@@ -66,3 +66,32 @@ fn mouse_dpi_is_kept_within_range() {
     c.mouse_dpi = 1_000_000;
     assert_eq!(c.mouse_dpi(), *Config::MOUSE_DPI.end());
 }
+
+#[test]
+fn unknown_accents_fall_back_to_the_default() {
+    for accent in [0, 4, 5, 255] {
+        let config = Config {
+            accent,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.accent(),
+            if accent < Config::ACCENT_COUNT {
+                accent
+            } else {
+                0
+            }
+        );
+    }
+}
+
+#[test]
+fn file_rate_has_a_global_bounded_decimal_bytes_budget() {
+    let mut config = Config::default();
+    assert_eq!(config.file_rate_limit_bytes(), 0);
+    assert!(!config.coalesce_motion);
+    config.file_rate_limit_mbps = 12;
+    assert_eq!(config.file_rate_limit_bytes(), 12_000_000);
+    config.file_rate_limit_mbps = u32::MAX;
+    assert_eq!(config.file_rate_limit_bytes(), 1_024_000_000);
+}

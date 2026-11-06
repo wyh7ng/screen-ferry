@@ -21,7 +21,16 @@ class DevicesPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.navigation,
+        AppAspect.devices,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.settings,
+      },
+    );
     final c = SfColors.of(context);
     final opened = state.openedDevice;
     final peer = opened == null ? null : state.peerOf(opened);
@@ -123,7 +132,16 @@ class _LocalAddresses extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.navigation,
+        AppAspect.devices,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.settings,
+      },
+    );
     final c = SfColors.of(context);
     return Wrap(
       spacing: 8,
@@ -277,7 +295,17 @@ class _PairedCardState extends State<_PairedCard> {
   Widget build(BuildContext context) {
     final d = widget.device;
     final c = SfColors.of(context);
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.navigation,
+        AppAspect.devices,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.settings,
+        AppAspect.clock,
+      },
+    );
     final addr = state.peer?.fingerprint == d.fingerprint ? state.peer?.addr ?? '' : '';
     final seen = d.online && addr.isNotEmpty ? context.l10n.devicesOnlineAt(addr) : seenText(context.l10n, d);
     // 服务端：这台设备贴在本机哪一侧（布局页里改）。
@@ -389,7 +417,16 @@ class _FoundCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = SfColors.of(context);
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.navigation,
+        AppAspect.devices,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.settings,
+      },
+    );
     return DashedBox(
       child: Padding(
         padding: const EdgeInsets.all(20),

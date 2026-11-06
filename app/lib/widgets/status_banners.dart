@@ -10,7 +10,10 @@ import 'surface.dart';
 
 /// 当前需要显示的提示条，没有时为空列表。由 PageScaffold 放在每页内容的最上面。
 List<Widget> statusBanners(BuildContext context) {
-  final state = AppScope.of(context);
+  final state = AppScope.of(
+    context,
+    aspects: const {AppAspect.connection, AppAspect.navigation, AppAspect.updateReminder},
+  );
   final problem = state.problem;
   return [
     if (state.disconnected)

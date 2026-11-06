@@ -8,3 +8,5 @@
 mod clipboard;
 mod keymap;
 mod update;
+
+mod file_commit;

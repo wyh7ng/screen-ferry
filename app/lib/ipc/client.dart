@@ -35,6 +35,7 @@ class IpcClient {
   Socket? _socket;
   StreamSubscription<String>? _lines;
   Timer? _retry;
+  Timer? _helloTimeout;
   bool _running = false;
   bool _attempting = false;
 
@@ -79,6 +80,7 @@ class IpcClient {
       socket.setOption(SocketOption.tcpNoDelay, true);
       _socket = socket;
       var welcomed = false;
+      _helloTimeout = Timer(const Duration(seconds: 3), _closed);
       _lines = socket
           .cast<List<int>>()
           .transform(utf8.decoder)
@@ -90,6 +92,8 @@ class IpcClient {
               if (!welcomed) {
                 if (notice is WelcomeNotice && notice.version == ipcVersion) {
                   welcomed = true;
+                  _helloTimeout?.cancel();
+                  _helloTimeout = null;
                   link.value = DaemonLink.online;
                 } else {
                   _closed();
@@ -130,6 +134,8 @@ class IpcClient {
   }
 
   Future<void> _drop() async {
+    _helloTimeout?.cancel();
+    _helloTimeout = null;
     final lines = _lines;
     final socket = _socket;
     _lines = null;

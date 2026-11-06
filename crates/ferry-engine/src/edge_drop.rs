@@ -342,12 +342,10 @@ struct Worker<O> {
 impl<O: Overlay> Worker<O> {
     async fn run(mut self) {
         let mut last = Instant::now();
+        let mut next_frame: Option<Instant> = None;
         loop {
-            let wake = if self.moving {
-                Some(Instant::now() + FRAME)
-            } else {
-                self.deadline()
-            };
+            // 输入只改变目标；动画按固定的下一帧截止时间推进，不随每个输入重新计时。
+            let wake = next_frame.into_iter().chain(self.deadline()).min();
             tokio::select! {
                 changed = self.pointer.changed() => {
                     if changed.is_err() {
@@ -378,16 +376,25 @@ impl<O: Overlay> Worker<O> {
             self.decide();
             self.sync_offer();
             self.publish_hint();
-            let dt = (now - last).as_secs_f32();
-            last = now;
-            self.draw(dt);
+            if (self.moving || self.dirty) && next_frame.is_none() {
+                next_frame = Some((last + FRAME).max(now));
+            }
+            if next_frame.is_some_and(|at| at <= now) {
+                self.draw((now - last).as_secs_f32());
+                last = now;
+                next_frame = self.moving.then_some(now + FRAME);
+            }
         }
     }
 
     /// 下一个到期的提示或卡片。
     fn deadline(&self) -> Option<Instant> {
         let brief = self.brief.as_ref().map(|b| b.until);
-        let card = self.card.as_ref().map(|c| c.until);
+        let card = self
+            .card
+            .as_ref()
+            .filter(|_| !self.dragging_out)
+            .map(|c| c.until);
         let remote = self.remote.as_ref().and_then(|r| r.until);
         brief
             .into_iter()
@@ -906,18 +913,17 @@ impl<O: Overlay> Worker<O> {
     }
 
     fn draw(&mut self, dt: f32) {
-        let moving = self.capsule.step(dt);
-        let push = moving || self.dirty || !self.shown;
-        self.moving = moving;
+        if !self.moving && !self.dirty {
+            return;
+        }
+        self.moving = self.capsule.step(dt);
         self.dirty = false;
         let scale = self.scale;
         let accent = *self.accent.borrow();
         match self.capsule.render(scale, accent) {
             Some((window, scene)) => {
-                if push {
-                    self.overlay.show(window, scale, scene);
-                    self.shown = true;
-                }
+                self.overlay.show(window, scale, scene);
+                self.shown = true;
             }
             None if self.shown => {
                 self.overlay.hide();

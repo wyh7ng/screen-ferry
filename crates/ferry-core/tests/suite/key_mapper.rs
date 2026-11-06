@@ -109,7 +109,7 @@ fn custom_modifiers_can_change_or_drop_each_key() {
     custom.custom_modifiers.caps_lock = ModifierTarget::Ctrl;
     custom.custom_modifiers.alt = ModifierTarget::None;
     custom.custom_modifiers.gui = ModifierTarget::Alt;
-    let mut m = mac_to_pc(&custom);
+    let mut m = pc_to_mac(&custom);
     assert_eq!(
         press(
             &mut m,
@@ -461,4 +461,88 @@ fn ctrl_home_becomes_command_up_on_a_mac() {
         press(&mut m, &[down(CTRL), down(HOME), up(HOME), up(CTRL)]),
         [down(CMD), down(UP), up(UP), up(CMD)],
     );
+}
+
+#[test]
+fn multiple_sources_keep_the_target_held_until_the_last_release() {
+    let mut custom = DeviceSettings {
+        modifiers: ModifierPreset::Custom,
+        ..settings()
+    };
+    custom.custom_modifiers.ctrl = ModifierTarget::Shift;
+    let mut m = mac_to_pc(&custom);
+    assert_eq!(
+        press(
+            &mut m,
+            &[down(SHIFT), down(CTRL), up(CTRL), down(C), up(C), up(SHIFT)]
+        ),
+        [down(SHIFT), down(C), up(C), up(SHIFT)],
+    );
+    assert_eq!(
+        press(&mut m, &[down(CTRL), down(SHIFT), up(CTRL), up(SHIFT)]),
+        [down(SHIFT), up(SHIFT)],
+    );
+}
+
+#[test]
+fn extra_mappings_share_target_ownership_and_reset_clears_it() {
+    let custom = DeviceSettings {
+        keys: vec![KeyMapping {
+            from: F13.raw(),
+            to: C.raw(),
+        }],
+        ..settings()
+    };
+    let mut m = mac_to_pc(&custom);
+    assert_eq!(
+        press(&mut m, &[down(C), down(F13), up(C), repeat(F13), up(F13)]),
+        [down(C), repeat(C), up(C)]
+    );
+    assert_eq!(press(&mut m, &[down(C), down(F13)]), [down(C)]);
+    m.reset();
+    assert_eq!(press(&mut m, &[down(C), up(C)]), [down(C), up(C)]);
+}
+
+#[test]
+fn mac_caps_lock_cannot_be_mapped_to_a_held_modifier() {
+    let mut custom = DeviceSettings {
+        modifiers: ModifierPreset::Custom,
+        ..settings()
+    };
+    custom.custom_modifiers.caps_lock = ModifierTarget::Ctrl;
+    let caps = KeyCode::CAPS_LOCK;
+    assert_eq!(
+        press(&mut mac_to_pc(&custom), &[down(caps), up(caps)]),
+        [down(caps), up(caps)]
+    );
+    assert_eq!(
+        press(
+            &mut pc_to_mac(&custom),
+            &[down(caps), down(C), up(C), up(caps)]
+        ),
+        [down(CTRL), down(C), up(C), up(CTRL)]
+    );
+    custom.keys = vec![KeyMapping {
+        from: caps.raw(),
+        to: SHIFT.raw(),
+    }];
+    assert_eq!(
+        press(&mut mac_to_pc(&custom), &[down(caps), up(caps)]),
+        [down(caps), up(caps)]
+    );
+    custom.keys[0].to = 0;
+    assert!(press(&mut mac_to_pc(&custom), &[down(caps), up(caps)]).is_empty());
+}
+
+#[test]
+fn an_untracked_source_release_does_not_release_another_sources_target() {
+    let custom = DeviceSettings {
+        keys: vec![KeyMapping {
+            from: F13.raw(),
+            to: C.raw(),
+        }],
+        ..settings()
+    };
+    let mut m = mac_to_pc(&custom);
+    assert_eq!(press(&mut m, &[down(C), up(F13), up(C)]), [down(C), up(C)]);
 }

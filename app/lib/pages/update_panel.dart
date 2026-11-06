@@ -15,7 +15,10 @@ class UpdatePanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.update, AppAspect.connection, AppAspect.local, AppAspect.clock},
+    );
     final l = context.l10n;
     final u = state.updateInfo;
     final latest = u.latest;
@@ -229,7 +232,7 @@ class _ReleaseCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.update, AppAspect.connection});
     final l = context.l10n;
     final c = SfColors.of(context);
     final ready = info.status == UpdateStatus.ready;

@@ -17,7 +17,7 @@
 //! 被控制的一方还要看着光标位置：本机的人自己动了鼠标，光标就重新出现。
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,23 +58,42 @@ thread_local! {
 }
 
 pub(crate) struct CursorHider {
-    state: Arc<Mutex<State>>,
+    shared: Arc<Shared>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    wake: Condvar,
 }
 
 struct State {
+    stopped: bool,
+    parked: Point,
+    reveal_on_move: bool,
     hidden: bool,
-    /// 每藏一次、显示一次加一；看守线程发现它变了就退出。
+    /// 每藏一次、显示一次加一；看守线程据此重新等待下一次隐藏。
     generation: u64,
 }
 
 impl CursorHider {
     pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(State {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                stopped: false,
+                parked: Point::default(),
+                reveal_on_move: false,
                 hidden: false,
                 generation: 0,
-            })),
-        }
+            }),
+            wake: Condvar::new(),
+        });
+        let watcher = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("ferry-cursor".into())
+            .spawn(move || watch(&watcher))
+            .ok();
+        Self { shared, worker }
     }
 
     /// 把光标挪到 `parked`（见 [`park_point`]）再藏起来。已经藏着时什么也不做，返回假。
@@ -82,7 +101,7 @@ impl CursorHider {
     /// `reveal_on_move`：本机的人一动鼠标就重新显示（被控制的一方）。控制别人时光标和鼠标已经脱开，
     /// 光标不会动，不需要看。
     pub(crate) fn hide(&self, parked: Point, reveal_on_move: bool) -> bool {
-        let mut state = lock(&self.state);
+        let mut state = lock(&self.shared.state);
         if state.hidden {
             return false;
         }
@@ -96,25 +115,21 @@ impl CursorHider {
         shield(Some(park));
         state.hidden = true;
         state.generation += 1;
-        let generation = state.generation;
-        drop(state);
-
-        let shared = Arc::clone(&self.state);
-        // 起不了线程就只是不会再确认、不会自动重新出现。
-        let _ = thread::Builder::new()
-            .name("ferry-cursor".into())
-            .spawn(move || watch(&shared, generation, parked, reveal_on_move));
+        state.parked = parked;
+        state.reveal_on_move = reveal_on_move;
+        self.shared.wake.notify_one();
         true
     }
 
     pub(crate) fn show(&self) {
-        let mut state = lock(&self.state);
+        let mut state = lock(&self.shared.state);
         state.generation += 1;
         if state.hidden {
             state.hidden = false;
             shield(None);
             let _ = CGDisplayShowCursor(CGMainDisplayID());
         }
+        self.shared.wake.notify_one();
     }
 }
 
@@ -130,47 +145,59 @@ pub(crate) fn park_point() -> Point {
 impl Drop for CursorHider {
     fn drop(&mut self) {
         self.show();
+        lock(&self.shared.state).stopped = true;
+        self.shared.wake.notify_one();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 /// 看守线程：按时再确认一次藏着；被控制的一方看到本机的人动了鼠标就显示。
-fn watch(state: &Mutex<State>, generation: u64, parked: Point, reveal_on_move: bool) {
-    let start = Instant::now();
-    let mut early = EARLY_CHECKS.iter().peekable();
-    let mut next_recheck = None;
+fn watch(shared: &Shared) {
+    let mut state = lock(&shared.state);
     loop {
-        thread::sleep(TICK);
-        let mut state = lock(state);
-        if !state.hidden || state.generation != generation {
+        while !state.stopped && !state.hidden {
+            state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if state.stopped {
             return;
         }
-        if reveal_on_move && live_cursor().is_some_and(|p| p != parked) {
-            state.hidden = false;
-            shield(None);
-            let _ = CGDisplayShowCursor(CGMainDisplayID());
-            return;
-        }
-        let elapsed = start.elapsed();
-        let due = match (early.peek(), next_recheck) {
-            (Some(&&at), _) if elapsed >= at => {
-                early.next();
-                true
+        let generation = state.generation;
+        let start = Instant::now();
+        let mut early = 0;
+        let mut next_recheck = start + EARLY_CHECKS[0];
+        while state.hidden && !state.stopped && state.generation == generation {
+            let now = Instant::now();
+            // 控制端只在需要重藏时醒来；被控制端才定时检查本机鼠标有没有动。
+            let deadline = if state.reveal_on_move {
+                next_recheck.min(now + TICK)
+            } else {
+                next_recheck
+            };
+            let (next, _) = shared
+                .wake
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+            if !state.hidden || state.stopped || state.generation != generation {
+                break;
             }
-            (None, None) => {
-                next_recheck = Some(elapsed + RECHECK);
-                false
+            if state.reveal_on_move && live_cursor().is_some_and(|p| p != state.parked) {
+                state.hidden = false;
+                shield(None);
+                let _ = CGDisplayShowCursor(CGMainDisplayID());
+                break;
             }
-            (None, Some(at)) if elapsed >= at => {
-                next_recheck = Some(elapsed + RECHECK);
-                true
+            let now = Instant::now();
+            if now >= next_recheck {
+                let _ = CGDisplayShowCursor(CGMainDisplayID());
+                let _ = CGDisplayHideCursor(CGMainDisplayID());
+                early += 1;
+                next_recheck = EARLY_CHECKS
+                    .get(early)
+                    .map_or(now + RECHECK, |at| start + *at);
             }
-            _ => false,
-        };
-        if due {
-            // 先显示再藏：计数 1 → 0 → 1，从 0 到 1 的那一下才会真正藏起来。
-            // 两次调用紧挨着，中间来不及画出一帧光标。
-            let _ = CGDisplayShowCursor(CGMainDisplayID());
-            let _ = CGDisplayHideCursor(CGMainDisplayID());
         }
     }
 }

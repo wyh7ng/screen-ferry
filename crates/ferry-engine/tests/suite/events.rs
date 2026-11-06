@@ -150,3 +150,44 @@ fn clipboard_summary_describes_images_and_rich_text() {
     let plain = ClipSummary::of(&ClipboardContent::text("x"));
     assert!(!plain.rich && plain.image.is_none());
 }
+
+#[tokio::test]
+async fn high_frequency_snapshots_coalesce_but_cannot_cross_a_lifecycle_barrier() {
+    use ferry_engine::Events;
+    use ferry_trust::Fingerprint;
+    use std::time::Duration;
+    let (events, mut rx) = Events::channel();
+    let peer = Fingerprint::from_bytes([9; 32]);
+    for n in 1..=10_000 {
+        events.emit(Event::Rtt {
+            peer,
+            rtt: Duration::from_micros(n),
+        });
+    }
+    events.emit(Event::Disconnected { peer, reason: None });
+    events.emit(Event::Rtt {
+        peer,
+        rtt: Duration::from_micros(77),
+    });
+    assert_eq!(
+        rx.recv().await,
+        Some(Event::Rtt {
+            peer,
+            rtt: Duration::from_micros(10_000)
+        })
+    );
+    assert_eq!(
+        rx.recv().await,
+        Some(Event::Disconnected { peer, reason: None })
+    );
+    assert_eq!(
+        rx.recv().await,
+        Some(Event::Rtt {
+            peer,
+            rtt: Duration::from_micros(77)
+        })
+    );
+    assert!(rx.try_recv().is_err());
+    drop(events);
+    assert_eq!(rx.recv().await, None);
+}

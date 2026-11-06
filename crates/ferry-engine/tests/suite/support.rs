@@ -137,7 +137,6 @@ pub struct Rig {
     /// 两端的文件传输。收到的文件在各自数据目录的 `received/` 里。
     pub mac_files: Files,
     pub pc_files: Files,
-    pc_events: Events,
     /// 服务端（Mac）。
     pub mac: Device,
     /// 客户端（PC）。
@@ -191,14 +190,20 @@ impl Rig {
         let inject = MockInject::new();
         let mac_displays = MockDisplays::new(vec![display(1000, 800, 100)]);
         let pc_displays = MockDisplays::new(vec![display(1920, 1080, 150)]);
-        let mac_files = setup
-            .mac_files
-            .clone()
-            .unwrap_or_else(|| Files::new(&setup.mac.store, setup.mac_events.clone()));
-        let pc_files = setup
-            .pc_files
-            .clone()
-            .unwrap_or_else(|| Files::new(&setup.pc.store, setup.pc_events.clone()));
+        let mac_files = setup.mac_files.clone().unwrap_or_else(|| {
+            Files::new(
+                &setup.mac.store,
+                setup.mac_events.clone(),
+                Arc::new(ferry_platform_mock::MockFileCommit),
+            )
+        });
+        let pc_files = setup.pc_files.clone().unwrap_or_else(|| {
+            Files::new(
+                &setup.pc.store,
+                setup.pc_events.clone(),
+                Arc::new(ferry_platform_mock::MockFileCommit),
+            )
+        });
 
         let server = tokio::spawn({
             let capture = capture.clone();
@@ -213,6 +218,7 @@ impl Rig {
                         devices: Vec::new(),
                         fallback: ferry_types::DeviceSettings::default(),
                         mouse_dpi: 1600,
+                        input: Default::default(),
                     }
                     .fixed()
                 }),
@@ -253,7 +259,6 @@ impl Rig {
             pc_displays,
             mac_files,
             pc_files,
-            pc_events: setup.pc_events.clone(),
             mac: setup.mac,
             pc: setup.pc,
             mac_clipboard: setup.mac_clipboard,
@@ -299,25 +304,6 @@ impl Rig {
                 Err(e) => e,
             }
         })
-    }
-
-    /// 模拟断线：停掉客户端再重新启动，数据目录和文件传输都沿用原来的。
-    pub fn restart_client(&mut self) {
-        self.client.abort();
-        let setup = Setup {
-            pc: self.pc.clone(),
-            pc_clipboard: self.pc_clipboard.clone(),
-            pc_confirm: self.pc_confirm.clone(),
-            pc_events: self.pc_events.clone(),
-            ..Setup::default()
-        };
-        self.client = Self::spawn_client(
-            &setup,
-            self.addr,
-            self.inject.clone(),
-            self.pc_displays.clone(),
-            self.pc_files.clone(),
-        );
     }
 
     /// 停掉两端，留下数据目录供下一个 `Rig` 使用。
@@ -372,7 +358,7 @@ impl Rig {
 /// 见 [`Rig::idle_client`]。
 pub struct Idle {
     pub device: Device,
-    pub events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    pub events: ferry_engine::EventReceiver,
     pub commands: tokio::sync::mpsc::UnboundedSender<ClientCommand>,
 }
 
@@ -450,7 +436,11 @@ impl Rig {
     ) -> Extra {
         let device = Device::new();
         let (events, mut rx) = Events::channel();
-        let files = Files::new(&device.store, events.clone());
+        let files = Files::new(
+            &device.store,
+            events.clone(),
+            Arc::new(ferry_platform_mock::MockFileCommit),
+        );
         let inject = MockInject::new();
         let config = ClientConfig {
             server: ServerAddr::Fixed(self.addr),
@@ -522,7 +512,11 @@ impl Rig {
             command_key: false,
             store: device.store.clone(),
             events,
-            files: Files::new(&device.store, Events::none()),
+            files: Files::new(
+                &device.store,
+                Events::none(),
+                Arc::new(ferry_platform_mock::MockFileCommit),
+            ),
             edge: EdgeFeed::none(),
             devices: Vec::new(),
             commands: Some(commands_rx),

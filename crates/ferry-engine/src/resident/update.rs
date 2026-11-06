@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 use ferry_ipc::{Endpoint, Phrase, UpdateError, UpdateInfo, UpdateRelease, UpdateStatus};
 use ferry_net::Https;
@@ -65,6 +66,7 @@ impl UpdateSource {
 
 /// 后台任务报回来的结果。
 pub(crate) enum UpdateEvent {
+    Capability(bool),
     Checked(Result<Release, (UpdateError, String)>),
     Progress {
         done: u64,
@@ -98,6 +100,7 @@ pub(crate) struct Updates<U> {
     state: UpdateState,
 
     status: UpdateStatus,
+    install_capable: bool,
     error: Option<(UpdateError, String)>,
     release: Option<Release>,
     package: Option<PathBuf>,
@@ -121,14 +124,20 @@ impl<U: Updater + 'static> Updates<U> {
         tx: mpsc::UnboundedSender<UpdateEvent>,
     ) -> Self {
         let state = store.update_state();
+        let platform = Arc::new(platform);
+        let (probe, events) = (platform.clone(), tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let _ = events.send(UpdateEvent::Capability(probe.can_install().is_ok()));
+        });
         Self {
-            platform: Arc::new(platform),
+            platform,
             source,
             store,
             tx,
             current: current_version(),
             state,
             status: UpdateStatus::Idle,
+            install_capable: false,
             error: None,
             release: None,
             package: None,
@@ -226,6 +235,7 @@ impl<U: Updater + 'static> Updates<U> {
         let tx = self.tx.clone();
         let current = self.current.to_string();
         tokio::task::spawn_blocking(move || {
+            let _ = tx.send(UpdateEvent::Capability(platform.can_install().is_ok()));
             let result = fetch_release(&*platform, &source, &current);
             let _ = tx.send(UpdateEvent::Checked(result));
         });
@@ -270,6 +280,14 @@ impl<U: Updater + 'static> Updates<U> {
         let (Some(package), Some(release)) = (self.package.clone(), &self.release) else {
             return;
         };
+        let Some(asset) = self
+            .platform
+            .platform()
+            .and_then(|name| release.asset(name))
+            .cloned()
+        else {
+            return;
+        };
         let version = release.version.to_string();
         self.state.installing = Some(Installing {
             from: self.current.to_string(),
@@ -282,7 +300,7 @@ impl<U: Updater + 'static> Updates<U> {
         let (platform, tx) = (self.platform.clone(), self.tx.clone());
         tokio::task::spawn_blocking(move || {
             let result = platform
-                .prepare(&package, &version)
+                .prepare(&package, &version, asset.size, &asset.sha256)
                 .map_err(|e| e.to_string());
             let _ = tx.send(UpdateEvent::Prepared(result));
         });
@@ -295,6 +313,13 @@ impl<U: Updater + 'static> Updates<U> {
 
     pub(crate) fn on_event(&mut self, event: UpdateEvent, auto: bool) -> Vec<Outcome> {
         match event {
+            UpdateEvent::Capability(allowed) => {
+                self.install_capable = allowed;
+                if auto && self.status == UpdateStatus::Available && self.can_install() {
+                    self.download();
+                }
+                Vec::new()
+            }
             UpdateEvent::Checked(result) => self.on_checked(result, auto),
             UpdateEvent::Progress { done, total } => {
                 self.done = done;
@@ -369,17 +394,16 @@ impl<U: Updater + 'static> Updates<U> {
         result: Result<Release, (UpdateError, String)>,
         auto: bool,
     ) -> Vec<Outcome> {
-        self.checked_at = Some(now_ms());
         let release = match result {
             Ok(release) => release,
             Err((error, message)) => {
                 warn!("检查更新失败：{message}");
+                self.next_check = Instant::now() + RETRY_AFTER;
                 if self.manual || error != UpdateError::Unreachable {
                     self.fail(error, message);
                 } else {
                     // 自动检查连不上：不打扰，过一会儿再试。
                     self.status = self.resting_status();
-                    self.next_check = Instant::now() + RETRY_AFTER;
                 }
                 return Vec::new();
             }
@@ -402,6 +426,7 @@ impl<U: Updater + 'static> Updates<U> {
             }
             Verdict::UpToDate | Verdict::Newer => {}
         }
+        self.checked_at = Some(now_ms());
         if self
             .state
             .seen_published
@@ -463,7 +488,7 @@ impl<U: Updater + 'static> Updates<U> {
             (None, Some(_)) => true,
             _ => false,
         };
-        has_asset && self.platform.can_install().is_ok()
+        has_asset && self.install_capable
     }
 
     /// 安装要弹出管理员确认（Windows）。
@@ -647,7 +672,7 @@ pub(crate) async fn finish<U: Updater + 'static>(
         tokio::task::spawn_blocking(move || platform.launch(&prepared)).await
     };
     let started = match launched {
-        Ok(Ok(())) => wait_for_new_version(&endpoint).await,
+        Ok(Ok(())) => wait_for_new_version(&endpoint, &prepared.version).await,
         Ok(Err(e)) => {
             warn!("启动新版本失败：{e}");
             false
@@ -675,13 +700,15 @@ pub(crate) async fn finish<U: Updater + 'static>(
 }
 
 /// 等另一个进程写下 `ipc.json` 并能连上。
-async fn wait_for_new_version(path: &Path) -> bool {
+async fn wait_for_new_version(path: &Path, version: &str) -> bool {
     let own = std::process::id();
     let deadline = Instant::now() + NEW_VERSION_WAIT;
     while Instant::now() < deadline {
         if let Ok(Some(endpoint)) = Endpoint::load(path)
             && endpoint.pid != own
-            && ferry_ipc::connect(&endpoint).await.is_ok()
+            && ferry_ipc::probe_update(&endpoint, version)
+                .await
+                .unwrap_or(false)
         {
             return true;
         }

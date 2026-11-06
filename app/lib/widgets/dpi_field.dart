@@ -14,9 +14,11 @@ class DpiField extends StatefulWidget {
     this.min = 100,
     this.max = 12800,
     this.highlight = false,
+    this.unit = 'DPI',
   });
 
   final int value;
+  final String unit;
 
   /// 为 null 时只读。
   final ValueChanged<int>? onChanged;
@@ -106,7 +108,7 @@ class _DpiFieldState extends State<DpiField> {
           ),
           const SizedBox(width: 6),
           Text(
-            'DPI',
+            widget.unit,
             style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: c.muted),
           ),
         ],

@@ -9,7 +9,7 @@ use ferry_types::{DeviceSettings, Language, Placement, Role, Side, Theme};
 use serde::{Deserialize, Serialize};
 
 /// 协议版本。不兼容的改动才递增。
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// 单行消息的上限。状态快照通常只有几 KB。
 pub const MAX_LINE: usize = 1 << 20;
@@ -20,6 +20,14 @@ pub const MAX_LINE: usize = 1 << 20;
 pub enum Request {
     /// 第一条消息：令牌与界面使用的协议版本。
     Hello { token: String, version: u32 },
+    /// 更新后的健康探测：独立于设置界面协议版本，只验证本次启动的令牌。
+    UpdateHealth { token: String },
+    /// 有结果的界面命令；session 绑定本次后台，id 由该界面递增生成。
+    Execute {
+        session: String,
+        id: u64,
+        request: Box<Request>,
+    },
     /// 暂停或继续共享。
     SetSharing { on: bool },
     /// 修改设置，只含要改的字段。
@@ -61,6 +69,10 @@ pub enum Request {
     ReadRunLog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     /// 把诊断文件存到“下载”文件夹，结果以 `diagnostics_exported` 告知，出错时以 `toast`。
     ExportDiagnostics,
@@ -90,6 +102,15 @@ pub enum Request {
 pub enum Notice {
     /// 回应 `Hello`，之后立即发送 `History` 和 `State`。
     Welcome { version: u32 },
+    /// 健康探测只返回实际应用版本，不建立设置界面会话。
+    UpdateHealth { version: String },
+    /// 命令已处理。失败时界面撤销对应的乐观更新，不影响更晚的命令。
+    CommandResult {
+        session: String,
+        id: u64,
+        ok: bool,
+        message: String,
+    },
     /// 完整的状态快照。有变化时推送，最多每秒 4 次。
     State { state: Box<State> },
     /// 连接时发送一次已有的日志，最新的在前。
@@ -111,6 +132,8 @@ pub enum Notice {
     /// 按地址连接（`invite` 为假）或邀请（为真）的结果。`error` 为 `null` 表示成了：
     /// 连上了、开始核对配对码，或者对方接受了邀请、正在连过来。
     Dialed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
         address: String,
         invite: bool,
         error: Option<DialError>,
@@ -125,6 +148,14 @@ pub enum Notice {
         fresh: bool,
         bytes: u64,
         lines_total: u64,
+        #[serde(default)]
+        cursor: String,
+        #[serde(default)]
+        more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
     },
     /// 诊断文件存好了：完整路径和大小。
     DiagnosticsExported { path: String, bytes: u64 },
@@ -174,6 +205,8 @@ pub enum DialError {
 /// 后台的完整状态。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
+    /// 随后台启动重新生成，防止断线前的命令作用到新后台。
+    pub session: String,
     pub local: Local,
     /// 用户没有暂停共享。
     pub sharing: bool,
@@ -193,6 +226,60 @@ pub struct State {
     /// 版本更新。旧版后台没有这个字段。
     #[serde(default)]
     pub update: UpdateInfo,
+    #[serde(default)]
+    pub performance: Performance,
+}
+
+/// 最近一个采样窗的本机阶段耗时；分位数是直方图桶上界近似，不能跨机相减。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LatencySummary {
+    pub count: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+    pub over_100ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueSummary {
+    pub depth: usize,
+    pub high_water: usize,
+    /// 当前最老事件年龄；无法无锁测量的捕获队列为 null。
+    pub oldest_us: Option<u64>,
+    /// 本窗口已消费事件的最大等待时间。
+    pub max_wait_us: u64,
+    pub coalesced: u64,
+    pub overflows: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InputMetrics {
+    pub window_ms: u64,
+    pub capture_queue: LatencySummary,
+    pub send_queue: LatencySummary,
+    pub send: LatencySummary,
+    pub inject: LatencySummary,
+    pub rtt: LatencySummary,
+    pub scheduler: LatencySummary,
+    pub capture: QueueSummary,
+    pub outbound: QueueSummary,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPerformance {
+    pub fingerprint: Option<String>,
+    pub measured_at: i64,
+    pub metrics: InputMetrics,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Performance {
+    pub peers: Vec<PeerPerformance>,
 }
 
 /// 版本更新（ADR 0014）。
@@ -461,6 +548,11 @@ pub struct Settings {
     /// 剪贴板单项（一种格式）的大小上限，单位 MB，1–64。
     #[serde(default = "default_clipboard_limit")]
     pub clipboard_limit_mb: u32,
+    /// 十进制 MB/s，0 不限制。
+    #[serde(default)]
+    pub file_rate_limit_mbps: u32,
+    #[serde(default)]
+    pub coalesce_motion: bool,
     /// 本机鼠标的 DPI，100–12800。每台设备的光标速度以它为准。
     #[serde(default = "default_mouse_dpi")]
     pub mouse_dpi: u32,
@@ -502,6 +594,10 @@ pub struct SettingsPatch {
     /// 1–64，超出的收进范围内。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clipboard_limit_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_rate_limit_mbps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coalesce_motion: Option<bool>,
     /// 100–12800，超出的收进范围内。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_dpi: Option<u32>,
@@ -603,6 +699,7 @@ pub enum LogIcon {
 /// 请用户核对的配对码。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingPrompt {
+    pub session: String,
     pub id: u64,
     pub peer_name: String,
     pub fingerprint: String,

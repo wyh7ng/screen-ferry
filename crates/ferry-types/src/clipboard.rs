@@ -1,6 +1,7 @@
 //! 剪贴板数据格式与内容。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// 剪贴板数据格式。以后可能新增格式，所以用编号而不是封闭枚举。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -20,7 +21,7 @@ impl ClipboardFormat {
 /// 一份剪贴板内容：同一内容的若干种格式，每种格式至多一份。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClipboardContent {
-    items: BTreeMap<ClipboardFormat, Vec<u8>>,
+    items: BTreeMap<ClipboardFormat, Arc<[u8]>>,
 }
 
 impl ClipboardContent {
@@ -37,15 +38,25 @@ impl ClipboardContent {
 
     /// 放入一种格式，替换已有的同格式数据。
     pub fn insert(&mut self, format: ClipboardFormat, data: Vec<u8>) {
-        self.items.insert(format, data);
+        self.items.insert(format, Arc::from(data));
     }
 
     pub fn get(&self, format: ClipboardFormat) -> Option<&[u8]> {
-        self.items.get(&format).map(Vec::as_slice)
+        self.items.get(&format).map(AsRef::as_ref)
     }
 
-    /// 取出一种格式。
+    /// 取出一种格式，兼容需要独占可变字节的调用方。
     pub fn remove(&mut self, format: ClipboardFormat) -> Option<Vec<u8>> {
+        self.remove_shared(format).map(|data| data.to_vec())
+    }
+
+    /// 共享只读字节；克隆内容和多设备通告都不复制整张图片。
+    pub fn get_shared(&self, format: ClipboardFormat) -> Option<Arc<[u8]>> {
+        self.items.get(&format).cloned()
+    }
+
+    /// 只从当前内容移除格式，其他内容及缓存仍持有相同的只读字节。
+    pub fn remove_shared(&mut self, format: ClipboardFormat) -> Option<Arc<[u8]>> {
         self.items.remove(&format)
     }
 
@@ -56,7 +67,7 @@ impl ClipboardContent {
 
     /// 按格式编号从小到大遍历。
     pub fn iter(&self) -> impl Iterator<Item = (ClipboardFormat, &[u8])> {
-        self.items.iter().map(|(f, d)| (*f, d.as_slice()))
+        self.items.iter().map(|(f, d)| (*f, d.as_ref()))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -65,6 +76,6 @@ impl ClipboardContent {
 
     /// 所有格式的总字节数。
     pub fn total_len(&self) -> usize {
-        self.items.values().map(Vec::len).sum()
+        self.items.values().map(|data| data.len()).sum()
     }
 }

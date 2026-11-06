@@ -16,7 +16,11 @@ const ACCENT: Rgba = Rgba::hex(0x0A6CFF, 255);
 /// 给一台设备配上边缘投递。常驻后台会把文件传输的进展转给边缘投递，这里由一个小任务代劳。
 fn edge_drop_for(device: &Device) -> (Files, MockOverlay, Arc<EdgeDrop>) {
     let (events, mut rx) = Events::channel();
-    let files = Files::new(&device.store, events);
+    let files = Files::new(
+        &device.store,
+        events,
+        Arc::new(ferry_platform_mock::MockFileCommit),
+    );
     let overlay = MockOverlay::new();
     let edge = Arc::new(EdgeDrop::spawn(
         overlay.clone(),
@@ -646,4 +650,163 @@ async fn with_two_clients_on_one_edge_files_go_to_the_one_whose_part_they_are_dr
     })
     .await;
     left_button(&rig, false);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dragging_past_the_card_deadline_does_not_keep_the_timer_ready() {
+    use ferry_engine::{TransferState, TransferUpdate};
+    use ferry_trust::Fingerprint;
+    use ferry_types::TransferId;
+
+    let device = Device::new();
+    let files = Files::new(
+        &device.store,
+        Events::none(),
+        Arc::new(ferry_platform_mock::MockFileCommit),
+    );
+    let overlay = MockOverlay::new();
+    let edge = EdgeDrop::spawn(overlay.clone(), files, ACCENT, Lang::Zh);
+    let saved = device.store.downloads_dir().join("received.txt");
+    edge.transfer(TransferUpdate {
+        id: TransferId([1; 16]),
+        peer: Fingerprint::from_bytes([2; 32]),
+        outgoing: false,
+        name: "received.txt".into(),
+        items: 1,
+        files: 1,
+        bytes: 1,
+        done: 1,
+        state: TransferState::Done {
+            saved: vec![saved.clone()],
+        },
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(overlay.offered(), vec![saved]);
+    overlay.emit(OverlayEvent::DragOutStarted);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(16)).await;
+
+    // 过期计时器若一直就绪，暂停的 Tokio 时钟就无法自动前进。
+    // 独立的墙钟看门狗让回归失败有界，不会把测试进程挂住。
+    let (cancel, stopped) = std::sync::mpsc::channel();
+    let (expired, watchdog) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        if stopped.recv_timeout(Duration::from_secs(2)).is_err() {
+            let _ = expired.send(());
+        }
+    });
+    let advanced = tokio::select! {
+        _ = sleep(Duration::from_secs(1)) => true,
+        _ = watchdog => false,
+    };
+    let _ = cancel.send(());
+    worker.join().unwrap();
+    assert!(advanced, "拖动中过期的卡片不应让后台空转");
+    overlay.emit(OverlayEvent::DragOutEnded { dropped: false });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(16)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        overlay.offered().is_empty(),
+        "取消拖动后重新计时，到期释放卡片"
+    );
+}
+
+struct CountedOverlay {
+    inner: MockOverlay,
+    frames: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ferry_platform::Overlay for CountedOverlay {
+    fn start(&mut self, sink: ferry_platform::OverlaySink) -> ferry_platform::Result<()> {
+        ferry_platform::Overlay::start(&mut self.inner, sink)
+    }
+    fn show(&mut self, frame: ferry_types::Frame, scale: f32, scene: ferry_types::Scene) {
+        self.frames
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ferry_platform::Overlay::show(&mut self.inner, frame, scale, scene);
+    }
+    fn hide(&mut self) {
+        ferry_platform::Overlay::hide(&mut self.inner);
+    }
+    fn drag_count(&self) -> i64 {
+        ferry_platform::Overlay::drag_count(&self.inner)
+    }
+    fn dragged_files(&self) -> Vec<std::path::PathBuf> {
+        ferry_platform::Overlay::dragged_files(&self.inner)
+    }
+    fn offer(&mut self, files: Vec<std::path::PathBuf>) {
+        ferry_platform::Overlay::offer(&mut self.inner, files);
+    }
+    fn watch_edge(&mut self, strip: Option<ferry_types::Frame>) {
+        ferry_platform::Overlay::watch_edge(&mut self.inner, strip);
+    }
+    fn open(&self, path: &std::path::Path) {
+        ferry_platform::Overlay::open(&self.inner, path);
+    }
+    fn reveal(&self, path: &std::path::Path) {
+        ferry_platform::Overlay::reveal(&self.inner, path);
+    }
+}
+
+#[tokio::test]
+async fn frequent_pointer_updates_do_not_draw_more_than_once_per_frame() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let device = Device::new();
+    let files = Files::new(
+        &device.store,
+        Events::none(),
+        Arc::new(ferry_platform_mock::MockFileCommit),
+    );
+    let overlay = MockOverlay::new();
+    let frames = Arc::new(AtomicUsize::new(0));
+    let edge = EdgeDrop::spawn(
+        CountedOverlay {
+            inner: overlay.clone(),
+            frames: frames.clone(),
+        },
+        files.clone(),
+        ACCENT,
+        Lang::Zh,
+    );
+    let rig = Rig::with(Setup {
+        mac: device,
+        mac_files: Some(files),
+        edge: edge.feed(),
+        ..Setup::default()
+    })
+    .await;
+    rig.enter().await;
+    rig.leave().await;
+    let source = TempDir::new();
+    let file = source_file(&source, "drawing.txt", b"x");
+    press_and_drag(&rig, &overlay, Some(vec![file])).await;
+    eventually("显示拖动胶囊", || {
+        pointer(&rig, 900, 400);
+        overlay.shown().is_some()
+    })
+    .await;
+
+    tokio::time::pause();
+    let before = frames.load(Ordering::Relaxed);
+    for i in 0..100 {
+        pointer(&rig, 900 + i % 30, 400 + i % 20);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    let drawn = frames.load(Ordering::Relaxed) - before;
+    assert!(
+        drawn > 0 && drawn <= 7,
+        "100ms 内按16ms帧间隔绘制，实际 {drawn} 帧"
+    );
 }

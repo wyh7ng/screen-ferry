@@ -1608,5 +1608,46 @@
         "type": "String"
       }
     }
+  },
+  "commandTimedOut": "后台未确认这次修改，请重试。",
+  "macCapsMappingHint": "macOS 将 Caps Lock 作为开关报告，因此只能保留原功能或禁用，无法映射成需要按住的键。",
+  "settingsResponsiveness": "传输与响应",
+  "settingsFileRate": "文件传输速度上限",
+  "settingsFileRateHint": "每秒最多传输多少 MB（1 MB = 1,000,000 字节）。0 表示不限速，范围 0–1024；限制大文件传输可为其他网络活动留出带宽。",
+  "settingsCoalesceMotion": "合并连续鼠标移动",
+  "settingsCoalesceMotionHint": "适合高回报率鼠标或网络繁忙时，减少待发送的移动事件；按键、点击和滚轮保持顺序。需要逐个保留移动采样时关闭。",
+  "performanceTitle": "性能统计",
+  "performanceHint": "近 5 秒的本机处理阶段，分位数为近似值，最大值为实测。RTT 是网络往返时间，不是端到端输入延迟；无样本显示 —。",
+  "performanceEmpty": "连接设备并操作键鼠后显示统计。",
+  "performanceStage": "阶段",
+  "performanceCount": "样本",
+  "performanceMax": "最大",
+  "performanceCaptureQueue": "捕获队列等待",
+  "performanceSendQueue": "发送队列等待",
+  "performanceSend": "发送耗时",
+  "performanceInject": "注入耗时",
+  "performanceRtt": "网络 RTT",
+  "performanceScheduler": "调度延迟",
+  "performanceCapture": "捕获队列",
+  "performanceOutbound": "发送队列",
+  "performanceDepth": "当前长度",
+  "performanceHighWater": "累计峰值",
+  "performanceOldest": "最老等待",
+  "performanceMaxWait": "窗口最大等待",
+  "performanceCoalesced": "已合并",
+  "performanceOverflows": "已溢出",
+  "performanceLocal": "本机",
+  "performanceUnits": "耗时单位：ms；超过 100 ms 一列为次数。",
+  "logRunVisible": "{size} · 当前显示 {count} 行",
+  "runLogReadFailed": "日志暂时无法读取，将自动重试。",
+  "@logRunVisible": {
+    "placeholders": {
+      "size": {
+        "type": "String"
+      },
+      "count": {
+        "type": "String"
+      }
+    }
   }
 }

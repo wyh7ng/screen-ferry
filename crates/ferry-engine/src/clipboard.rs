@@ -12,9 +12,10 @@
 //! 写入后记下剪贴板的变化计数，自己写入的内容不会再被当作新复制通告回去。
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferry_net::Framed;
 use ferry_platform::Clipboard;
@@ -25,7 +26,7 @@ use ferry_proto::{
 use ferry_trust::Fingerprint;
 use ferry_types::{ClipboardContent, ClipboardFormat};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
@@ -37,6 +38,12 @@ use crate::link::send;
 
 /// 活动端检查本机剪贴板的间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// 转换后的共享缓存总量；会话各自的单格式限制不改变缓存的原内容。
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// 没有会话读取缓存后及时释放大图片；轮询变化计数不延长寿命。
+const CACHE_IDLE: Duration = Duration::from_secs(5);
+const CACHE_SWEEP: Duration = Duration::from_secs(1);
+const STABLE_READ_ATTEMPTS: usize = 3;
 
 /// 单个格式缺省的大小上限：32 MB。
 pub const DEFAULT_CLIP_LIMIT: u64 = 32 * 1024 * 1024;
@@ -65,11 +72,198 @@ impl Default for ClipLimit {
     }
 }
 
-/// 服务端与客户端各持有一份，会话之间复用。
-pub(crate) type SharedClipboard<C> = Arc<Mutex<C>>;
+/// 每端一条专用串行工作线程。系统调用和图片编解码不占用输入/心跳运行时。
+pub(crate) struct SharedClipboard<C> {
+    requests: mpsc::Sender<ClipboardWork>,
+    formats: &'static [ClipboardFormat],
+    marker: PhantomData<fn() -> C>,
+}
+
+impl<C> Clone for SharedClipboard<C> {
+    fn clone(&self) -> Self {
+        Self {
+            requests: self.requests.clone(),
+            formats: self.formats,
+            marker: PhantomData,
+        }
+    }
+}
+
+enum ClipboardWork {
+    Sweep,
+    Count(oneshot::Sender<u64>),
+    Read(oneshot::Sender<(u64, ferry_platform::Result<ClipboardContent>)>),
+    Write(
+        ClipboardContent,
+        oneshot::Sender<ferry_platform::Result<u64>>,
+    ),
+}
+
+impl<C: Clipboard> SharedClipboard<C> {
+    pub(crate) fn new(mut clipboard: C) -> Result<Self> {
+        let formats = clipboard.formats();
+        let (requests, mut incoming) = mpsc::channel(8);
+        let weak = requests.downgrade();
+        std::thread::Builder::new()
+            .name("ferry-clipboard".into())
+            .spawn(move || {
+                let mut cache = ClipboardCache::default();
+                while let Some(work) = incoming.blocking_recv() {
+                    cache.expire();
+                    match work {
+                        ClipboardWork::Count(reply) if !reply.is_closed() => {
+                            let count = clipboard.change_count();
+                            cache.changed(count);
+                            let _ = reply.send(count);
+                        }
+                        ClipboardWork::Read(reply) if !reply.is_closed() => {
+                            let _ = reply.send(cache.read(&mut clipboard));
+                        }
+                        ClipboardWork::Write(content, reply) if !reply.is_closed() => {
+                            cache.entry = None;
+                            let _ = reply.send(clipboard.write(&content));
+                        }
+                        _ => {} // 会话已结束的排队工作直接丢弃。
+                    }
+                }
+            })?;
+        // 只持有弱发送端：所有会话结束时专用线程能自然退出，不会被清理任务留住。
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CACHE_SWEEP).await;
+                let Some(sender) = weak.upgrade() else {
+                    break;
+                };
+                if matches!(
+                    sender.try_send(ClipboardWork::Sweep),
+                    Err(mpsc::error::TrySendError::Closed(_))
+                ) {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            requests,
+            formats,
+            marker: PhantomData,
+        })
+    }
+
+    async fn count(&self) -> Result<u64> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(ClipboardWork::Count(reply))
+            .await
+            .map_err(|_| worker_closed())?;
+        result.await.map_err(|_| worker_closed())
+    }
+
+    async fn read(&self) -> Result<(u64, ferry_platform::Result<ClipboardContent>)> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(ClipboardWork::Read(reply))
+            .await
+            .map_err(|_| worker_closed())?;
+        result.await.map_err(|_| worker_closed())
+    }
+
+    async fn write(&self, content: ClipboardContent) -> Result<u64> {
+        let (reply, result) = oneshot::channel();
+        self.requests
+            .send(ClipboardWork::Write(content, reply))
+            .await
+            .map_err(|_| worker_closed())?;
+        result
+            .await
+            .map_err(|_| worker_closed())?
+            .map_err(Error::from)
+    }
+}
+
+#[derive(Default)]
+struct ClipboardCache {
+    entry: Option<CachedClipboard>,
+}
+
+struct CachedClipboard {
+    count: u64,
+    content: ClipboardContent,
+    used: Instant,
+}
+
+impl ClipboardCache {
+    fn expire(&mut self) {
+        if self
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.used.elapsed() >= CACHE_IDLE)
+        {
+            self.entry = None;
+        }
+    }
+
+    fn changed(&mut self, count: u64) {
+        if self
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.count != count)
+        {
+            self.entry = None;
+        }
+    }
+
+    fn read<C: Clipboard>(
+        &mut self,
+        clipboard: &mut C,
+    ) -> (u64, ferry_platform::Result<ClipboardContent>) {
+        let mut count = clipboard.change_count();
+        self.changed(count);
+        if let Some(entry) = &mut self.entry {
+            entry.used = Instant::now();
+            return (count, Ok(entry.content.clone()));
+        }
+        for _ in 0..STABLE_READ_ATTEMPTS {
+            let content = match clipboard.read() {
+                Ok(content) => content,
+                Err(error) => return (count, Err(error)),
+            };
+            let after = clipboard.change_count();
+            if count == after {
+                if content.total_len() <= CACHE_BYTES {
+                    self.entry = Some(CachedClipboard {
+                        count,
+                        content: content.clone(),
+                        used: Instant::now(),
+                    });
+                }
+                return (count, Ok(content));
+            }
+            count = after;
+        }
+        (
+            count,
+            Err(ferry_platform::Error::Failed(
+                "剪贴板在读取期间持续变化，请稍后再试".into(),
+            )),
+        )
+    }
+}
+
+fn worker_closed() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "剪贴板工作线程已停止",
+    ))
+}
 
 /// 正在运行的同步任务，丢弃即停止。
 pub(crate) struct ClipboardTask(JoinHandle<()>);
+
+impl ClipboardTask {
+    pub(crate) async fn finished(&mut self) {
+        let _ = (&mut self.0).await;
+    }
+}
 
 impl Drop for ClipboardTask {
     fn drop(&mut self) {
@@ -84,9 +278,12 @@ pub(crate) enum Start {
     Announce,
     /// 客户端的旧内容只记下计数，免得一连上就覆盖服务端。
     Quiet,
+    /// 数据连接恢复时，当前有光标的一方才是权威来源，不再重放首次连接的旧内容。
+    Resume,
 }
 
 /// 和哪台设备同步，结果报告给谁，单项多大以内才同步。
+#[derive(Clone)]
 pub(crate) struct Reporter {
     pub(crate) peer: Fingerprint,
     pub(crate) events: Events,
@@ -138,7 +335,7 @@ struct ClipboardSync<S, C> {
     clipboard: SharedClipboard<C>,
     active: watch::Receiver<bool>,
     /// 最近一次看到的本机剪贴板变化计数。
-    seen: u64,
+    seen: Option<u64>,
     /// 最近一次通告出去的本机内容，等对方来拉取。拉走一种格式就放掉一种，大图片不长期占着内存。
     offered: Option<(u32, ClipboardContent)>,
     next_seq: u32,
@@ -180,7 +377,7 @@ where
             framed,
             clipboard,
             active,
-            seen: 0,
+            seen: None,
             offered: None,
             next_seq: 1,
             offer: None,
@@ -194,9 +391,9 @@ where
     }
 
     async fn run(&mut self, start: Start) -> Result<()> {
-        let count = self.lock().change_count();
-        self.seen = count;
-        if self.sync && start == Start::Announce {
+        let count = self.clipboard.count().await?;
+        self.seen = Some(count);
+        if self.sync && (start == Start::Announce || (start == Start::Resume && self.is_active())) {
             self.offer_local().await?;
         }
 
@@ -234,6 +431,17 @@ where
     }
 
     async fn on_message(&mut self, message: Message) -> Result<()> {
+        if !self.sync
+            && matches!(
+                &message,
+                Message::ClipboardOffer(_)
+                    | Message::ClipboardRequest(_)
+                    | Message::Chunk(_)
+                    | Message::Cancel(_)
+            )
+        {
+            return Err(Error::Protocol("未协商剪贴板同步"));
+        }
         match message {
             Message::Ping { nonce } => send(&mut self.framed, &Message::Pong { nonce }).await?,
             Message::ClipboardOffer(offer) => {
@@ -246,22 +454,21 @@ where
                 }
             }
             Message::ClipboardRequest(request) => self.serve(request).await?,
-            Message::Chunk(chunk) => self.on_chunk(chunk)?,
+            Message::Chunk(chunk) => self.on_chunk(chunk).await?,
             Message::Cancel(cancel) => {
                 if let Some(fetch) = self.fetch.as_mut()
                     && fetch.pending.remove(&cancel.transfer).is_some()
                 {
                     debug!(reason = cancel.reason.0, "对方取消了一个格式的传输");
-                    self.finish_if_done()?;
+                    self.finish_if_done().await?;
                 }
             }
             message @ (Message::FileOffer(_)
             | Message::FileAccept { .. }
-            | Message::FileCancel(_)) => {
-                if let Some(files) = &self.files {
-                    files.on_control(message);
-                }
-            }
+            | Message::FileCancel(_)) => match &self.files {
+                Some(files) => files.on_control(message),
+                None => return Err(Error::Protocol("未协商文件传输")),
+            },
             other => debug!(
                 kind = format_args!("{:#06x}", other.type_id()),
                 "数据连接上忽略消息"
@@ -272,22 +479,25 @@ where
 
     /// 本机剪贴板变了就通告。
     async fn poll(&mut self) -> Result<()> {
-        if self.lock().change_count() != self.seen {
+        if Some(self.clipboard.count().await?) != self.seen {
             self.offer_local().await?;
         }
         Ok(())
     }
 
     async fn offer_local(&mut self) -> Result<()> {
-        let (count, content) = {
-            let mut clipboard = self.lock();
-            (clipboard.change_count(), clipboard.read())
+        let (count, content) = self.clipboard.read().await?;
+        let content = match content {
+            Ok(content) => content,
+            Err(error) => {
+                // 失败不是一个新的空版本；保留重试机会，并拒绝对旧内容的迟到请求。
+                self.seen = None;
+                self.offered = None;
+                warn!("读取本机剪贴板失败：{error}");
+                return Ok(());
+            }
         };
-        self.seen = count;
-        let content = content.unwrap_or_else(|e| {
-            warn!("读取本机剪贴板失败：{e}");
-            ClipboardContent::new()
-        });
+        self.seen = Some(count);
 
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
@@ -300,7 +510,7 @@ where
             .filter(|&(_, size)| size > limit)
             .collect();
         for &(format, size) in &too_large {
-            content.remove(format);
+            content.remove_shared(format);
             info!(?format, size, limit, "剪贴板内容超过大小上限，没有通告");
             self.report.skipped(true, format, size, limit);
         }
@@ -326,7 +536,7 @@ where
         let Some(offer) = self.offer.take() else {
             return Ok(());
         };
-        let supported = self.lock().formats();
+        let supported = self.clipboard.formats;
         let limit = self.report.limit.get();
         let mut fetch = Fetch {
             seq: offer.seq,
@@ -376,7 +586,7 @@ where
             });
         }
         let data = match &mut self.offered {
-            Some((_, content)) if current => content.remove(request.format),
+            Some((_, content)) if current => content.remove_shared(request.format),
             _ => None,
         };
         let Some(data) = data else {
@@ -404,7 +614,7 @@ where
         Ok(())
     }
 
-    fn on_chunk(&mut self, chunk: Chunk) -> Result<()> {
+    async fn on_chunk(&mut self, chunk: Chunk) -> Result<()> {
         let Some(fetch) = self.fetch.as_mut() else {
             return Ok(());
         };
@@ -418,13 +628,13 @@ where
         if chunk.last {
             let (format, _, data) = fetch.pending.remove(&chunk.transfer).expect("刚刚查到过");
             fetch.done.insert(format, data);
-            self.finish_if_done()?;
+            self.finish_if_done().await?;
         }
         Ok(())
     }
 
     /// 所有格式都到齐（或被取消）后写入本机剪贴板。
-    fn finish_if_done(&mut self) -> Result<()> {
+    async fn finish_if_done(&mut self) -> Result<()> {
         if self.fetch.as_ref().is_some_and(|f| !f.pending.is_empty()) {
             return Ok(());
         }
@@ -434,19 +644,16 @@ where
         if fetch.done.is_empty() {
             return Ok(());
         }
-        let written = self.lock().write(&fetch.done);
+        let summary = ClipSummary::of(&fetch.done);
+        let written = self.clipboard.write(fetch.done).await;
         match written {
             Ok(count) => {
-                self.seen = count;
-                info!(
-                    seq = fetch.seq,
-                    bytes = fetch.done.total_len(),
-                    "已同步对方的剪贴板"
-                );
+                self.seen = Some(count);
+                info!(seq = fetch.seq, bytes = summary.bytes, "已同步对方的剪贴板");
                 self.report.events.emit(Event::Clipboard {
                     peer: self.report.peer,
                     to_peer: false,
-                    summary: ClipSummary::of(&fetch.done),
+                    summary,
                 });
             }
             Err(e) => warn!("写入本机剪贴板失败：{e}"),
@@ -456,10 +663,6 @@ where
 
     fn is_active(&self) -> bool {
         *self.active.borrow()
-    }
-
-    fn lock(&self) -> MutexGuard<'_, C> {
-        self.clipboard.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

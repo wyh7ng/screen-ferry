@@ -9,3 +9,5 @@ mod autostart;
 mod display;
 mod keymap;
 mod update;
+
+mod file_commit;

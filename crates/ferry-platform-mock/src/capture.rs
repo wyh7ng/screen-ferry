@@ -1,6 +1,7 @@
 //! 输入捕获：`InputCapture` 的测试实现。
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use ferry_platform::{CaptureEvent, CaptureSink, Captured, InputCapture, Result};
 use ferry_types::{LockKeys, Point};
@@ -29,7 +30,11 @@ impl MockCapture {
         let mut state = self.lock();
         let grabbed = state.grabbed;
         if let Some(sink) = state.sink.as_mut() {
-            sink(Captured { event, grabbed });
+            sink(Captured {
+                event,
+                grabbed,
+                captured_at: Instant::now(),
+            });
         }
     }
 
@@ -38,7 +43,11 @@ impl MockCapture {
         let mut state = self.lock();
         let grabbed = !state.grabbed;
         if let Some(sink) = state.sink.as_mut() {
-            sink(Captured { event, grabbed });
+            sink(Captured {
+                event,
+                grabbed,
+                captured_at: Instant::now(),
+            });
         }
     }
 

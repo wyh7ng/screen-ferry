@@ -27,7 +27,17 @@ class DevicePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.devices,
+        AppAspect.settings,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.clock,
+        AppAspect.updateReminder,
+      },
+    );
     final d = state.deviceSettings(peer.fingerprint);
     final server = state.isServer;
     final localMac = state.localIsMac;
@@ -268,7 +278,17 @@ class _Header extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.devices,
+        AppAspect.settings,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.clock,
+        AppAspect.updateReminder,
+      },
+    );
     final c = SfColors.of(context);
     final addr = state.peer?.fingerprint == peer.fingerprint ? state.peer?.addr ?? '' : '';
     final place = state.isServer ? state.placeOf(peer.fingerprint) : null;
@@ -351,7 +371,17 @@ class _ControlledBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.devices,
+        AppAspect.settings,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.clock,
+        AppAspect.updateReminder,
+      },
+    );
     final c = SfColors.of(context);
     final name = peer.displayName;
     return Container(
@@ -422,7 +452,17 @@ class _PointerSpeedState extends State<_PointerSpeed> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.devices,
+        AppAspect.settings,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.clock,
+        AppAspect.updateReminder,
+      },
+    );
     final c = SfColors.of(context);
     final d = widget.settings;
     const range = DeviceSettings.pointerDpiRange;
@@ -588,6 +628,11 @@ class _ModifierTable extends StatelessWidget {
               ),
             ],
           ),
+          if (localMac)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(context.l10n.macCapsMappingHint, style: TextStyle(fontSize: 12, color: c.muted)),
+            ),
           for (final key in ModifierKey.values)
             Padding(
               padding: const EdgeInsets.only(top: 8),
@@ -602,6 +647,7 @@ class _ModifierTable extends StatelessWidget {
                   SizedBox(width: 36, child: Icon(Icons.arrow_forward_rounded, size: 18, color: c.muted)),
                   Expanded(
                     child: _TargetMenu(
+                      capsOnly: localMac && key == ModifierKey.capsLock,
                       value: map[key],
                       changed: map[key] != _same(key),
                       peerMac: peerMac,
@@ -626,8 +672,10 @@ class _TargetMenu extends StatelessWidget {
     required this.peerMac,
     required this.label,
     required this.onSelected,
+    this.capsOnly = false,
   });
 
+  final bool capsOnly;
   final ModifierTarget value;
   final bool changed;
   final bool peerMac;
@@ -647,6 +695,7 @@ class _TargetMenu extends StatelessWidget {
       itemBuilder: (_) => [
         for (final t in ModifierTarget.values)
           PopupMenuItem(
+            enabled: !capsOnly || t == ModifierTarget.capsLock || t == ModifierTarget.none,
             value: t,
             child: Text(
               modifierTargetName(context.l10n, t, mac: peerMac),
@@ -781,7 +830,17 @@ class _ConnectionState extends State<_Connection> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.devices,
+        AppAspect.settings,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.clock,
+        AppAspect.updateReminder,
+      },
+    );
     final c = SfColors.of(context);
     final peer = widget.peer;
     final server = state.settings.server.trim();
@@ -896,7 +955,17 @@ class _ManageState extends State<_Manage> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.devices,
+        AppAspect.settings,
+        AppAspect.connection,
+        AppAspect.local,
+        AppAspect.clock,
+        AppAspect.updateReminder,
+      },
+    );
     final d = widget.settings;
     return SfGroup(
       children: [

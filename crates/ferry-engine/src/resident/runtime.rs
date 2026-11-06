@@ -1,14 +1,22 @@
-//! 常驻运行的状态：引擎的启停、引擎事件与界面命令的处理、给界面的状态快照。
+//! 常驻运行的状态、引擎生命周期与事件分派。
 
-use std::collections::{BTreeMap, HashMap};
+mod commands;
+mod projection;
+mod reporting;
+mod settings;
+mod tasks;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferry_core::Redactor;
+use ring::rand::{SecureRandom, SystemRandom};
 
 use ferry_ipc::{
     ClipboardImage, ClipboardSync, DialError as IpcDialError, FoundDevice, Link, LinkStatus, Local,
@@ -22,7 +30,7 @@ use ferry_types::{
 };
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
 use super::confirm::{PairAsk, UiConfirm};
@@ -60,6 +68,33 @@ struct EngineTask {
     client: Option<mpsc::UnboundedSender<ClientCommand>>,
 }
 
+pub(crate) enum WorkResult {
+    PlatformInfo {
+        addresses: Vec<String>,
+        natural_scrolling: Option<bool>,
+    },
+    EngineExit(Result<Infallible>),
+    Sent {
+        from: u64,
+        command_id: Option<u64>,
+        result: Result<String, String>,
+    },
+    RunLog {
+        from: u64,
+        chunk: diagnostics::Chunk,
+        request_id: Option<u64>,
+    },
+    Diagnostic {
+        from: u64,
+        command_id: Option<u64>,
+        result: Result<(Option<PathBuf>, String), String>,
+    },
+    Preview {
+        generation: u64,
+        result: Result<PathBuf, String>,
+    },
+}
+
 struct Pending {
     prompt: PairingPrompt,
     reply: oneshot::Sender<bool>,
@@ -71,12 +106,28 @@ struct LinkInfo {
     peer: PeerRef,
     /// 连上的时刻（Unix 毫秒）。
     since: i64,
+    started: Instant,
     rtt: Rtt,
 }
 
 pub(crate) struct Runtime<H: Host> {
     store: Store,
-    host: H,
+    session: String,
+    performance: BTreeMap<String, ferry_ipc::PeerPerformance>,
+    command_error: Option<String>,
+    next_operation: u64,
+    dial_requests: HashMap<u64, (u64, u64, Instant)>,
+    host: Arc<H>,
+    workers: JoinSet<WorkResult>,
+    background: JoinSet<()>,
+    generation_signal: watch::Sender<u64>,
+    addresses: Vec<String>,
+    natural_scrolling: Option<bool>,
+    platform_info_at: Instant,
+    platform_info_pending: bool,
+    preview_generation: u64,
+    preview_busy: bool,
+    preview_pending: Option<(u64, Arc<[u8]>)>,
     config: Config,
     name: String,
     fingerprint: Fingerprint,
@@ -89,6 +140,7 @@ pub(crate) struct Runtime<H: Host> {
 
     paused: bool,
     engine: Option<EngineTask>,
+    generation: u64,
     retry_at: Option<Instant>,
     problem: Option<Problem>,
 
@@ -119,6 +171,7 @@ pub(crate) struct Runtime<H: Host> {
     last_second: Instant,
 
     clients: BTreeMap<u64, mpsc::Sender<Notice>>,
+    logs_in_flight: HashSet<u64>,
     next_client: u64,
     /// 界面或 `quit` 命令请后台退出了。
     quit_requested: bool,
@@ -157,6 +210,11 @@ impl<H: Host> Runtime<H> {
         asks: mpsc::UnboundedSender<PairAsk>,
         update_tx: mpsc::UnboundedSender<UpdateEvent>,
     ) -> Result<Self> {
+        let mut epoch = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut epoch)
+            .map_err(|_| std::io::Error::other("无法生成后台会话标识"))?;
+        let session = epoch.iter().map(|b| format!("{b:02x}")).collect();
         let config = store.config()?;
         let updates = Updates::new(
             host.updater(),
@@ -170,7 +228,8 @@ impl<H: Host> Runtime<H> {
         let autostart = host.autostart();
         let system = host.system();
         let lang = config.language.resolve(host.system_language());
-        let files = Files::new(&store, events.clone());
+        let files = Files::new(&store, events.clone(), host.file_committer());
+        files.set_rate_limit(config.file_rate_limit_bytes());
         let edge = EdgeDrop::spawn(
             host.overlay(),
             files.clone(),
@@ -182,9 +241,29 @@ impl<H: Host> Runtime<H> {
         if let Err(e) = store.clear_blobs() {
             warn!("清理上次的剪贴板预览失败：{e}");
         }
+        let addresses = ferry_net::local_addresses()
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        let natural_scrolling = host.natural_scrolling();
         let mut runtime = Self {
             store,
-            host,
+            addresses,
+            natural_scrolling,
+            platform_info_at: Instant::now(),
+            platform_info_pending: false,
+            session,
+            performance: BTreeMap::new(),
+            command_error: None,
+            next_operation: 1,
+            dial_requests: HashMap::new(),
+            host: Arc::new(host),
+            workers: JoinSet::new(),
+            background: JoinSet::new(),
+            generation_signal: watch::Sender::new(0),
+            preview_generation: 0,
+            preview_busy: false,
+            preview_pending: None,
             config,
             name,
             fingerprint,
@@ -194,6 +273,7 @@ impl<H: Host> Runtime<H> {
             edge,
             paused: false,
             engine: None,
+            generation: 0,
             retry_at: None,
             problem: None,
             status: LinkStatus::Starting,
@@ -214,6 +294,7 @@ impl<H: Host> Runtime<H> {
             activity: Activity::default(),
             last_second: Instant::now(),
             clients: BTreeMap::new(),
+            logs_in_flight: HashSet::new(),
             next_client: 1,
             quit_requested: false,
             pending: BTreeMap::new(),
@@ -265,12 +346,12 @@ impl<H: Host> Runtime<H> {
     }
 
     /// 退出前告诉所有界面一起关闭，并放开它们的发送队列：每个界面的发送任务写完这条后结束。
-    /// 返回当时连着几个界面。
-    pub(crate) fn farewell(&mut self) -> usize {
+    /// 返回等待发送完毕的具体界面，旧连接迟到的Left不能代替它们。
+    pub(crate) fn farewell(&mut self) -> HashSet<u64> {
         self.broadcast(Notice::Quit);
-        let count = self.clients.len();
+        let waiting = self.clients.keys().copied().collect();
         self.clients.clear();
-        count
+        waiting
     }
 
     // ── 引擎 ─────────────────────────────────────
@@ -282,7 +363,10 @@ impl<H: Host> Runtime<H> {
         self.retry_at = None;
         self.status = LinkStatus::Starting;
         self.dirty = true;
+        self.generation = self.generation.wrapping_add(1);
+        self.generation_signal.send_replace(self.generation);
         let confirm = UiConfirm {
+            generation: self.generation,
             asks: self.asks.clone(),
         };
         let started = match self.config.role {
@@ -306,7 +390,7 @@ impl<H: Host> Runtime<H> {
             command_key: uses_command_key(),
             store: self.store.clone(),
             announce: self.config.announce,
-            events: self.events.clone(),
+            events: self.events.scoped(self.generation),
             files: self.files.clone(),
             edge: self.edge.feed(),
         };
@@ -327,10 +411,8 @@ impl<H: Host> Runtime<H> {
     fn spawn_client(&mut self, confirm: UiConfirm) -> Result<()> {
         self.host.check_permissions(Role::Client)?;
         let inject = self.host.inject()?;
-        let server = match self.config.server.trim() {
-            "" => ServerAddr::Discover,
-            text => ServerAddr::Fixed(resolve(text)?),
-        };
+        let address = self.config.server.trim().to_owned();
+        let server = ServerAddr::Discover;
         let (commands_tx, commands) = mpsc::unbounded_channel();
         let config = ClientConfig {
             server,
@@ -339,7 +421,7 @@ impl<H: Host> Runtime<H> {
             clipboard_limit: self.clip_limit.clone(),
             command_key: uses_command_key(),
             store: self.store.clone(),
-            events: self.events.clone(),
+            events: self.events.scoped(self.generation),
             files: self.files.clone(),
             edge: self.edge.feed(),
             devices: self.config.devices.clone(),
@@ -347,7 +429,17 @@ impl<H: Host> Runtime<H> {
             invite_port: Some(self.host.invite_port()),
         };
         let (displays, clipboard) = (self.host.displays(), self.host.clipboard());
-        let handle = tokio::spawn(connect(config, inject, displays, clipboard, confirm));
+        let handle = tokio::spawn(async move {
+            let mut config = config;
+            if !address.is_empty() {
+                config.server = ServerAddr::Fixed(
+                    resolve_input(&address, DEFAULT_PORT)
+                        .await
+                        .ok_or_else(|| Error::BadAddress(address))?,
+                );
+            }
+            connect(config, inject, displays, clipboard, confirm).await
+        });
         self.engine = Some(EngineTask {
             handle,
             live: None,
@@ -358,9 +450,16 @@ impl<H: Host> Runtime<H> {
 
     /// 停下引擎：丢弃它的任务，引擎随之归还鼠标控制、松开按键、断开连接。
     pub(crate) async fn stop_engine(&mut self) {
+        self.background.abort_all();
+        self.generation = self.generation.wrapping_add(1);
+        self.generation_signal.send_replace(self.generation);
         if let Some(task) = self.engine.take() {
             task.handle.abort();
             let _ = task.handle.await;
+        }
+        let closed: Vec<_> = self.pending.keys().copied().collect();
+        for id in closed {
+            self.answer(id, false);
         }
         self.edge.feed().reset();
         self.invite_port = None;
@@ -373,22 +472,16 @@ impl<H: Host> Runtime<H> {
         self.start_engine();
     }
 
-    /// 等待引擎自己结束（只会因为出错）。没有在运行的引擎时永远不返回。
-    pub(crate) async fn engine_exit(&mut self) -> Result<Infallible> {
-        let Some(task) = self.engine.as_mut() else {
-            return std::future::pending().await;
-        };
-        let result = (&mut task.handle).await;
-        self.engine = None;
-        match result {
-            Ok(result) => result,
-            Err(e) => Err(Error::Io(std::io::Error::other(format!(
-                "引擎意外退出：{e}"
-            )))),
-        }
-    }
-
     pub(crate) fn on_engine_exit(&mut self, result: Result<Infallible>) {
+        self.background.abort_all();
+        self.generation = self.generation.wrapping_add(1);
+        self.generation_signal.send_replace(self.generation);
+        let closed: Vec<_> = self.pending.keys().copied().collect();
+        for id in closed {
+            self.answer(id, false);
+        }
+        self.edge.feed().reset();
+        self.invite_port = None;
         let Err(e) = result;
         warn!("引擎停止：{e}");
         self.drop_link();
@@ -466,11 +559,15 @@ impl<H: Host> Runtime<H> {
             devices: self.config.devices.clone(),
             fallback: DeviceSettings::default(),
             mouse_dpi: self.config.mouse_dpi(),
+            input: crate::InputSettings {
+                coalesce_motion: self.config.coalesce_motion,
+            },
         }
     }
 
     /// 连接全没了（引擎停下）：记下各台设备最后在线的时刻，清空与连接有关的状态。
     fn drop_link(&mut self) {
+        self.performance.clear();
         if self.engine.is_none() {
             self.port = None;
         }
@@ -534,6 +631,11 @@ impl<H: Host> Runtime<H> {
     // ── 引擎事件 ─────────────────────────────────
 
     pub(crate) fn on_engine(&mut self, event: Event) {
+        let event = match event {
+            Event::Engine { generation, event } if generation == self.generation => *event,
+            Event::Engine { .. } => return,
+            event => event,
+        };
         let progress = matches!(
             &event,
             Event::Transfer(TransferUpdate {
@@ -545,6 +647,21 @@ impl<H: Host> Runtime<H> {
             self.dirty = true;
         }
         match event {
+            Event::Engine { .. } => {}
+            Event::Metrics { peer, metrics } => {
+                if peer.is_some_and(|peer| {
+                    !self.links.iter().any(|link| {
+                        link.fingerprint == peer
+                            && metrics.collected_at.is_some_and(|at| at >= link.started)
+                    })
+                }) {
+                    return;
+                }
+                self.performance.insert(
+                    peer.map(|p| p.to_hex()).unwrap_or_default(),
+                    super::performance::project(peer, *metrics),
+                );
+            }
             Event::Listening { port, announced } => {
                 self.status = LinkStatus::Waiting;
                 self.port = Some(port);
@@ -562,14 +679,13 @@ impl<H: Host> Runtime<H> {
             }
             Event::InviteListening { port } => self.invite_port = Some(port),
             Event::Dialed {
+                request_id,
                 address,
                 invite,
                 error,
-            } => self.broadcast(Notice::Dialed {
-                address,
-                invite,
-                error: error.map(ipc_dial_error),
-            }),
+            } => {
+                self.dial_result(request_id, address, invite, error.map(ipc_dial_error));
+            }
             Event::Searching => {
                 if self.links.is_empty() {
                     self.status = LinkStatus::Searching;
@@ -593,6 +709,7 @@ impl<H: Host> Runtime<H> {
                 }
                 self.status = LinkStatus::Connected;
                 self.clear_problem();
+                self.performance.remove(&fingerprint.to_hex());
                 self.links.retain(|l| l.fingerprint != fingerprint);
                 self.links.push(LinkInfo {
                     fingerprint,
@@ -603,6 +720,7 @@ impl<H: Host> Runtime<H> {
                         addr: addr.ip().to_string(),
                     },
                     since: now_ms(),
+                    started: Instant::now(),
                     rtt: Rtt::default(),
                 });
                 self.focus = Some(fingerprint);
@@ -624,6 +742,7 @@ impl<H: Host> Runtime<H> {
                 );
             }
             Event::Disconnected { peer, reason } => {
+                self.performance.remove(&peer.to_hex());
                 let name = self.peer_name(&peer);
                 self.links.retain(|l| l.fingerprint != peer);
                 self.last_seen.insert(peer, now_ms());
@@ -757,10 +876,11 @@ impl<H: Host> Runtime<H> {
                     (None, Some(n)) => format!("文本 · {n} 字"),
                     (None, None) => size_text(summary.bytes),
                 };
+                self.preview_generation = self.preview_generation.wrapping_add(1);
                 let image = summary.image.map(|image| ClipboardImage {
                     width: image.width,
                     height: image.height,
-                    path: self.save_preview(&image.png),
+                    path: self.save_preview(image.png.clone()),
                 });
                 self.clipboard = Some(ClipboardSync {
                     to_peer,
@@ -864,10 +984,15 @@ impl<H: Host> Runtime<H> {
     // ── 配对 ─────────────────────────────────────
 
     pub(crate) fn on_pairing(&mut self, ask: PairAsk) {
+        if ask.generation != self.generation || ask.reply.is_closed() || self.paused {
+            let _ = ask.reply.send(false);
+            return;
+        }
         let id = self.next_prompt;
         self.next_prompt += 1;
         let request = &ask.request;
         let prompt = PairingPrompt {
+            session: self.session.clone(),
             id,
             peer_name: request.peer_name.clone(),
             fingerprint: request.peer_fingerprint.to_hex(),
@@ -952,126 +1077,9 @@ impl<H: Host> Runtime<H> {
             }
             UiEvent::Request { id, request } => self.on_request(id, request).await,
             UiEvent::Left { id } => {
+                self.logs_in_flight.remove(&id);
                 self.clients.remove(&id);
             }
-        }
-    }
-
-    async fn on_request(&mut self, from: u64, request: Request) {
-        match request {
-            Request::Hello { .. } => {}
-            Request::SetSharing { on } => self.set_sharing(on).await,
-            Request::UpdateSettings { settings } => self.update_settings(settings).await,
-            Request::SetDevice { device } => self.set_device(device).await,
-            Request::OpenPeerSettings { fingerprint } => self.open_peer_settings(&fingerprint),
-            Request::Forget { fingerprint } => self.forget(&fingerprint).await,
-            Request::PairReply { id, accept } => self.answer(id, accept),
-            Request::Connect { fingerprint } => self.connect_to(&fingerprint),
-            Request::ConnectAddress { address } => self.connect_address(address),
-            Request::Invite { address } => self.invite_address(address),
-            Request::OpenPermissionSettings => self.host.open_permission_settings(),
-            Request::ClearLog => {
-                self.log.clear();
-                self.broadcast(Notice::History {
-                    entries: Vec::new(),
-                });
-            }
-            Request::OpenSettings => self.open_settings(),
-            Request::SendFiles { paths, to } => self.send_files(paths, to).await,
-            Request::Quit => {
-                info!("收到退出请求");
-                self.quit_requested = true;
-            }
-            Request::ReadRunLog { since } => {
-                let chunk = diagnostics::read(&self.store.log_file(), since);
-                self.reply(
-                    from,
-                    Notice::RunLog {
-                        lines: chunk.lines,
-                        next: chunk.next,
-                        fresh: chunk.fresh,
-                        bytes: chunk.bytes,
-                        lines_total: chunk.lines_total,
-                    },
-                );
-            }
-            Request::ExportDiagnostics => self.export_diagnostics(from),
-            Request::CopyDiagnostics => {
-                let text = self.diagnostics(true);
-                self.reply(from, Notice::DiagnosticsSummary { text });
-            }
-            Request::RevealDiagnostics => match &self.last_export {
-                Some(path) if path.exists() => self.host.reveal(path),
-                _ => self.reply(
-                    from,
-                    Notice::Toast {
-                        text: "诊断文件已经不在了，请重新导出".into(),
-                        phrase: Some(Phrase::new("diagnostics_missing")),
-                    },
-                ),
-            },
-            Request::OpenLogsFolder => {
-                let dir = self.store.logs_dir();
-                let _ = fs::create_dir_all(&dir);
-                self.host.open_folder(&dir);
-            }
-            Request::SetVerbose { on } => self.set_verbose(on),
-            Request::CheckUpdate => self.updates.check(true),
-            Request::DownloadUpdate => self.updates.download(),
-            Request::CancelUpdate => self.updates.cancel(),
-            Request::InstallUpdate => self.updates.install(!self.clients.is_empty()),
-            Request::DismissUpdate { version } => self.updates.dismiss(version),
-        }
-        self.dirty = true;
-    }
-
-    /// 把剪贴板图片存一份给设置界面预览，换掉上一份。存不下来时界面只显示尺寸。
-    fn save_preview(&mut self, png: &[u8]) -> Option<String> {
-        let saved = match self.store.put_blob(png) {
-            Ok(path) => path,
-            Err(e) => {
-                warn!("保存剪贴板图片的预览失败：{e}");
-                return None;
-            }
-        };
-        if let Some(old) = self.clip_preview.replace(saved.clone())
-            && old != saved
-            && let Err(e) = self.store.remove_blob(&old)
-        {
-            warn!("删除上一张剪贴板预览失败：{e}");
-        }
-        Some(saved.display().to_string())
-    }
-
-    /// 发给 `to`（证书指纹）；不指定时发给光标最近去过的那台，只连着一台时就是它。
-    async fn send_files(&mut self, paths: Vec<String>, to: Option<String>) {
-        let paths = paths.into_iter().map(PathBuf::from).collect();
-        let target = match to {
-            Some(hex) => hex.parse::<Fingerprint>().ok(),
-            None => self.focus_link().map(|l| l.fingerprint),
-        };
-        let Some(peer) = target else {
-            return self.toast(
-                Phrase::new("not_connected"),
-                Error::NotConnected.to_string(),
-            );
-        };
-        if !self.config.device(&peer.to_hex()).files {
-            let name = self.peer_name(&peer);
-            return self.toast(
-                Phrase::new("files_disabled").arg("name", &name),
-                format!("已在设置里关掉了拖文件给 {name}"),
-            );
-        }
-        match self.files.send(peer, paths).await {
-            Ok(_) => {
-                let name = self.peer_name(&peer);
-                self.toast(
-                    Phrase::new("sending").arg("name", &name),
-                    format!("开始发给 {name}"),
-                );
-            }
-            Err(e) => self.toast(Phrase::new("error").arg("message", &e), e.to_string()),
         }
     }
 
@@ -1169,9 +1177,7 @@ impl<H: Host> Runtime<H> {
     }
 
     /// 为安装更新退出时（macOS）交给 `run` 的安装。
-    pub(crate) fn take_restart(
-        &mut self,
-    ) -> Option<(std::sync::Arc<H::Updater>, ferry_platform::Prepared)> {
+    pub(crate) fn take_restart(&mut self) -> Option<(Arc<H::Updater>, ferry_platform::Prepared)> {
         self.updates.take_restart()
     }
 
@@ -1203,422 +1209,35 @@ impl<H: Host> Runtime<H> {
         }
     }
 
-    async fn set_sharing(&mut self, on: bool) {
-        if on != self.paused {
-            return;
-        }
-        self.paused = !on;
-        self.problem = None;
-        self.dirty = true;
-        if on {
-            self.start_engine();
-            let phrase = Phrase::new("sharing_resumed");
-            self.log(
-                LogKind::Link,
-                LogIcon::Play,
-                phrase.clone(),
-                "继续共享",
-                "键鼠可以切到对方",
-            );
-            self.toast(phrase, "已继续共享");
-        } else {
-            self.stop_engine().await;
-            self.status = LinkStatus::Paused;
-            let phrase = Phrase::new("sharing_paused");
-            self.log(
-                LogKind::Link,
-                LogIcon::Pause,
-                phrase.clone(),
-                "暂停共享",
-                "键鼠留在本机",
-            );
-            self.toast(phrase, "已暂停共享");
-        }
-    }
-
-    async fn update_settings(&mut self, patch: SettingsPatch) {
-        let mut next = self.config.clone();
-        // 需要重新握手才能生效的设置。
-        let mut restart = false;
-        if let Some(name) = patch.name {
-            restart |= name != next.name;
-            next.name = name;
-        }
-        let role_changed = patch.role.filter(|&role| role != next.role);
-        if let Some(role) = role_changed {
-            restart = true;
-            next.role = role;
-        }
-        if let Some(announce) = patch.announce {
-            restart |= announce != next.announce;
-            next.announce = announce;
-        }
-        if let Some(clipboard) = patch.clipboard {
-            restart |= clipboard != next.clipboard;
-            next.clipboard = clipboard;
-        }
-        if let Some(mb) = patch.clipboard_limit_mb {
-            let range = Config::CLIPBOARD_LIMIT_MB;
-            next.clipboard_limit_mb = mb.clamp(*range.start(), *range.end());
-        }
-        if let Some(server) = patch.server {
-            restart |= server != next.server;
-            next.server = server;
-        }
-        let moved = patch.side.filter(|&side| side != next.side);
-        if let Some(side) = patch.side {
-            next.side = side;
-        }
-        let arranged = patch.layout.as_ref().is_some_and(|l| *l != next.layout);
-        if let Some(layout) = patch.layout {
-            next.layout = layout;
-        }
-        if let Some(dpi) = patch.mouse_dpi {
-            let range = Config::MOUSE_DPI;
-            next.mouse_dpi = dpi.clamp(*range.start(), *range.end());
-        }
-        if let Some(theme) = patch.theme {
-            next.theme = theme;
-        }
-        if let Some(on) = patch.auto_update {
-            next.auto_update = on;
-        }
-        if let Some(language) = patch.language {
-            next.language = language;
-            self.lang = language.resolve(self.host.system_language());
-            self.edge.set_lang(self.lang);
-        }
-        if let Some(accent) = patch.accent {
-            next.accent = accent;
-            self.edge.set_accent(accent_color(accent));
-        }
-        if let Some(on) = patch.autostart {
-            match self.host.set_autostart(on) {
-                Ok(()) => self.autostart = self.host.autostart(),
-                Err(e) => self.toast(
-                    Phrase::new("autostart_failed").arg("message", &e),
-                    format!("无法修改开机自启：{e}"),
-                ),
-            }
-            self.dirty = true;
-        }
-
-        if next != self.config {
-            if let Err(e) = self.store.save_config(&next) {
-                self.toast(
-                    Phrase::new("save_failed").arg("message", &e),
-                    format!("保存设置失败：{e}"),
-                );
-                return;
-            }
-            self.config = next;
-            self.clip_limit.set(self.config.clipboard_limit_bytes());
-            self.dirty = true;
-        }
-        if arranged {
-            self.log(
-                LogKind::Link,
-                LogIcon::Layout,
-                Phrase::new("layout_arranged"),
-                "调整了设备的位置",
-                "布局已保存",
-            );
-        } else if let Some(side) = moved {
-            let (name, peer) = match self.links.as_slice() {
-                [only] => (
-                    only.peer.name.clone(),
-                    mark::device(&only.peer.name).to_string(),
-                ),
-                _ => (String::new(), "其他设备".to_owned()),
-            };
-            let phrase = Phrase::new("layout_moved")
-                .arg("name", &name)
-                .arg("side", side_key(side));
-            self.log(
-                LogKind::Link,
-                LogIcon::Layout,
-                phrase,
-                format!("{peer} 移到本机{}", side_label(side)),
-                "布局已保存",
-            );
-        }
-        if let Some(role) = role_changed {
-            // 另一种角色用不上之前发现的服务端。
-            self.found.clear();
-            let (key, text, detail) = match role {
-                Role::Server => (
-                    "server",
-                    "改为控制别的电脑",
-                    "键盘鼠标在本机，等另一台电脑来连接",
-                ),
-                Role::Client => (
-                    "client",
-                    "改为由另一台电脑控制",
-                    "在局域网里寻找键盘鼠标所在的那台",
-                ),
-            };
-            let phrase = Phrase::new("role_changed").arg("role", key);
-            self.log(LogKind::Link, LogIcon::Settings, phrase, text, detail);
-        }
-        if restart {
-            self.name = resolve_name(&self.config, &self.host);
-            self.restart_engine().await;
-        } else {
-            self.push_live();
-        }
-    }
-
-    /// 换上一台设备的单独设置。服务端上立即生效；剪贴板开关要重新连接才生效，
-    /// 客户端上对服务端的剪贴板、拖文件开关也一样。
-    async fn set_device(&mut self, device: DeviceSettings) {
-        let Ok(fingerprint) = device.fingerprint.parse::<Fingerprint>() else {
-            return;
-        };
-        // 统一写成小写十六进制，免得同一台设备有两条。
-        let device = DeviceSettings {
-            fingerprint: fingerprint.to_hex(),
-            ..device.clamped()
-        };
-        let before = self.config.device(&device.fingerprint);
-        if before == device {
-            return;
-        }
-        let mut next = self.config.clone();
-        next.set_device(device.clone());
-        if let Err(e) = self.store.save_config(&next) {
-            return self.toast(
-                Phrase::new("save_failed").arg("message", &e),
-                format!("保存设置失败：{e}"),
-            );
-        }
-        self.config = next;
-        self.dirty = true;
-        let linked = self.links.iter().any(|l| l.fingerprint == fingerprint);
-        let reconnect = linked
-            && (before.clipboard != device.clipboard
-                || (self.config.role == Role::Client && before.files != device.files));
-        if reconnect {
-            self.restart_engine().await;
-        } else {
-            self.push_live();
-        }
-    }
-
-    /// 客户端：请连着的服务端打开它的设置界面。
-    fn open_peer_settings(&mut self, fingerprint: &str) {
-        let Ok(fingerprint) = fingerprint.parse::<Fingerprint>() else {
-            return;
-        };
-        let online = self.links.iter().any(|l| l.fingerprint == fingerprint);
-        let commands = self.engine.as_ref().and_then(|t| t.client.as_ref());
-        match commands {
-            Some(commands) if online => {
-                let _ = commands.send(ClientCommand::OpenPeerSettings);
-            }
-            _ => {
-                let name = self.peer_name(&fingerprint);
-                self.toast(
-                    Phrase::new("peer_offline").arg("name", &name),
-                    format!("{name} 现在没连着"),
-                );
-            }
-        }
-    }
-
-    /// 把服务端的即时设置（布局、每台设备的设置）交给正在运行的引擎。
-    fn push_live(&self) {
-        if let Some(live) = self.engine.as_ref().and_then(|t| t.live.as_ref()) {
-            live.send_if_modified(|current| {
-                let next = self.live();
-                let changed = *current != next;
-                *current = next;
-                changed
-            });
-        }
-    }
-
-    async fn forget(&mut self, fingerprint: &str) {
-        let Ok(fingerprint) = fingerprint.parse::<Fingerprint>() else {
-            return;
-        };
-        let mut peers = match self.store.peers() {
-            Ok(peers) => peers,
-            Err(e) => {
-                return self.toast(
-                    Phrase::new("peers_read_failed").arg("message", &e),
-                    format!("读取已配对设备失败：{e}"),
-                );
-            }
-        };
-        let Some(name) = peers.get(&fingerprint).map(|p| p.name.clone()) else {
-            return;
-        };
-        peers.remove(&fingerprint);
-        if let Err(e) = self.store.save_peers(&peers) {
-            return self.toast(
-                Phrase::new("remove_failed").arg("message", &e),
-                format!("移除失败：{e}"),
-            );
-        }
-        self.refresh_peers();
-        // 它的位置安排和单独设置也不再需要。
-        let hex = fingerprint.to_hex();
-        if self.config.layout.iter().any(|p| p.fingerprint == hex)
-            || self.config.devices.iter().any(|d| d.fingerprint == hex)
-        {
-            let mut next = self.config.clone();
-            next.layout.retain(|p| p.fingerprint != hex);
-            next.devices.retain(|d| d.fingerprint != hex);
-            match self.store.save_config(&next) {
-                Ok(()) => self.config = next,
-                Err(e) => warn!("保存设置失败：{e}"),
-            }
-        }
-        let phrase = Phrase::new("removed").arg("name", &name);
-        self.log(
-            LogKind::Link,
-            LogIcon::Unlink,
-            phrase.clone(),
-            format!("已移除 {}", mark::device(&name)),
-            "下次连接需要重新配对",
-        );
-        self.toast(phrase, format!("已移除 {name}"));
-        // 正连着这台：断开它，它下次来要重新配对。
-        if self.links.iter().any(|l| l.fingerprint == fingerprint) {
-            self.restart_engine().await;
-        }
-    }
-
-    /// 客户端：连接局域网里发现的一台服务端。只连这一次，不把地址写死。
-    fn connect_to(&mut self, fingerprint: &str) {
-        if self.config.role != Role::Client {
-            return;
-        }
-        let Ok(fingerprint) = fingerprint.parse::<Fingerprint>() else {
-            return;
-        };
-        let Some(addr) = self
-            .found
-            .iter()
-            .find(|f| f.fingerprint == fingerprint)
-            .and_then(|f| f.addrs.first().copied())
-        else {
-            return self.toast(Phrase::new("server_gone"), "这台电脑已经不在局域网里了");
-        };
-        self.dial(addr);
-    }
-
-    /// 客户端：按地址连接一台服务端。电脑名在后台解析，结果以 `dialed` 告诉界面。
-    fn connect_address(&mut self, address: String) {
-        if self.config.role != Role::Client {
-            return self.broadcast(Notice::Dialed {
-                address,
-                invite: false,
-                error: Some(IpcDialError::WrongRole),
-            });
-        }
-        let Some(commands) = self.engine.as_ref().and_then(|t| t.client.clone()) else {
-            self.toast(
-                Phrase::new("paused_connect_later"),
-                "已暂停共享，继续共享后再连接",
-            );
-            return self.broadcast(Notice::Dialed {
-                address,
-                invite: false,
-                error: Some(IpcDialError::Unreachable),
-            });
-        };
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            match resolve_input(&address, DEFAULT_PORT).await {
-                Some(addr) => {
-                    let _ = commands.send(ClientCommand::Connect(addr));
-                }
-                None => events.emit(Event::Dialed {
-                    address,
-                    invite: false,
-                    error: Some(DialError::BadAddress),
-                }),
-            }
-        });
-    }
-
-    fn dial(&mut self, addr: SocketAddr) {
-        match self.engine.as_ref().and_then(|t| t.client.as_ref()) {
-            Some(commands) => {
-                let _ = commands.send(ClientCommand::Connect(addr));
-            }
-            None => self.toast(
-                Phrase::new("paused_connect_later"),
-                "已暂停共享，继续共享后再连接",
-            ),
-        }
-    }
-
-    /// 服务端：邀请这个地址上的电脑连过来。结果以 `dialed` 告诉界面。
-    fn invite_address(&mut self, address: String) {
-        let refuse = |error| Notice::Dialed {
-            address: address.clone(),
-            invite: true,
-            error: Some(error),
-        };
-        if self.config.role != Role::Server {
-            return self.broadcast(refuse(IpcDialError::WrongRole));
-        }
-        let Some(port) = self.port else {
-            self.toast(
-                Phrase::new("not_sharing_invite_later"),
-                "还没开始共享，开始后再邀请",
-            );
-            return self.broadcast(refuse(IpcDialError::Unreachable));
-        };
-        let (store, name, events) = (self.store.clone(), self.name.clone(), self.events.clone());
-        tokio::spawn(async move {
-            let error = match resolve_input(&address, INVITE_PORT).await {
-                None => Some(DialError::BadAddress),
-                Some(addr) => invite(&store, &name, addr, port)
-                    .await
-                    .err()
-                    .map(|e| DialError::of(&e)),
-            };
-            events.emit(Event::Dialed {
-                address,
-                invite: true,
-                error,
-            });
-        });
-    }
-
-    /// 服务端开始共享时，邀请上次连过、现在没连着的客户端：局域网发现不可靠时也能自己连上来。
-    /// 不成功也不提示。
-    fn invite_known(&self, port: u16) {
-        for peer in self.peers.iter() {
-            let Some(addr) = peer.addr else {
-                continue;
-            };
-            if self.links.iter().any(|l| l.fingerprint == peer.fingerprint) {
-                continue;
-            }
-            let to = SocketAddr::new(addr.ip(), INVITE_PORT);
-            let (store, name) = (self.store.clone(), self.name.clone());
-            tokio::spawn(async move {
-                if invite(&store, &name, to, port).await.is_ok() {
-                    info!(%to, "已邀请上次连过的电脑");
-                }
-            });
-        }
-    }
-
     // ── 定时 ─────────────────────────────────────
 
     /// 每 250 毫秒一次：结算每秒的统计、清理过期的配对请求、按时重试、推送状态。
     pub(crate) fn on_tick(&mut self) {
+        while self.background.try_join_next().is_some() {}
+        self.start_preview();
+        if !self.platform_info_pending
+            && self.platform_info_at.elapsed() >= Duration::from_secs(30)
+            && self.workers.len() < 8
+        {
+            let host = self.host.clone();
+            self.platform_info_pending = true;
+            self.workers
+                .spawn_blocking(move || WorkResult::PlatformInfo {
+                    addresses: ferry_net::local_addresses()
+                        .into_iter()
+                        .map(|ip| ip.to_string())
+                        .collect(),
+                    natural_scrolling: host.natural_scrolling(),
+                });
+        }
         let outcomes = self.updates.tick(self.config.auto_update);
         if !outcomes.is_empty() {
             self.apply(outcomes);
             self.dirty = true;
         }
         let now = Instant::now();
+        self.dial_requests
+            .retain(|_, (_, _, at)| now.duration_since(*at) < Duration::from_secs(60));
         if now.duration_since(self.last_second) >= Duration::from_secs(1) {
             self.last_second = now;
             for link in &mut self.links {
@@ -1700,197 +1319,25 @@ impl<H: Host> Runtime<H> {
         }
     }
 
-    // ── 运行日志与诊断文件 ───────────────────────
-
-    fn set_verbose(&mut self, on: bool) {
-        if on == self.verbose_since.is_some() {
-            return;
-        }
-        self.host.set_verbose(on);
-        self.verbose_since = on.then(now_ms);
-        info!("详细记录已{}", if on { "打开" } else { "关闭" });
-        self.dirty = true;
-    }
-
-    /// 把诊断文件存到“下载”文件夹，重名时加编号。
-    fn export_diagnostics(&mut self, from: u64) {
-        let text = self.diagnostics(false);
-        let (_, stamp) = diagnostics::local_time(now_ms(), self.host.utc_offset());
-        let dir = self.store.downloads_dir();
-        let name = ferry_core::file_name::unique(&format!("ScreenFerry-诊断-{stamp}.txt"), |n| {
-            dir.join(n).exists()
-        });
-        let path = dir.join(name);
-        let saved = fs::create_dir_all(&dir).and_then(|()| fs::write(&path, &text));
-        match saved {
-            Ok(()) => {
-                info!(path = %mark::path(&path), "诊断文件已导出");
-                self.last_export = Some(path.clone());
-                self.reply(
-                    from,
-                    Notice::DiagnosticsExported {
-                        path: path.display().to_string(),
-                        bytes: text.len() as u64,
-                    },
-                );
-            }
-            Err(e) => {
-                warn!("导出诊断文件失败：{e}");
-                self.reply(
-                    from,
-                    Notice::Toast {
-                        text: format!("导出诊断文件失败：{e}"),
-                        phrase: Some(Phrase::new("diagnostics_failed").arg("message", &e)),
-                    },
-                );
-            }
-        }
-    }
-
-    /// 诊断文件（`summary` 为真时是只带最后 200 行运行日志的摘要）。设备名、文件名、用户目录换成代号。
-    fn diagnostics(&self, summary: bool) -> String {
-        let state = self.snapshot();
-        let home = ferry_store::home_dir();
-        let mut redactor = Redactor::new(home.as_deref().and_then(Path::to_str));
-        redactor.local(&state.local.name);
-        let server = state.local.role == Role::Server;
-        let on = |b: bool| if b { "开" } else { "关" };
-
-        let (now, _) = diagnostics::local_time(now_ms(), self.host.utc_offset());
-        let version = match option_env!("SCREENFERRY_COMMIT") {
-            Some(commit) if !commit.is_empty() => {
-                format!("{}（提交 {commit}）", state.local.version)
-            }
-            _ => state.local.version.clone(),
-        };
-        let mut local = format!(
-            "本机 · {}",
-            if server {
-                "控制别的电脑"
-            } else {
-                "被控制"
-            }
-        );
-        if let Some(port) = state.local.port {
-            local.push_str(&format!(" · 监听 {port}"));
-        }
-        if server {
-            local.push_str(&format!(" · 局域网广播 {}", on(state.settings.announce)));
-        } else {
-            match state.settings.server.trim() {
-                "" => local.push_str(" · 自动寻找控制端"),
-                fixed => local.push_str(&format!(" · 固定连接 {fixed}")),
-            }
-            if let Some(port) = state.local.invite_port {
-                local.push_str(&format!(" · 等邀请 {port}"));
-            }
-        }
-        let displays = match ferry_platform::Displays::displays(&self.host.displays()) {
-            Ok(list) => {
-                let each: Vec<String> = list
-                    .iter()
-                    .map(|d| {
-                        format!(
-                            "{}×{} @{}%{}",
-                            d.bounds.width,
-                            d.bounds.height,
-                            d.scale_percent,
-                            if d.primary { "（主）" } else { "" }
-                        )
-                    })
-                    .collect();
-                format!("{} 台：{}", list.len(), each.join(" · "))
-            }
-            Err(e) => format!("读不到：{e}"),
-        };
-        let permission = match self.host.check_permissions(state.local.role) {
-            Ok(()) => "键鼠控制 已允许".to_owned(),
-            Err(e) => format!("键鼠控制 未允许：{e}"),
-        };
-        let mut devices = format!("{} 台已配对", state.peers.len());
-        for peer in &state.peers {
-            let code = redactor.device(&[&peer.name, &peer.alias]);
-            let platform = match peer.platform.as_str() {
-                "macos" => "macOS",
-                "windows" => "Windows",
-                "" => "系统未知",
-                other => other,
-            };
-            let mut row = format!(
-                "{code}  {platform} · {}",
-                if peer.online { "在线" } else { "离线" }
-            );
-            if !peer.addr.is_empty() {
-                row.push_str(&format!(" · {}", peer.addr));
-            }
-            if let Some(side) = peer.side {
-                row.push_str(&format!(" · 在本机{}", side_label(side)));
-            }
-            let preset = match self.config.device(&peer.fingerprint).modifiers {
-                ferry_types::ModifierPreset::Habit => "修饰键按本机习惯",
-                ferry_types::ModifierPreset::Plain => "修饰键原样",
-                ferry_types::ModifierPreset::Custom => "修饰键自定义",
-            };
-            row.push_str(&format!(" · {preset}"));
-            devices.push('\n');
-            devices.push_str(&row);
-        }
-        let settings = format!(
-            "共享 {} · 剪贴板 {}（上限 {} MB）· 开机自启 {}",
-            on(state.sharing),
-            on(state.settings.clipboard),
-            state.settings.clipboard_limit_mb,
-            on(state.settings.autostart)
-        );
-        let verbose = match self.verbose_since {
-            Some(since) => format!("开着，已有 {} 分钟", (now_ms() - since) / 60_000),
-            None => "关".to_owned(),
-        };
-        let mut header = vec![
-            ("生成于", now),
-            ("版本", version),
-            (
-                "系统",
-                if self.system.is_empty() {
-                    std::env::consts::OS.to_owned()
-                } else {
-                    self.system.clone()
-                },
-            ),
-            ("本机", local),
-            ("显示器", displays),
-            ("权限", permission),
-            ("设备", devices),
-            ("设置", settings),
-            ("详细记录", verbose),
-        ];
-        // 局域网里发现、还没配对的设备也可能出现在日志里。
-        for found in &state.found {
-            redactor.device(&[&found.name]);
-        }
-        if let Some(problem) = &state.problem {
-            header.push(("问题", redactor.line(&problem.message)));
-        }
-        let title = if summary {
-            "ScreenFerry 诊断摘要"
-        } else {
-            "ScreenFerry 诊断文件"
-        };
-        let previous = self.store.previous_log_file();
-        let current = self.store.log_file();
-        diagnostics::report(
-            title,
-            &header,
-            &[previous.as_path(), current.as_path()],
-            &mut redactor,
-            summary,
-        )
-    }
-
     /// 给所有界面一句提示：`phrase` 按当前语言说，`text` 是中文。
     fn toast(&mut self, phrase: Phrase, text: impl Into<String>) {
+        let text = text.into();
+        if matches!(
+            phrase.key.as_str(),
+            "save_failed"
+                | "remove_failed"
+                | "peers_read_failed"
+                | "autostart_failed"
+                | "error"
+                | "files_disabled"
+                | "not_connected"
+                | "paused_connect_later"
+                | "not_sharing_invite_later"
+        ) {
+            self.command_error = Some(text.clone());
+        }
         self.broadcast(Notice::Toast {
-            text: text.into(),
+            text,
             phrase: Some(phrase),
         });
     }
@@ -1906,131 +1353,6 @@ impl<H: Host> Runtime<H> {
                 }
             });
     }
-
-    pub(crate) fn summary(&self) -> Summary {
-        let lang = self.lang;
-        Summary {
-            sharing: !self.paused,
-            connected_to: (!self.links.is_empty()).then(|| {
-                self.links
-                    .iter()
-                    .map(|l| self.peer_name(&l.fingerprint))
-                    .collect::<Vec<_>>()
-                    .join(lang.pick("、", ", "))
-            }),
-            problem: self.problem.as_ref().map(|p| match (p.kind, lang) {
-                (ProblemKind::Permission, Lang::En) => {
-                    "Allow ScreenFerry to control the keyboard and mouse in System Settings"
-                        .to_owned()
-                }
-                (ProblemKind::PortInUse, Lang::En) => format!(
-                    "Port {} is in use: another copy of ScreenFerry may be running",
-                    p.port.unwrap_or_default()
-                ),
-                _ => p.message.clone(),
-            }),
-            lang,
-            update: self.updates.ready_version(),
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> State {
-        let focus = self.focus_link();
-        let server = self.config.role == Role::Server;
-        State {
-            local: Local {
-                name: self.name.clone(),
-                fingerprint: self.fingerprint.to_hex(),
-                short: self.fingerprint.short(),
-                role: self.config.role,
-                data_dir: self.store.root().display().to_string(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                port: self.port,
-                platform: std::env::consts::OS.to_owned(),
-                natural_scrolling: self.host.natural_scrolling(),
-                addresses: ferry_net::local_addresses()
-                    .into_iter()
-                    .map(|ip| ip.to_string())
-                    .collect(),
-                invite_port: self.invite_port,
-                system: self.system.clone(),
-                verbose_since: self.verbose_since,
-            },
-            sharing: !self.paused,
-            problem: self.problem.clone(),
-            link: Link {
-                status: self.status,
-                peer: focus.map(|l| l.peer.clone()),
-                since: focus.map(|l| l.since),
-                cursor_on_peer: self.cursor.is_some(),
-                rtt_ms: focus.map_or_else(Vec::new, |l| l.rtt.history()),
-            },
-            clipboard: self.clipboard.clone().map(|mut c| {
-                if let Some(peer) = &self.clipboard_peer {
-                    c.peer = self.peer_name(peer);
-                }
-                c
-            }),
-            peers: self
-                .peers
-                .iter()
-                .map(|p| PeerInfo {
-                    name: p.name.clone(),
-                    fingerprint: p.fingerprint.to_hex(),
-                    short: p.fingerprint.short(),
-                    online: self.links.iter().any(|l| l.fingerprint == p.fingerprint),
-                    last_seen: self.last_seen.get(&p.fingerprint).copied(),
-                    side: server.then(|| self.side_of(&p.fingerprint)),
-                    cursor: self.cursor == Some(p.fingerprint),
-                    alias: self.alias_of(&p.fingerprint).unwrap_or_default(),
-                    platform: self
-                        .platforms
-                        .get(&p.fingerprint)
-                        .cloned()
-                        .unwrap_or_default(),
-                    addr: p.addr.map(addr_text).unwrap_or_default(),
-                    version: self
-                        .versions
-                        .get(&p.fingerprint)
-                        .cloned()
-                        .unwrap_or_default(),
-                })
-                .collect(),
-            found: self
-                .found
-                .iter()
-                .map(|f| FoundDevice {
-                    name: f.name.clone(),
-                    fingerprint: f.fingerprint.to_hex(),
-                    short: f.fingerprint.short(),
-                    addr: f
-                        .addrs
-                        .first()
-                        .map(|a| a.ip().to_string())
-                        .unwrap_or_default(),
-                    paired: self.peers.contains(&f.fingerprint),
-                })
-                .collect(),
-            settings: Settings {
-                name: self.config.name.clone(),
-                side: self.config.side,
-                layout: self.config.layout.clone(),
-                announce: self.config.announce,
-                clipboard: self.config.clipboard,
-                clipboard_limit_mb: self.config.clipboard_limit_mb,
-                mouse_dpi: self.config.mouse_dpi(),
-                server: self.config.server.clone(),
-                autostart: self.autostart,
-                theme: self.config.theme,
-                accent: self.config.accent,
-                language: self.config.language,
-                auto_update: self.config.auto_update,
-                devices: self.config.devices.clone(),
-            },
-            activity: self.activity.recent(),
-            update: self.updates.info(!server && !self.links.is_empty()),
-        }
-    }
 }
 
 fn resolve_name<H: Host>(config: &Config, host: &H) -> String {
@@ -2038,26 +1360,6 @@ fn resolve_name<H: Host>(config: &Config, host: &H) -> String {
         "" => host.device_name(),
         name => name.to_owned(),
     }
-}
-
-/// 解析 `IP`、`IP:端口`、`主机名` 或 `主机名:端口`，省略端口时用默认端口。
-fn resolve(text: &str) -> Result<SocketAddr> {
-    if let Ok(addr) = text.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    if let Ok(ip) = text.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, DEFAULT_PORT));
-    }
-    let with_port = if text.contains(':') {
-        text.to_owned()
-    } else {
-        format!("{text}:{DEFAULT_PORT}")
-    };
-    with_port
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .ok_or_else(|| Error::BadAddress(text.to_owned()))
 }
 
 /// 用户输入的地址：IP、IP:端口、电脑名或电脑名:端口；不写端口时用 `port`。解析不了时为 `None`。

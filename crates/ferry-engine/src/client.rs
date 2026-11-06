@@ -29,19 +29,20 @@ use ferry_trust::{Fingerprint, Peer};
 use ferry_types::{DeviceSettings, Display, InputEvent, LockKeys, Point, Side, mark};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{MissedTickBehavior, interval, sleep, timeout};
+use tokio::time::{MissedTickBehavior, interval, interval_at, sleep, timeout};
 use tracing::{debug, info, warn};
 
-use crate::clipboard::{self, ClipLimit, ClipboardTask, Reporter, SharedClipboard, Start};
+use crate::clipboard::{self, ClipLimit, Reporter, SharedClipboard, Start};
 use crate::edge_drop::{Edge, EdgeFeed, gone};
 use crate::error::{Error, Result};
 use crate::events::{DialError, Event, Events, FoundServer};
-use crate::files::{FileLink, Files, Opener};
+use crate::files::{Files, Opener};
 use crate::invite::{self, Invitation};
 use crate::link::{
     CONNECT_TIMEOUT, DEFAULT_PORT, DISPLAY_CHECK, HANDSHAKE_TIMEOUT, capabilities, frame_of,
     platform_of, primary_scale, send,
 };
+use crate::metrics::{self, MetricsWindow, QueueSummary};
 use crate::pairing::{self, ConfirmPairing, Outcome};
 
 /// 两次连接尝试之间的间隔。
@@ -62,6 +63,8 @@ pub enum ClientCommand {
     OpenPeerSettings,
     /// 按地址连接一台服务端：立即去连（正连着别的服务端时先断开），结果以 [`Event::Dialed`] 报告。
     Connect(SocketAddr),
+    /// 界面请求的连接，结果带回对应的请求号。
+    RequestedConnect { addr: SocketAddr, request_id: u64 },
 }
 
 /// 服务端在哪里。
@@ -105,11 +108,37 @@ pub struct ClientConfig {
 /// 需要配对时用 `confirm` 请本机用户核对配对码。
 /// 启动失败（例如读不到本机显示器）或任何一方拒绝配对时返回错误。
 pub async fn connect<I, D, K, P>(
+    config: ClientConfig,
+    inject: I,
+    displays: D,
+    clipboard: K,
+    confirm: P,
+) -> Result<Infallible>
+where
+    I: InputInject,
+    D: Displays,
+    K: Clipboard,
+    P: ConfirmPairing,
+{
+    connect_with_transport(
+        config,
+        inject,
+        displays,
+        clipboard,
+        confirm,
+        ferry_net::Transport::Tcp,
+    )
+    .await
+}
+
+/// 显式传输实验入口。Auto仅在建立连接失败时回退TCP，已运行会话不会重放输入。
+pub async fn connect_with_transport<I, D, K, P>(
     mut config: ClientConfig,
     inject: I,
     displays: D,
     clipboard: K,
     confirm: P,
+    transport: ferry_net::Transport,
 ) -> Result<Infallible>
 where
     I: InputInject,
@@ -154,12 +183,13 @@ where
     };
     let mut client = Client {
         tls,
+        transport,
         current,
         fingerprint: identity.fingerprint(),
         confirm,
         repair: false,
         inject,
-        clipboard: Arc::new(Mutex::new(clipboard)),
+        clipboard: SharedClipboard::new(clipboard)?,
         active: watch::Sender::new(false),
         pressed: Pressed::new(),
         cursor: Point::default(),
@@ -172,6 +202,7 @@ where
         server: None,
         commands: config.commands.take(),
         drop_files: true,
+        metrics: MetricsWindow::default(),
     };
     let mut searching = false;
     let mut seen = Vec::new();
@@ -189,6 +220,7 @@ where
                 addrs: vec![addr],
                 expected: None,
                 via: Via::Sticky,
+                request_id: None,
             }
         } else {
             let found = tokio::select! {
@@ -215,6 +247,15 @@ where
         };
         let via = target.via;
         let result = client.session(&config, &displays, &target).await;
+        if client.in_session {
+            client.events.emit(Event::Metrics {
+                peer: client.server,
+                metrics: client
+                    .metrics
+                    .take(QueueSummary::default(), QueueSummary::default())
+                    .into(),
+            });
+        }
         *lock(&client.current) = None;
         let ok = result.is_ok();
         client.peer_side = None;
@@ -236,8 +277,8 @@ where
                 }
                 continue;
             }
-            Ok(Ended::Switch(addr)) => {
-                next = Some(Target::requested(addr));
+            Ok(Ended::Switch { addr, request_id }) => {
+                next = Some(Target::requested(addr, request_id));
                 continue;
             }
             Ok(Ended::Session) => info!("连接已结束"),
@@ -264,7 +305,10 @@ where
 /// 不在会话中时收到的命令：按地址连接就是下一次要连的；其余的只在会话中才有意义。
 fn requested(command: ClientCommand) -> Option<Target> {
     match command {
-        ClientCommand::Connect(addr) => Some(Target::requested(addr)),
+        ClientCommand::Connect(addr) => Some(Target::requested(addr, None)),
+        ClientCommand::RequestedConnect { addr, request_id } => {
+            Some(Target::requested(addr, Some(request_id)))
+        }
         ClientCommand::OpenPeerSettings => None,
     }
 }
@@ -275,14 +319,16 @@ struct Target {
     /// 局域网广播中对方自称的指纹（或者上次连上时的指纹），连上后必须与证书一致。
     expected: Option<Fingerprint>,
     via: Via,
+    request_id: Option<u64>,
 }
 
 impl Target {
-    fn requested(addr: SocketAddr) -> Self {
+    fn requested(addr: SocketAddr, request_id: Option<u64>) -> Self {
         Self {
             addrs: vec![addr],
             expected: None,
             via: Via::Requested,
+            request_id,
         }
     }
 
@@ -292,6 +338,7 @@ impl Target {
             addrs: vec![invitation.addr],
             expected: Some(invitation.peer),
             via: Via::Invited,
+            request_id: None,
         }
     }
 }
@@ -336,6 +383,7 @@ async fn locate(
                 addrs: vec![*addr],
                 expected: None,
                 via: Via::Found,
+                request_id: None,
             }));
         }
         Finder::Discover(browser) => browser,
@@ -365,6 +413,7 @@ async fn locate(
                     addrs: server.addrs,
                     expected: Some(server.fingerprint),
                     via: Via::Found,
+                    request_id: None,
                 }));
             }
             Lookup::Nothing { others } if Instant::now() >= deadline => {
@@ -404,6 +453,7 @@ async fn locate(
                         addrs: vec![addr],
                         expected: Some(fingerprint),
                         via: Via::Remembered,
+                        request_id: None,
                     }));
                 }
                 return Ok(None);
@@ -427,6 +477,7 @@ async fn connect_any(
     tls: &Tls,
     addrs: &[SocketAddr],
     channel: Channel,
+    transport: ferry_net::Transport,
 ) -> Result<(Framed<ClientStream>, Fingerprint, SocketAddr)> {
     let per = if addrs.len() > 1 {
         PER_ADDRESS_TIMEOUT
@@ -435,7 +486,12 @@ async fn connect_any(
     };
     let mut last = Error::Timeout("连接");
     for &addr in addrs {
-        match timeout(per, tls.connect(addr, channel)).await {
+        match timeout(
+            transport.connect_budget(per),
+            tls.connect_with(addr, channel, transport),
+        )
+        .await
+        {
             Ok(Ok((framed, peer))) => return Ok((framed, peer, addr)),
             Ok(Err(e)) => last = e.into(),
             Err(_) => last = Error::Timeout("连接"),
@@ -448,11 +504,15 @@ enum Ended {
     Session,
     Paired,
     /// 用户要求改连另一个地址。
-    Switch(SocketAddr),
+    Switch {
+        addr: SocketAddr,
+        request_id: Option<u64>,
+    },
 }
 
 struct Client<I: InputInject, K, P> {
     tls: Tls,
+    transport: ferry_net::Transport,
     /// 此刻连着的服务端，等邀请的任务据此判断忙不忙。
     current: Arc<Mutex<Option<Fingerprint>>>,
     fingerprint: Fingerprint,
@@ -481,6 +541,7 @@ struct Client<I: InputInject, K, P> {
     commands: Option<mpsc::UnboundedReceiver<ClientCommand>>,
     /// 本次会话能把文件拖给服务端（本机对它的设置没有关掉）。
     drop_files: bool,
+    metrics: MetricsWindow,
 }
 
 /// 无论因为什么停下（包括整个引擎被关掉），都松开对方按着的键、让本机光标重新出现。
@@ -507,6 +568,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         let report = |error: Option<DialError>| {
             if let (true, Some(&addr)) = (requested, target.addrs.first()) {
                 self.events.emit(Event::Dialed {
+                    request_id: target.request_id,
                     address: addr.to_string(),
                     invite: false,
                     error,
@@ -519,7 +581,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             self.events.emit(Event::Connecting { addr });
         }
         let (mut framed, server, addr) =
-            match connect_any(&self.tls, &target.addrs, Channel::Input).await {
+            match connect_any(&self.tls, &target.addrs, Channel::Input, self.transport).await {
                 Ok(connected) => connected,
                 Err(e) => {
                     report(Some(DialError::of(&e)));
@@ -545,7 +607,14 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             .cloned()
             .unwrap_or_else(|| DeviceSettings::new(server.to_hex()));
         self.drop_files = device.files;
-        let caps = capabilities(config.clipboard && device.clipboard, config.command_key);
+        let mut caps = capabilities(
+            config.clipboard && device.clipboard,
+            device.files,
+            config.command_key,
+        );
+        if framed.get_ref().is_quic() && self.transport.datagrams() {
+            caps |= Capabilities::QUIC_MOTION;
+        }
         let hello = Hello::new(Channel::Input, caps, 0, config.name.clone());
         let welcome =
             match timeout(HANDSHAKE_TIMEOUT, ferry_net::initiate(&mut framed, hello)).await {
@@ -566,6 +635,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                 }
                 Ok(Ok(welcome)) => welcome,
             };
+        let negotiated = welcome.capabilities & caps;
         report(None);
         // 记下这次连上的地址：以后局域网里找不到它时用。记不下来只是少一个兜底。
         if let Err(e) = crate::server::remember_addr(&config.store, server, addr) {
@@ -573,7 +643,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         }
         let mut screens = displays.displays()?;
         send(&mut framed, &Message::Displays(screens.clone())).await?;
-        if welcome.capabilities.contains(Capabilities::APP_INFO) {
+        if negotiated.contains(Capabilities::APP_INFO) {
             send(&mut framed, &crate::link::app_info()).await?;
         }
         info!(server = %mark::device(&welcome.name), fingerprint = %server, "已连接，等待光标进入");
@@ -585,52 +655,92 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         // 本机是 Mac 时看得出对方是不是 Mac：交集里有 COMMAND_KEY 说明两边都是。
         let platform = config
             .command_key
-            .then(|| platform_of(welcome.capabilities.contains(Capabilities::COMMAND_KEY)));
+            .then(|| platform_of(negotiated.contains(Capabilities::COMMAND_KEY)));
         self.events.emit(Event::Connected {
             name: welcome.name.clone(),
             fingerprint: server,
             addr,
             platform,
         });
-        // 上次会话里没来得及处理的命令已经过时。
-        if let Some(commands) = &mut self.commands {
-            while commands.try_recv().is_ok() {}
-        }
+        // 连接期间排队的按地址请求仍需处理并报告结果，不能在握手后静默丢弃。
         let shown = match device.alias.trim() {
             "" => welcome.name.clone(),
             alias => alias.to_owned(),
         };
 
         // 会话结束时随之丢弃，剪贴板同步也就停了。
-        let clipboard = welcome.capabilities.contains(Capabilities::CLIPBOARD);
-        let files = welcome.capabilities.contains(Capabilities::FILES);
-        let edge_drop = welcome.capabilities.contains(Capabilities::EDGE_DROP);
+        let clipboard = negotiated.contains(Capabilities::CLIPBOARD);
+        let files = negotiated.contains(Capabilities::FILES);
+        let edge_drop = negotiated.contains(Capabilities::EDGE_DROP);
         let link = Link {
             tls: self.tls.clone(),
+            transport: if framed.get_ref().is_quic() {
+                ferry_net::Transport::Quic
+            } else {
+                ferry_net::Transport::Tcp
+            },
             name: config.name.clone(),
             addr,
             caps,
             session: welcome.session,
             server,
         };
-        let _data_task = if clipboard || files {
-            match link.connect(Channel::Data).await {
-                Ok(data) => {
-                    info!("数据连接已建立");
-                    let files = files.then(|| config.files.attach(server, Some(link.opener())));
-                    Some(self.start_data(data, server, clipboard, files))
+        let _data_task = (clipboard || files).then(|| {
+            let shared = self.clipboard.clone();
+            let active = self.active.subscribe();
+            let report = Reporter {
+                peer: server,
+                events: self.events.clone(),
+                limit: self.clip_limit.clone(),
+            };
+            let transfers = config.files.clone();
+            AbortOnDrop(tokio::spawn(async move {
+                let mut delay = RETRY_DELAY;
+                let mut start = Start::Quiet;
+                loop {
+                    match link.connect(Channel::Data).await {
+                        Ok(data) => {
+                            info!("数据连接已建立");
+                            let file_link =
+                                files.then(|| transfers.attach(server, Some(link.opener())));
+                            let mut task = clipboard::spawn(
+                                data,
+                                shared.clone(),
+                                active.clone(),
+                                start,
+                                report.clone(),
+                                clipboard,
+                                file_link,
+                            );
+                            start = Start::Resume;
+                            task.finished().await;
+                            delay = RETRY_DELAY;
+                        }
+                        Err(e) => warn!("数据连接失败，将重试：{e}"),
+                    }
+                    sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
                 }
-                Err(e) => {
-                    warn!("数据连接失败，本次不同步剪贴板、不能传文件：{e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            }))
+        });
 
+        let datagrams = framed
+            .get_ref()
+            .datagrams()
+            .filter(|_| negotiated.contains(Capabilities::QUIC_MOTION));
+        let mut motion = datagrams
+            .as_ref()
+            .map(|_| crate::MotionReceiver::new(welcome.session));
         // 自己定时 Ping 服务端测往返延迟；同时据最后一次收到消息的时刻判断断线。
         let epoch = Instant::now();
+        self.metrics = MetricsWindow::default();
+        let mut metrics_tick = interval_at(
+            tokio::time::Instant::now() + metrics::REPORT_EVERY,
+            metrics::REPORT_EVERY,
+        );
+        metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut scheduler_tick = interval(crate::heartbeat::TICK);
+        scheduler_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_heard = Instant::now();
         let mut ping = interval(RTT_INTERVAL);
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -643,10 +753,22 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         loop {
             let message = tokio::select! {
                 message = framed.recv() => message?,
+                packet = async {
+                    match &datagrams { Some(datagrams) => datagrams.recv().await, None => std::future::pending().await }
+                } => {
+                    let bytes = packet?;
+                    let received = Instant::now();
+                    if let Some(packet) = ferry_proto::MotionPacket::decode_datagram(&bytes)
+                        && let Some(position) = motion.as_mut().and_then(|state| state.position(packet)) {
+                        self.move_to(position);
+                        self.metrics.inject.record(received.elapsed());
+                    }
+                    continue;
+                }
                 Some(command) = next_command(&mut self.commands) => {
                     match command {
                         ClientCommand::OpenPeerSettings => {
-                            let sent = welcome.capabilities.contains(Capabilities::REMOTE_SETTINGS);
+                            let sent = negotiated.contains(Capabilities::REMOTE_SETTINGS);
                             if sent {
                                 send(&mut framed, &Message::OpenSettings).await?;
                             }
@@ -655,14 +777,26 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                         // 已经连着这个地址：就算成了。
                         ClientCommand::Connect(to) if to == addr => {
                             self.events.emit(Event::Dialed {
+                                request_id: None,
                                 address: to.to_string(),
                                 invite: false,
                                 error: None,
                             });
                         }
+                        ClientCommand::RequestedConnect { addr: to, request_id } if to == addr => {
+                            self.events.emit(Event::Dialed {
+                                request_id: Some(request_id),
+                                address: to.to_string(),
+                                invite: false,
+                                error: None,
+                            });
+                        }
+                        ClientCommand::RequestedConnect { addr, request_id } => {
+                            return Ok(Ended::Switch { addr, request_id: Some(request_id) });
+                        }
                         ClientCommand::Connect(to) => {
                             info!(%to, "按用户要求改连另一台服务端");
-                            return Ok(Ended::Switch(to));
+                            return Ok(Ended::Switch { addr: to, request_id: None });
                         }
                     }
                     continue;
@@ -695,6 +829,15 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     send(&mut framed, &Message::Ping { nonce }).await?;
                     continue;
                 }
+                expected = scheduler_tick.tick() => {
+                    self.metrics.scheduler.record(expected.elapsed());
+                    continue;
+                }
+                _ = metrics_tick.tick() => {
+                    self.events.emit(Event::Metrics { peer: Some(server),
+                        metrics: self.metrics.take(QueueSummary::default(), QueueSummary::default()).into() });
+                    continue;
+                }
                 _ = silence.tick() => {
                     if last_heard.elapsed() > SILENCE_TIMEOUT {
                         return Err(Error::HeartbeatTimeout);
@@ -703,15 +846,65 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                 }
             };
             last_heard = Instant::now();
+            let received = Instant::now();
+            let enters = matches!(&message, Some(Message::Enter(_)));
+            let leaves = matches!(&message, Some(Message::Leave { .. }));
+            let control = !matches!(
+                &message,
+                Some(
+                    Message::MotionFence { .. }
+                        | Message::MotionSync(_)
+                        | Message::MotionAck { .. }
+                        | Message::Ping { .. }
+                        | Message::Pong { .. }
+                )
+            );
+            let measured = matches!(
+                &message,
+                Some(
+                    Message::Input(_)
+                        | Message::Enter(_)
+                        | Message::Leave { .. }
+                        | Message::MotionFence { .. }
+                        | Message::MotionSync(_)
+                )
+            );
             match message {
                 None | Some(Message::Bye(_)) => return Ok(Ended::Session),
+                Some(Message::MotionFence {
+                    generation,
+                    sequence,
+                    position,
+                }) => {
+                    let Some(state) = &mut motion else {
+                        return Err(Error::Protocol("未协商QUIC移动"));
+                    };
+                    if let Some(position) = state
+                        .fence(generation, sequence, position)
+                        .map_err(Error::Protocol)?
+                    {
+                        self.move_to(position);
+                    }
+                }
+                Some(Message::MotionSync(packet)) => {
+                    let Some(state) = &mut motion else {
+                        return Err(Error::Protocol("未协商QUIC移动"));
+                    };
+                    if let Some(position) = state.position(packet) {
+                        self.move_to(position);
+                    }
+                }
+                Some(Message::MotionAck { .. }) => {
+                    return Err(Error::Protocol("控制端发来了QUIC移动确认"));
+                }
                 Some(Message::Ping { nonce }) => {
                     send(&mut framed, &Message::Pong { nonce }).await?
                 }
                 Some(Message::Pong { nonce }) => {
-                    let sent = epoch + Duration::from_micros(nonce);
+                    let sent = epoch.checked_add(Duration::from_micros(nonce));
                     let now = Instant::now();
-                    if sent <= now {
+                    if let Some(sent) = sent.filter(|&sent| sent <= now) {
+                        self.metrics.rtt.record(now - sent);
                         self.events.emit(Event::Rtt {
                             peer: server,
                             rtt: now - sent,
@@ -763,6 +956,16 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                 Some(Message::Displays(_)) => {}
                 Some(other) => debug!(kind = format_args!("{:#06x}", other.type_id()), "忽略消息"),
             }
+            if measured {
+                self.metrics.inject.record(received.elapsed());
+            }
+            if control
+                && let Some(ack) = motion
+                    .as_mut()
+                    .and_then(|state| state.after_control(enters, leaves))
+            {
+                send(&mut framed, &ack).await?;
+            }
         }
     }
 
@@ -775,9 +978,12 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         addr: SocketAddr,
         expected: Fingerprint,
     ) -> Result<()> {
-        let (mut framed, server) = timeout(CONNECT_TIMEOUT, self.tls.connect(addr, Channel::Pair))
-            .await
-            .map_err(|_| Error::Timeout("连接"))??;
+        let (mut framed, server) = timeout(
+            CONNECT_TIMEOUT,
+            self.tls.connect_with(addr, Channel::Pair, self.transport),
+        )
+        .await
+        .map_err(|_| Error::Timeout("连接"))??;
         if server != expected {
             return Err(Error::PeerMismatch);
         }
@@ -824,29 +1030,6 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                 Err(Error::PairingRejected)
             }
         }
-    }
-
-    fn start_data(
-        &self,
-        data: Framed<ClientStream>,
-        server: Fingerprint,
-        sync: bool,
-        files: Option<FileLink>,
-    ) -> ClipboardTask {
-        let report = Reporter {
-            peer: server,
-            events: self.events.clone(),
-            limit: self.clip_limit.clone(),
-        };
-        clipboard::spawn(
-            data,
-            self.clipboard.clone(),
-            self.active.subscribe(),
-            Start::Quiet,
-            report,
-            sync,
-            files,
-        )
     }
 
     fn apply(&mut self, event: InputEvent) {
@@ -925,6 +1108,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
 #[derive(Clone)]
 struct Link {
     tls: Tls,
+    transport: ferry_net::Transport,
     name: String,
     addr: SocketAddr,
     caps: Capabilities,
@@ -936,7 +1120,10 @@ impl Link {
     /// 带着会话号连一条数据连接或文件连接，并确认连到的还是同一台服务端。
     async fn connect(&self, channel: Channel) -> Result<Framed<ClientStream>> {
         let handshake = async {
-            let (mut framed, peer) = self.tls.connect(self.addr, channel).await?;
+            let (mut framed, peer) = self
+                .tls
+                .connect_with(self.addr, channel, self.transport)
+                .await?;
             if peer != self.server {
                 return Err(Error::PeerMismatch);
             }

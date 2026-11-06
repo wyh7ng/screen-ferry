@@ -13,6 +13,7 @@ pub struct Framed<S> {
     io: S,
     codec: Codec,
     read_buf: Vec<u8>,
+    read_pos: usize,
     write_buf: Vec<u8>,
 }
 
@@ -22,6 +23,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
             io,
             codec: Codec::new(channel),
             read_buf: Vec::with_capacity(READ_CHUNK),
+            read_pos: 0,
             write_buf: Vec::with_capacity(READ_CHUNK),
         }
     }
@@ -54,13 +56,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
     /// 可以放在 `select!` 中：被取消时已读到的数据保留在缓冲区里，不会丢失。
     pub async fn recv(&mut self) -> Result<Option<Message>> {
         loop {
-            if let Some((message, used)) = self.codec.decode(&self.read_buf)? {
-                self.read_buf.drain(..used);
+            if let Some((message, used)) = self.codec.decode(&self.read_buf[self.read_pos..])? {
+                self.read_pos += used;
                 return Ok(Some(message));
+            }
+            if self.read_pos == self.read_buf.len() {
+                self.read_buf.clear();
+                self.read_pos = 0;
+            } else if self.read_pos >= READ_CHUNK && self.read_pos >= self.read_buf.len() / 2 {
+                self.read_buf.drain(..self.read_pos);
+                self.read_pos = 0;
             }
             self.read_buf.reserve(READ_CHUNK);
             if self.io.read_buf(&mut self.read_buf).await? == 0 {
-                return if self.read_buf.is_empty() {
+                return if self.read_pos == self.read_buf.len() {
                     Ok(None)
                 } else {
                     Err(Error::TruncatedFrame)

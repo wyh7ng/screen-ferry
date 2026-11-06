@@ -5,7 +5,12 @@
 //!   设备名、文件名和用户目录换成代号（ferry-core 的 `Redactor`），局域网地址留着。
 //!   以前的版本写的行没有标记、换不干净，不带上。
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+
+use ferry_platform::FileCommit;
+use ring::digest::{SHA256, digest};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use ferry_core::Redactor;
@@ -15,55 +20,171 @@ use ferry_types::mark;
 /// 第一次读运行日志时最多取最后这么多行。
 const TAIL_LINES: usize = 500;
 /// 一次最多读这么多字节。新写的超过这么多时只取最后这一段，界面整个替换。
-const MAX_CHUNK: usize = 256 * 1024;
+// JSON最坏转义为6倍，另限制每页行数，确保落在IPC的1MiB单行上限内。
+const MAX_CHUNK: usize = 128 * 1024;
+const PAGE_LINES: usize = 1000;
 /// 摘要里运行日志的行数：GitHub 的问题描述最多 6.5 万字，要贴得下。
 const SUMMARY_LINES: usize = 200;
+/// 摘要通过一条JSON消息返回；为最坏的6倍转义和字段开销留出空间。
+const SUMMARY_BYTES: usize = 64 * 1024;
+const SUMMARY_TRUNCATED: &str = "（诊断摘要已截短，完整日志请导出诊断文件）";
 
-/// 读到的一段运行日志。
+/// 读到的一段运行日志；仅保存界面需要的有界分页数据。
+#[derive(Default)]
 pub(crate) struct Chunk {
     pub(crate) lines: Vec<RunLogLine>,
-    /// 下次从这里接着读。
     pub(crate) next: u64,
-    /// 界面要整个替换，而不是接在后面。
     pub(crate) fresh: bool,
-    /// 当前这卷的大小和行数。
     pub(crate) bytes: u64,
+    /// 当前游标累计读取的完整行数；首次尾读不扫描整卷。
     pub(crate) lines_total: u64,
+    pub(crate) cursor: String,
+    pub(crate) more: bool,
+    pub(crate) error: Option<String>,
 }
 
-/// 读运行日志 `path`：`since` 为空时取最后 [`TAIL_LINES`] 行，否则取 `since` 之后新写的。
-/// 日志换了一卷（文件比 `since` 短）或者新写的太多时，从头取最后一段。
-pub(crate) fn read(path: &Path, since: Option<u64>) -> Chunk {
-    let data = fs::read(path).unwrap_or_default();
-    let bytes = data.len();
-    let (start, fresh) = match since.and_then(|s| usize::try_from(s).ok()) {
-        Some(s) if s <= bytes && bytes - s <= MAX_CHUNK => (s, false),
-        _ => (bytes.saturating_sub(MAX_CHUNK), true),
-    };
-    // 只要完整的行：从中间开始时跳过第一行的后半截，最后没写完的一行留到下次。
-    let mut from = start;
-    if fresh && start > 0 {
-        from = data[start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(bytes, |i| start + i + 1);
-    }
-    let end = data[from..]
+#[derive(Serialize, Deserialize)]
+struct Cursor {
+    version: u8,
+    identity: String,
+    offset: u64,
+    lines: u64,
+    anchor: String,
+    /// 超长行被分段跳过时，下一页继续丢弃它，直到换行。
+    skipping: bool,
+}
+
+fn anchor(file: &mut File, end: u64) -> std::io::Result<String> {
+    let start = end.saturating_sub(256);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0; (end - start) as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(digest(&SHA256, &bytes)
+        .as_ref()
         .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(from, |i| from + i + 1);
-    let text = String::from_utf8_lossy(&data[from..end]);
-    let mut lines: Vec<RunLogLine> = text.lines().filter(|l| !l.is_empty()).map(parse).collect();
-    if fresh && lines.len() > TAIL_LINES {
-        lines.drain(..lines.len() - TAIL_LINES);
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// 每次只 seek/read 至多 MAX_CHUNK 字节。文件身份与已读尾部摘要一起防止轮转/截断误用游标。
+/// 不完整的末行留到下次，超长行明确跳过，避免无限重复读取同一段。
+pub(crate) fn read(
+    path: &Path,
+    since: Option<u64>,
+    cursor: Option<&str>,
+    files: &dyn FileCommit,
+) -> Chunk {
+    match read_inner(path, since, cursor, files) {
+        Ok(chunk) => chunk,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Chunk {
+            fresh: true,
+            ..Chunk::default()
+        },
+        Err(e) => Chunk {
+            error: Some(format!("读取运行日志失败：{e}")),
+            ..Chunk::default()
+        },
     }
-    Chunk {
+}
+
+fn read_inner(
+    path: &Path,
+    since: Option<u64>,
+    token: Option<&str>,
+    files: &dyn FileCommit,
+) -> std::io::Result<Chunk> {
+    let mut file = File::open(path)?;
+    let identity = files.identity_open_file(&file)?;
+    let bytes = file.metadata()?.len();
+    let prior = token
+        .filter(|s| s.len() <= 2048)
+        .and_then(|s| serde_json::from_str::<Cursor>(s).ok())
+        .filter(|c| c.version == 1 && c.identity == identity && c.offset <= bytes)
+        .filter(|c| anchor(&mut file, c.offset).is_ok_and(|a| a == c.anchor));
+    let legacy = token
+        .is_none()
+        .then_some(since)
+        .flatten()
+        .filter(|s| *s <= bytes);
+    let fresh = prior.is_none() && legacy.is_none();
+    let start = prior
+        .as_ref()
+        .map(|c| c.offset)
+        .or(legacy)
+        .unwrap_or_else(|| bytes.saturating_sub(MAX_CHUNK as u64));
+    let old_lines = prior.as_ref().map_or(0, |c| c.lines);
+    let skipping = prior.as_ref().is_some_and(|c| c.skipping) || (fresh && start > 0);
+    file.seek(SeekFrom::Start(start))?;
+    let length = (bytes - start).min(MAX_CHUNK as u64) as usize;
+    let mut data = vec![0; length];
+    file.read_exact(&mut data)?;
+    let from = if skipping {
+        data.iter().position(|b| *b == b'\n').map(|i| i + 1)
+    } else {
+        Some(0)
+    };
+    let mut limited = false;
+    let mut next = start;
+    let mut skipped = skipping;
+    let mut lines = Vec::new();
+    let mut count = old_lines;
+    if let Some(from) = from {
+        skipped = false;
+        let mut end = data[from..]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(from, |i| from + i + 1);
+        if !fresh
+            && let Some((position, _)) = data[from..end]
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .nth(PAGE_LINES - 1)
+        {
+            let boundary = from + position + 1;
+            limited = boundary < end;
+            end = boundary;
+        }
+        let text = String::from_utf8_lossy(&data[from..end]);
+        count =
+            count.saturating_add(data[from..end].iter().filter(|b| **b == b'\n').count() as u64);
+        lines = text.lines().filter(|l| !l.is_empty()).map(parse).collect();
+        next = start + end as u64;
+        if fresh && lines.len() > TAIL_LINES {
+            lines.drain(..lines.len() - TAIL_LINES);
+        }
+        if end == from && length == MAX_CHUNK && from == 0 {
+            // 生产日志writer有行长度上限；仍可安全处理旧日志或外部写入的超长行。
+            next = start + length as u64;
+            skipped = true;
+            lines.push(RunLogLine {
+                at: String::new(),
+                level: RunLogLevel::Warn,
+                text: "已跳过超过 128 KiB 的运行日志行".into(),
+            });
+        }
+    } else if length == MAX_CHUNK {
+        next = start + length as u64;
+    }
+    let more = next > start && next < bytes && (length == MAX_CHUNK || limited);
+    let cursor = Cursor {
+        version: 1,
+        identity,
+        offset: next,
+        lines: count,
+        anchor: anchor(&mut file, next)?,
+        skipping: skipped,
+    };
+    Ok(Chunk {
         lines,
-        next: end as u64,
+        next,
         fresh,
-        bytes: bytes as u64,
-        lines_total: data.iter().filter(|&&b| b == b'\n').count() as u64,
-    }
+        bytes,
+        lines_total: count,
+        cursor: serde_json::to_string(&cursor).expect("日志游标可序列化"),
+        more,
+        error: None,
+    })
 }
 
 /// 解析运行日志的一行，去掉敏感内容的标记。
@@ -174,11 +295,54 @@ pub(crate) fn report(
             old.len()
         ));
     }
+    let mut rendered = Vec::new();
+    let mut total = 0usize;
     for line in shown {
-        out.push_str(&redactor.line(line));
-        out.push('\n');
+        let mut line = redactor.line(line);
+        if summary && line.len() > SUMMARY_BYTES / 2 {
+            truncate_utf8(&mut line, SUMMARY_BYTES / 2);
+            line.push_str(" …（本行已截短）");
+        }
+        total = total.saturating_add(line.len() + 1);
+        rendered.push(line);
+    }
+    if summary {
+        // 标题与配置最多占四分之一预算；运行日志优先保留最近完整行。
+        let header_truncated = out.len() > SUMMARY_BYTES / 4;
+        if header_truncated {
+            truncate_utf8(&mut out, SUMMARY_BYTES / 4);
+            out.push('\n');
+        }
+        let budget = SUMMARY_BYTES.saturating_sub(out.len() + SUMMARY_TRUNCATED.len() + 2);
+        let mut start = 0;
+        while total > budget && start < rendered.len() {
+            total = total.saturating_sub(rendered[start].len() + 1);
+            start += 1;
+        }
+        if header_truncated || start > 0 || shown.iter().any(|line| line.len() > SUMMARY_BYTES / 2)
+        {
+            out.push_str(SUMMARY_TRUNCATED);
+            out.push('\n');
+        }
+        for line in &rendered[start..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    } else {
+        for line in rendered {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
     out
+}
+
+fn truncate_utf8(text: &mut String, maximum: usize) {
+    let mut end = maximum.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 /// Unix 毫秒加上时区，写成本机时间：`(2026-11-02 06:24:13 +08:00, 20261102-0624)`。

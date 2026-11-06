@@ -7,8 +7,14 @@ mod clipboard;
 mod edge_drop;
 mod events;
 mod files;
+mod input_queue;
 mod invite;
+mod metrics;
 mod pairing;
 mod resident;
 mod server;
 mod support;
+
+#[cfg(feature = "quic-experiment")]
+mod quic;
+mod quic_motion;

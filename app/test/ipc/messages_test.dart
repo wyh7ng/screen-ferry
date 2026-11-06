@@ -36,6 +36,8 @@ void main() {
     expect(decoded, everyElement(isNotNull));
     expect(decoded.map((n) => n.runtimeType).toSet(), {
       WelcomeNotice,
+      UpdateHealthNotice,
+      CommandResultNotice,
       StateNotice,
       HistoryNotice,
       LogNotice,
@@ -178,6 +180,8 @@ void main() {
   test('Dart 编码的命令与样例一致', () {
     final ours = <Request>[
       HelloRequest('ab' * 32),
+      UpdateHealthRequest('ab' * 32),
+      const ExecuteRequest(session: 'sample-session', id: 42, request: SetSharingRequest(false)),
       const SetSharingRequest(false),
       const UpdateSettingsRequest(
         SettingsPatch(

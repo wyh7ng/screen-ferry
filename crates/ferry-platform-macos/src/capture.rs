@@ -389,6 +389,7 @@ unsafe extern "C-unwind" fn on_event(
     event: NonNull<CGEvent>,
     user_info: *mut c_void,
 ) -> *mut CGEvent {
+    let captured_at = Instant::now();
     // SAFETY: `user_info` 是 `run` 中创建的 `TapState`，只在本线程访问。
     let state = unsafe { &mut *user_info.cast::<TapState>() };
 
@@ -452,7 +453,7 @@ unsafe extern "C-unwind" fn on_event(
         }
     }
 
-    emit(state, captured, grabbed);
+    emit(state, captured, grabbed, captured_at);
     if captured
         == (CaptureEvent::Key {
             code: KeyCode::CAPS_LOCK,
@@ -467,6 +468,7 @@ unsafe extern "C-unwind" fn on_event(
                 action: KeyAction::Up,
             },
             grabbed,
+            captured_at,
         );
     }
     verdict
@@ -483,9 +485,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// 把事件交给 sink，标明它是否被抓取吞掉了。panic 不能穿过系统框架，这里截住。
-fn emit(state: &mut TapState, event: CaptureEvent, grabbed: bool) {
+fn emit(state: &mut TapState, event: CaptureEvent, grabbed: bool, captured_at: Instant) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        (state.sink)(Captured { event, grabbed })
+        (state.sink)(Captured {
+            event,
+            grabbed,
+            captured_at,
+        })
     }));
 }
 

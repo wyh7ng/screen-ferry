@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -33,10 +33,10 @@ use ferry_types::{
     DeviceSettings, Display, InputEvent, KeyAction, KeyCode, Placement, Point, Rect, mark,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{MissedTickBehavior, interval, interval_at, timeout};
 use tracing::{debug, info, warn};
 
 use crate::clipboard::{self, ClipLimit, ClipboardTask, Reporter, SharedClipboard, Start};
@@ -45,13 +45,18 @@ use crate::error::{Error, Result};
 use crate::events::{Event, Events};
 use crate::files::Files;
 use crate::heartbeat::{self, Heartbeat};
+use crate::input_queue::{InputReceiver, InputSender, InputSettings, input_queue};
 use crate::link::{
     DISPLAY_CHECK, HANDSHAKE_TIMEOUT, capabilities, frame_of, platform_of, primary_scale, send,
 };
+use crate::metrics::{self, MetricsWindow, QueueSummary};
 use crate::pairing::{self, ConfirmPairing, Outcome};
 
 /// 主循环交给一个会话、还没发出去的消息最多积压多少条。积压满了说明对方长时间收不动。
 const OUTBOX: usize = 1024;
+const CAPTURE_CAPACITY: usize = 4096;
+/// 包含等待用户配对的连接，限制陌生连接占用的任务和套接字。
+const MAX_HANDSHAKES: usize = 64;
 
 pub struct ServerConfig {
     /// 会话中途也能立即生效的设置。
@@ -90,6 +95,8 @@ pub struct Live {
     pub fallback: DeviceSettings,
     /// 本机鼠标的 DPI，各台设备的光标速度以它为准换算。
     pub mouse_dpi: u32,
+    /// 输入队列策略，不改变按键、拖拽或屏幕切换的顺序。
+    pub input: InputSettings,
 }
 
 impl Live {
@@ -145,7 +152,35 @@ where
     K: Clipboard,
     P: ConfirmPairing,
 {
-    let mut server = Server::start(config, capture, displays, clipboard, confirm)?;
+    serve_with_transport(
+        listener,
+        config,
+        capture,
+        displays,
+        clipboard,
+        confirm,
+        ferry_net::Transport::Tcp,
+    )
+    .await
+}
+
+/// 显式传输实验入口；普通serve始终保持TCP行为。
+pub async fn serve_with_transport<C, D, K, P>(
+    listener: TcpListener,
+    config: ServerConfig,
+    capture: C,
+    displays: D,
+    clipboard: K,
+    confirm: P,
+    transport: ferry_net::Transport,
+) -> Result<Infallible>
+where
+    C: InputCapture,
+    D: Displays,
+    K: Clipboard,
+    P: ConfirmPairing,
+{
+    let mut server = Server::start(config, capture, displays, clipboard, confirm, transport)?;
     let addr = listener.local_addr()?;
     // 广播失败（例如网络不支持组播）不影响按地址连接。
     let advertiser = if server.config.announce {
@@ -169,7 +204,7 @@ where
         port: addr.port(),
         announced: advertiser.is_some(),
     });
-    server.run(listener).await
+    server.run(listener, transport).await
 }
 
 /// 会话任务和连接握手交回主循环的事。
@@ -200,6 +235,8 @@ struct NewSession {
 /// 连接握手（在各自的任务里进行）需要的东西。
 struct Shared<P> {
     capabilities: Capabilities,
+    live: watch::Receiver<Live>,
+    quic_motion: bool,
     tls: Tls,
     fingerprint: Fingerprint,
     name: String,
@@ -248,7 +285,7 @@ struct Session {
     peer: Fingerprint,
     name: String,
     /// 交给会话任务发出的消息。
-    outbox: mpsc::Sender<Message>,
+    outbox: InputSender,
     /// 对这台设备而言本机是不是活动端：光标不在它上面。剪贴板同步和心跳据此判断。
     active: watch::Sender<bool>,
     remote: Vec<Display>,
@@ -275,7 +312,9 @@ struct Server<C, D, K, P> {
     capture: C,
     displays: D,
     clipboard: SharedClipboard<K>,
-    events: UnboundedReceiver<Captured>,
+    events: mpsc::Receiver<Captured>,
+    capture_stats: Arc<CaptureStats>,
+    metrics: MetricsWindow,
     local: Vec<Display>,
     neighbors: Neighbors,
     sessions: HashMap<u64, Session>,
@@ -303,18 +342,38 @@ where
         displays: D,
         clipboard: K,
         confirm: P,
+        transport: ferry_net::Transport,
     ) -> Result<Self> {
         let identity = config.store.identity(&config.name)?;
         let tls = Tls::new(&identity)?;
-        let (tx, events) = mpsc::unbounded_channel();
+        let (tx, events) = mpsc::channel(CAPTURE_CAPACITY);
+        let capture_stats = Arc::new(CaptureStats::default());
+        let stats = capture_stats.clone();
         capture.start(Box::new(move |event| {
-            let _ = tx.send(event);
+            // 原生回调绝不等待：溢出后主循环停止引擎，不能丢掉Up却继续控制远端。
+            if stats.overflows.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            match tx.try_send(event) {
+                Ok(()) => {
+                    stats
+                        .high_water
+                        .fetch_max(CAPTURE_CAPACITY - tx.capacity(), Ordering::Relaxed);
+                }
+                Err(error) => {
+                    if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                        stats.overflows.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
         }))?;
         let local = displays.displays()?;
         let rect = bounds(&local).ok_or(Error::NoDisplays("本机"))?;
         let (arrivals_tx, arrivals) = mpsc::channel(64);
         let shared = Arc::new(Shared {
-            capabilities: capabilities(config.clipboard, config.command_key),
+            capabilities: capabilities(config.clipboard, true, config.command_key),
+            live: config.live.clone(),
+            quic_motion: transport.datagrams(),
             tls,
             fingerprint: identity.fingerprint(),
             name: config.name.clone(),
@@ -333,8 +392,10 @@ where
             arrivals,
             capture,
             displays,
-            clipboard: Arc::new(Mutex::new(clipboard)),
+            clipboard: SharedClipboard::new(clipboard)?,
             events,
+            capture_stats,
+            metrics: MetricsWindow::default(),
             local,
             neighbors: Neighbors::new(rect),
             sessions: HashMap::new(),
@@ -345,22 +406,112 @@ where
         })
     }
 
-    async fn run(&mut self, listener: TcpListener) -> Result<Infallible> {
+    async fn run(
+        &mut self,
+        listener: TcpListener,
+        transport: ferry_net::Transport,
+    ) -> Result<Infallible> {
+        #[cfg(feature = "quic-experiment")]
+        let mut quic = if transport != ferry_net::Transport::Tcp {
+            let addr = listener.local_addr()?;
+            let binding = async {
+                loop {
+                    match self.shared.tls.listen_quic(addr) {
+                        Err(ferry_net::Error::Io(error))
+                            if error.kind() == std::io::ErrorKind::AddrInUse =>
+                        {
+                            // 上一引擎的QUIC连接仍在draining，异步限时重试；中止引擎可立即取消。
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        result => return result,
+                    }
+                }
+            };
+            let bound = timeout(Duration::from_secs(3), binding)
+                .await
+                .map_err(|_| {
+                    ferry_net::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "QUIC监听端口仍被占用",
+                    ))
+                })
+                .and_then(|result| result);
+            match bound {
+                Ok(listener) => Some(listener),
+                Err(error) if !transport.falls_back() => return Err(error.into()),
+                Err(error) => {
+                    warn!("QUIC监听失败，继续使用TCP：{error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "quic-experiment"))]
+        if transport != ferry_net::Transport::Tcp && !transport.falls_back() {
+            return Err(std::io::Error::other("需要quic-experiment编译feature").into());
+        }
         let mut screens = interval(DISPLAY_CHECK);
         screens.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut hints = self.config.edge.hints();
         // 设置的发送方已经不在（命令行模式）时，不再等它的变化。
         let mut live_open = true;
+        let mut handshakes = JoinSet::new();
+        let mut metrics_tick = interval_at(
+            tokio::time::Instant::now() + metrics::REPORT_EVERY,
+            metrics::REPORT_EVERY,
+        );
+        metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
+            #[cfg(feature = "quic-experiment")]
+            let quic_incoming = async {
+                match &mut quic {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            };
+            #[cfg(not(feature = "quic-experiment"))]
+            let quic_incoming = std::future::pending::<
+                ferry_net::Result<(Framed<ServerStream>, Fingerprint, SocketAddr)>,
+            >();
             tokio::select! {
+                accepted = quic_incoming => {
+                    match accepted {
+                        Ok((framed, peer, addr)) if handshakes.len() < MAX_HANDSHAKES => {
+                            let shared = self.shared.clone();
+                            handshakes.spawn(async move {
+                                if let Err(error) = established(&shared, framed, peer, addr).await {
+                                    warn!("QUIC应用握手失败：{error}");
+                                }
+                            });
+                        }
+                        Ok(_) => {},
+                        Err(error) => warn!("QUIC接受连接失败：{error}"),
+                    }
+                }
                 accepted = listener.accept() => match accepted {
                     Ok((stream, addr)) => {
-                        tokio::spawn(connection(self.shared.clone(), stream, addr));
+                        if handshakes.len() < MAX_HANDSHAKES {
+                            handshakes.spawn(connection(self.shared.clone(), stream, addr));
+                        }
+                        // 达到上限时立即关闭；已有会话仍由各自的任务继续服务。
                     }
                     Err(e) => warn!("接受连接失败：{e}"),
                 },
+                _ = handshakes.join_next(), if !handshakes.is_empty() => {},
                 Some(arrival) = self.arrivals.recv() => self.on_arrival(arrival),
-                Some(captured) = self.events.recv() => self.on_capture(captured),
+                Some(captured) = self.events.recv() => {
+                    if self.capture_stats.overflows.load(Ordering::Relaxed) != 0 {
+                        self.stop_overloaded_capture();
+                        return Err(std::io::Error::other("输入捕获队列已满，已停止共享并归还控制").into());
+                    }
+                    self.metrics.capture.record(captured.captured_at.elapsed());
+                    self.on_capture(captured);
+                },
+                expected = metrics_tick.tick() => {
+                    self.metrics.scheduler.record(expected.elapsed());
+                    self.report_capture();
+                },
                 changed = self.config.live.changed(), if live_open => {
                     if changed.is_err() {
                         live_open = false;
@@ -380,6 +531,28 @@ where
                 self.end(id, Some("对方长时间收不动，已断开".into()));
             }
         }
+    }
+
+    fn report_capture(&mut self) {
+        self.config.events.emit(Event::Metrics {
+            peer: None,
+            metrics: self
+                .metrics
+                .take(
+                    self.capture_stats.summary(self.events.len()),
+                    QueueSummary::default(),
+                )
+                .into(),
+        });
+    }
+
+    fn stop_overloaded_capture(&mut self) {
+        if let Some((_, at)) = self.neighbors.abort() {
+            let _ = self.capture.release(at);
+        }
+        self.sessions.clear();
+        self.shared.sessions().clear();
+        self.report_capture();
     }
 
     // ── 会话的开始与结束 ─────────────────────────
@@ -429,16 +602,15 @@ where
         let keys = Keys {
             peer,
             clipboard: caps.contains(Capabilities::CLIPBOARD) && settings.clipboard,
-            files: caps.contains(Capabilities::FILES),
+            files: caps.contains(Capabilities::FILES) && settings.files,
         };
         self.shared.sessions().insert(id, keys);
 
-        let (outbox, out_rx) = mpsc::channel(OUTBOX);
+        let (outbox, out_rx) = input_queue(OUTBOX, self.config.live.borrow().input);
         let active = watch::Sender::new(true);
         let io = tokio::spawn(run_session(
             framed,
-            id,
-            peer,
+            (id, peer, caps.contains(Capabilities::QUIC_MOTION)),
             out_rx,
             active.subscribe(),
             self.shared.arrivals.clone(),
@@ -499,11 +671,16 @@ where
         let files = keys
             .files
             .then(|| self.config.files.attach(keys.peer, None));
+        let start = if session.sync.is_some() {
+            Start::Resume
+        } else {
+            Start::Announce
+        };
         let task = clipboard::spawn(
             framed,
             self.clipboard.clone(),
             session.active.subscribe(),
-            Start::Announce,
+            start,
             report,
             keys.clipboard,
             files,
@@ -517,6 +694,7 @@ where
         };
         match message {
             Message::Displays(displays) => {
+                session.outbox.barrier();
                 session.remote = displays;
                 if let Some(rect) = bounds(&session.remote) {
                     let scale = relative_scale(&self.local, &session.remote);
@@ -548,6 +726,17 @@ where
             return;
         };
         self.shared.sessions().remove(&id);
+        let outbound = session.outbox.summary();
+        if outbound.overflows != 0 {
+            self.config.events.emit(Event::Metrics {
+                peer: Some(session.peer),
+                metrics: metrics::InputMetrics {
+                    outbound,
+                    ..Default::default()
+                }
+                .into(),
+            });
+        }
         if let Some(at) = self.neighbors.remove(id) {
             self.pressed.clear_keys();
             match self.capture.release(at) {
@@ -720,7 +909,14 @@ where
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        if session.outbox.try_send(message).is_err() && !self.broken.contains(&id) {
+        let mergeable = self.pressed.is_empty()
+            && match &message {
+                Message::Input(InputEvent::PointerMotion { position }) => {
+                    bounds(&session.remote).is_some_and(|rect| interior(*position, rect))
+                }
+                _ => false,
+            };
+        if session.outbox.try_send(message, mergeable).is_err() && !self.broken.contains(&id) {
             self.broken.push(id);
         }
     }
@@ -736,7 +932,15 @@ where
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
             };
+            session.outbox.configure(live.input);
             let settings = live.device(&session.peer);
+            if settings.clipboard != session.settings.clipboard
+                || settings.files != session.settings.files
+            {
+                // 已协商的能力不能半途悄悄改变；断开数据和输入会话，让双方重新协商。
+                self.end(id, Some("共享权限已改变，正在重新连接".into()));
+                continue;
+            }
             if settings != session.settings {
                 info!(peer = %mark::device(&session.name), "这台设备的设置变了");
                 // 改设置要点本机的设置界面，那时光标在本机、对方没有按着的键，直接换成新的。
@@ -911,12 +1115,41 @@ async fn handshake<P: ConfirmPairing>(
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<()> {
-    let (mut framed, peer) = timeout(HANDSHAKE_TIMEOUT, shared.tls.accept(stream))
+    let (framed, peer) = timeout(HANDSHAKE_TIMEOUT, shared.tls.accept(stream))
         .await
         .map_err(|_| Error::Timeout("TLS 握手"))??;
+    established(shared, framed, peer, addr).await
+}
+
+async fn established<P: ConfirmPairing>(
+    shared: &Shared<P>,
+    mut framed: Framed<ServerStream>,
+    peer: Fingerprint,
+    addr: SocketAddr,
+) -> Result<()> {
     // 每次都从磁盘读：用户手动删掉某台设备后立即生效。
     let peers = shared.store.peers()?;
-    let accepted = ferry_net::accept(&mut framed, shared.capabilities, &shared.name, |hello| {
+    let settings = shared.live.borrow().device(&peer);
+    let mut offered = shared.capabilities;
+    let quic = framed.get_ref().is_quic();
+    if quic && shared.quic_motion {
+        offered |= Capabilities::QUIC_MOTION;
+    }
+    if !settings.clipboard {
+        offered.remove(Capabilities::CLIPBOARD);
+    }
+    if !settings.files {
+        offered.remove(Capabilities::FILES | Capabilities::EDGE_DROP);
+    }
+    let accepted = ferry_net::accept(&mut framed, offered, &shared.name, |hello| {
+        if quic
+            && matches!(
+                hello.channel,
+                Channel::Data | Channel::File | Channel::Invite
+            )
+        {
+            return Err(RejectReason::UNKNOWN_SESSION);
+        }
         match hello.channel {
             Channel::Input if peers.contains(&peer) => {
                 Ok(shared.next_id.fetch_add(1, Ordering::Relaxed))
@@ -931,8 +1164,8 @@ async fn handshake<P: ConfirmPairing>(
                 let claimed = keys.is_some_and(|k| {
                     k.peer == peer
                         && match hello.channel {
-                            Channel::File => k.files,
-                            _ => k.clipboard || k.files,
+                            Channel::File => k.files && settings.files,
+                            _ => (k.clipboard && settings.clipboard) || (k.files && settings.files),
                         }
                 });
                 if claimed {
@@ -1039,26 +1272,60 @@ async fn pair<P: ConfirmPairing>(
 /// 结束时（对方断开、心跳超时、出错、主循环不要它了）告诉主循环。
 async fn run_session(
     mut framed: Framed<ServerStream>,
-    id: u64,
-    peer: Fingerprint,
-    mut outbox: mpsc::Receiver<Message>,
+    identity: (u64, Fingerprint, bool),
+    mut outbox: InputReceiver,
     active: watch::Receiver<bool>,
     arrivals: mpsc::Sender<Arrival>,
     events: Events,
 ) {
+    let (id, peer, motion_enabled) = identity;
+    let datagrams = framed.get_ref().datagrams().filter(|_| motion_enabled);
+    let mut motion = datagrams.as_ref().map(|_| crate::MotionSender::new(id));
     let mut heartbeat = Heartbeat::new();
+    let mut metrics = MetricsWindow::default();
+    let mut metrics_tick = interval_at(
+        tokio::time::Instant::now() + metrics::REPORT_EVERY,
+        metrics::REPORT_EVERY,
+    );
+    metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut tick = interval(heartbeat::TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let result: Result<()> = async {
         loop {
             tokio::select! {
                 message = outbox.recv() => match message {
-                    Some(message) => send(&mut framed, &message).await?,
+                    Some(queued) => {
+                        metrics.queued.record(queued.queued_at.elapsed());
+                        let start = Instant::now();
+                        if let Some(state) = motion.as_mut() {
+                            let plan = state.prepare(queued.message, queued.ordinary_motion, start);
+                            for reliable in plan.reliable { send(&mut framed, &reliable).await?; }
+                            if let Some(packet) = plan.datagram
+                                && let Some(datagrams) = &datagrams
+                                && datagrams.send(&packet.encode_datagram()).is_err() {
+                                state.disable();
+                                if let Some(final_position) = state.compensate() {
+                                    send(&mut framed, &final_position).await?;
+                                }
+                            }
+                        } else {
+                            send(&mut framed, &queued.message).await?;
+                        }
+                        metrics.send.record(start.elapsed());
+                    },
                     None => return Ok(()),
                 },
                 message = framed.recv() => match message? {
+                    Some(Message::MotionFence { .. } | Message::MotionSync(_)) => {
+                        return Err(Error::Protocol("被控端不能发送QUIC移动控制"));
+                    }
+                    Some(Message::MotionAck { generation, sequence }) => {
+                        let Some(state) = &mut motion else { return Err(Error::Protocol("未协商QUIC移动")); };
+                        state.acknowledge(generation, sequence);
+                    }
                     Some(Message::Pong { nonce }) => {
                         if let Some(rtt) = heartbeat.pong(nonce) {
+                            metrics.rtt.record(rtt);
                             events.emit(Event::Rtt { peer, rtt });
                         }
                     }
@@ -1076,7 +1343,19 @@ async fn run_session(
                     }
                     Some(other) => debug!(kind = format_args!("{:#06x}", other.type_id()), "忽略消息"),
                 },
-                _ = tick.tick() => {
+                _ = async {
+                    match motion.as_ref().and_then(crate::MotionSender::deadline) {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(final_position) = motion.as_mut().and_then(crate::MotionSender::compensate) {
+                        send(&mut framed, &final_position).await?;
+                    }
+                }
+                expected = tick.tick() => {
+                    if let Some(state) = &mut motion { state.check_timeout(Instant::now()); }
+                    metrics.scheduler.record(expected.elapsed());
                     if heartbeat.timed_out() {
                         let bye = Bye { reason: ByeReason::TIMEOUT };
                         let _ = send(&mut framed, &Message::Bye(bye)).await;
@@ -1090,10 +1369,20 @@ async fn run_session(
                         info!("{report}");
                     }
                 }
+                _ = metrics_tick.tick() => {
+                    events.emit(Event::Metrics { peer: Some(peer),
+                        metrics: metrics.take(QueueSummary::default(), outbox.summary()).into() });
+                }
             }
         }
     }
     .await;
+    events.emit(Event::Metrics {
+        peer: Some(peer),
+        metrics: metrics
+            .take(QueueSummary::default(), outbox.summary())
+            .into(),
+    });
     let reason = result.err().map(|e| e.to_string());
     let _ = arrivals.send(Arrival::Closed { id, reason }).await;
 }
@@ -1135,4 +1424,29 @@ async fn expect_displays(framed: &mut Framed<ServerStream>) -> Result<Vec<Displa
 fn relative_scale(local: &[Display], remote: &[Display]) -> u16 {
     let ratio = u32::from(primary_scale(remote)) * 100 / u32::from(primary_scale(local));
     u16::try_from(ratio).unwrap_or(u16::MAX)
+}
+
+#[derive(Default)]
+struct CaptureStats {
+    high_water: AtomicUsize,
+    overflows: AtomicU64,
+}
+
+impl CaptureStats {
+    fn summary(&self, depth: usize) -> QueueSummary {
+        QueueSummary {
+            depth,
+            high_water: self.high_water.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+            ..QueueSummary::default()
+        }
+    }
+}
+
+/// 屏幕边缘附近保留完整移动路径，避免合并改变触边/回切反馈。
+fn interior(position: Point, rect: Rect) -> bool {
+    position.x > rect.x.saturating_add(2)
+        && position.y > rect.y.saturating_add(2)
+        && position.x < rect.right().saturating_sub(3)
+        && position.y < rect.bottom().saturating_sub(3)
 }

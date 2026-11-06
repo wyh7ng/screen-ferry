@@ -40,7 +40,10 @@ class Sidebar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.navigation, AppAspect.connection, AppAspect.devices, AppAspect.updateReminder},
+    );
     final c = SfColors.of(context);
     final collapsed = forceCollapsed || state.sidebarCollapsed;
     final index = navIndexOf(state.page);
@@ -97,41 +100,52 @@ class Sidebar extends StatelessWidget {
             _UpdatePill(version: version, collapsed: collapsed, onTap: () => state.go(SfPage.about)),
             const SizedBox(height: 8),
           ],
-          Tooltip(
-            message: _footer(state),
-            child: AnimatedContainer(
-              duration: Motion.medium,
-              curve: Motion.ease,
-              height: 44,
-              // 收起时圆点正好落在中间；展开时左边留 16。
-              padding: EdgeInsets.only(left: collapsed ? (_railWidth - _dotSize) / 2 : 16, right: 12),
-              decoration: ShapeDecoration(color: c.card2, shape: continuous(14)),
-              child: Row(
-                children: [
-                  StatusDot(on: state.connected),
-                  Expanded(
-                    child: ClipRect(
-                      child: AnimatedOpacity(
-                        duration: Motion.fast,
-                        opacity: collapsed ? 0 : 1,
-                        child: Padding(
-                          padding: const EdgeInsets.only(left: 10),
-                          child: Text(
-                            _footer(state),
-                            maxLines: 1,
-                            softWrap: false,
-                            overflow: TextOverflow.clip,
-                            style: TextStyle(fontSize: 13, color: c.muted, fontFeatures: tabular),
-                          ),
-                        ),
-                      ),
+          _StatusFooter(collapsed: collapsed),
+        ],
+      ),
+    );
+  }
+}
+
+class _StatusFooter extends StatelessWidget {
+  const _StatusFooter({required this.collapsed});
+  final bool collapsed;
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context, aspects: const {AppAspect.connection, AppAspect.rtt});
+    final c = SfColors.of(context);
+    return Tooltip(
+      message: _footer(state),
+      child: AnimatedContainer(
+        duration: Motion.medium,
+        curve: Motion.ease,
+        height: 44,
+        // 收起时圆点正好落在中间；展开时左边留 16。
+        padding: EdgeInsets.only(left: collapsed ? (_railWidth - _dotSize) / 2 : 16, right: 12),
+        decoration: ShapeDecoration(color: c.card2, shape: continuous(14)),
+        child: Row(
+          children: [
+            StatusDot(on: state.connected),
+            Expanded(
+              child: ClipRect(
+                child: AnimatedOpacity(
+                  duration: Motion.fast,
+                  opacity: collapsed ? 0 : 1,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 10),
+                    child: Text(
+                      _footer(state),
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.clip,
+                      style: TextStyle(fontSize: 13, color: c.muted, fontFeatures: tabular),
                     ),
                   ),
-                ],
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

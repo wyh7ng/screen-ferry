@@ -86,6 +86,12 @@ Device names, user names and file names are replaced with placeholders.
 While the cursor is on another screen, press <kbd>Ctrl</kbd>+<kbd>Option</kbd>+<kbd>Esc</kbd> (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> when Windows controls) to bring it back.
 Quit other keyboard and mouse sharing tools first so they don't compete for input.
 
+### Transfer and responsiveness
+
+Settings can limit the combined rate of all outgoing files (decimal MB/s; 0 means unlimited), leaving bandwidth for input and other applications. Rate limiting does not eliminate wireless link jitter.
+“Coalesce pointer motion” is off by default. When enabled it combines queued ordinary motion while preserving key, drag and screen transition order.
+The overview shows local stage timings and queues for the latest sample window. Percentiles are approximate; RTT is not input-to-display latency.
+
 ### Command line
 
 | Command | What it does |
@@ -116,6 +122,11 @@ cargo xtask bundle
 
 It builds for the system it runs on and puts the result in `target/bundle/`: `ScreenFerry.app` and its update package `ScreenFerry-<version>-macos-<arch>.zip` on macOS (add `--dmg` for the installer disk), `ScreenFerry-<version>-windows-x64-setup.exe` on Windows. Releases are made with `cargo xtask release <version>`; see ADR 0014.
 On macOS the app is signed with a Developer ID certificate from the keychain when there is one (or the one named by `SCREENFERRY_SIGN_IDENTITY`). Otherwise it gets an ad-hoc signature, and Accessibility permission has to be granted again after every rebuild.
+
+### Optional QUIC input experiment
+
+Default builds and the resident application continue to use TCP. Developers can build with `cargo build -p ferry-daemon --features quic-experiment`, then run `serve/connect --transport quic`; `--transport auto` falls back to TCP when establishing the connection fails. Add `--quic-reliable-only` to compare reliable streams without motion datagrams. Clipboard and file transfers still use TCP.
+See [ADR 0017](docs/adr/0017-quic-input-experiment.md) for pairing, ordering barriers and command examples. This is a development experiment with no demonstrated latency benefit on a real LAN.
 
 ## Development
 
@@ -160,6 +171,9 @@ The engineering docs are written in Chinese:
 | [docs/protocol.md](docs/protocol.md) | Wire protocol |
 | [docs/ipc.md](docs/ipc.md) | Local IPC between the settings window and the background service |
 | [docs/adr/](docs/adr/) | Architecture decision records |
+
+
+This branch fixes file-name collisions, connection recovery, pairing sessions, and blocking background work; see [ADR 0015](docs/adr/0015-reliable-lifecycle-and-input-isolation.md). The settings window and daemon use local IPC 3 and must be updated together; the device wire protocol remains version 1. Resend unfinished file transfers after upgrading. On a Mac controller, Caps Lock mappings currently support keeping or disabling the key.
 
 ## License
 

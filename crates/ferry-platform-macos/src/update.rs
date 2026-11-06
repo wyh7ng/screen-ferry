@@ -85,7 +85,13 @@ impl Updater for MacUpdater {
         parse_scutil_proxy(&String::from_utf8_lossy(&output.stdout))
     }
 
-    fn prepare(&self, package: &Path, version: &str) -> Result<Prepared> {
+    fn prepare(
+        &self,
+        package: &Path,
+        version: &str,
+        _size: u64,
+        _sha256: &str,
+    ) -> Result<Prepared> {
         self.can_install()?;
         let bundle = self.bundle()?;
         let parent = bundle
@@ -104,8 +110,8 @@ impl Updater for MacUpdater {
                 staging.as_os_str(),
             ],
         );
-        let name = bundle.file_name().unwrap_or(OsStr::new("ScreenFerry.app"));
-        let new_app = staging.join(name);
+        // 发布包内的名字固定，安装目录里的应用允许被用户改名。
+        let new_app = staging.join("ScreenFerry.app");
         if unpacked.is_err() || !new_app.is_dir() {
             let _ = fs::remove_dir_all(&staging);
             return Err(Error::Failed("更新包里没有 ScreenFerry.app".into()));
@@ -123,6 +129,7 @@ impl Updater for MacUpdater {
         // 交换之后，`new_app` 那个位置放的是旧版本。
         Ok(Prepared {
             target: bundle.to_owned(),
+            version: version.to_owned(),
             backup: Some(new_app),
             restart_self: true,
         })

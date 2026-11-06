@@ -10,6 +10,7 @@ struct Inner {
     blocked: Option<&'static str>,
     cancel: bool,
     calls: Vec<String>,
+    capability_checks: usize,
 }
 
 /// 克隆后共用同一份记录。缺省能安装，更新包叫 `test`，像 macOS 一样由自己重启。
@@ -36,6 +37,11 @@ impl MockUpdater {
         self.0.lock().unwrap().calls.clone()
     }
 
+    /// 查询安装能力的次数，验证状态快照不会重复启动系统命令。
+    pub fn capability_checks(&self) -> usize {
+        self.0.lock().unwrap().capability_checks
+    }
+
     fn record(&self, call: String) {
         self.0.lock().unwrap().calls.push(call);
     }
@@ -47,7 +53,9 @@ impl Updater for MockUpdater {
     }
 
     fn can_install(&self) -> Result<()> {
-        match self.0.lock().unwrap().blocked {
+        let mut inner = self.0.lock().unwrap();
+        inner.capability_checks += 1;
+        match inner.blocked {
             Some(reason) => Err(Error::Unsupported(reason)),
             None => Ok(()),
         }
@@ -57,10 +65,17 @@ impl Updater for MockUpdater {
         None
     }
 
-    fn prepare(&self, package: &Path, version: &str) -> Result<Prepared> {
+    fn prepare(
+        &self,
+        package: &Path,
+        version: &str,
+        _size: u64,
+        _sha256: &str,
+    ) -> Result<Prepared> {
         self.record(format!("prepare {version}"));
         Ok(Prepared {
             target: package.to_owned(),
+            version: version.to_owned(),
             backup: None,
             restart_self: true,
         })

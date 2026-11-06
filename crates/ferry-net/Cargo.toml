@@ -9,7 +9,13 @@ publish.workspace = true
 [lib]
 test = false
 
+[features]
+default = []
+quic-experiment = ["dep:quinn", "tokio/macros", "tokio/sync", "tokio/time", "tokio/rt"]
+
 [dependencies]
+quinn = { workspace = true, optional = true }
+
 ferry-proto.workspace = true
 ferry-trust.workspace = true
 ferry-types.workspace = true

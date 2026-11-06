@@ -8,17 +8,16 @@
 //! - 文件写满 2 MB 时改名成上一卷（`screenferry.log.1`）再开一个，只留这一卷。
 //! - “详细记录”（DEBUG）可以在运行中打开、关闭，见 [`set_verbose`]。
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use ferry_store::Store;
+use ferry_store::{LogGuard, LogWriter, MAX_LOG_RECORD, RotatingLog, Store};
 use time::UtcOffset;
 use time::macros::format_description;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::OffsetTime;
-use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Registry, reload};
@@ -32,6 +31,7 @@ const LOG_LIMIT: u64 = 2 * 1024 * 1024;
 static LEVEL: OnceLock<reload::Handle<LevelFilter, Registry>> = OnceLock::new();
 /// 启动时取到的本机时区。
 static OFFSET: OnceLock<UtcOffset> = OnceLock::new();
+static LOG_GUARD: OnceLock<Mutex<Option<LogGuard>>> = OnceLock::new();
 
 pub(crate) fn init(options: &Options) {
     let offset =
@@ -54,10 +54,17 @@ pub(crate) fn init(options: &Options) {
         .map(Mutex::new);
     // Windows 的控制台窗口不一定认颜色控制码，不加颜色；写进文件时也不加。
     let ansi = terminal && file.is_none() && !cfg!(target_os = "windows");
-    let writer = match file {
-        Some(file) if terminal => BoxMakeWriter::new(file.and(io::stderr)),
-        Some(file) => BoxMakeWriter::new(file),
-        None => BoxMakeWriter::new(io::stderr),
+    let sink: Box<dyn Write + Send> = match file {
+        Some(file) if terminal => Box::new(DualOutput(file.into_inner().unwrap(), io::stderr())),
+        Some(file) => Box::new(file.into_inner().unwrap()),
+        None => Box::new(io::stderr()),
+    };
+    let writer = match LogWriter::with_utc_offset(sink, 256, offset.whole_seconds()) {
+        Ok((writer, guard)) => {
+            let _ = LOG_GUARD.set(Mutex::new(Some(guard)));
+            BoxMakeWriter::new(AsyncWriter(writer))
+        }
+        Err(_) => BoxMakeWriter::new(io::stderr),
     };
     let output = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -87,70 +94,69 @@ pub(crate) fn utc_offset() -> i32 {
     OFFSET.get().map_or(0, |o| o.whole_seconds())
 }
 
-fn log_file(options: &Options) -> Option<LogFile> {
+fn log_file(options: &Options) -> Option<RotatingLog> {
     let store = match &options.data_dir {
         Some(dir) => Store::open(dir),
         None => Store::open_default(),
     }
     .ok()?;
     fs::create_dir_all(store.logs_dir()).ok()?;
-    LogFile::open(store.log_file(), store.previous_log_file()).ok()
+    RotatingLog::open(store.log_file(), store.previous_log_file(), LOG_LIMIT).ok()
 }
 
-/// 运行日志文件：写满 [`LOG_LIMIT`] 时改名成上一卷，再开一个新的。
-struct LogFile {
-    path: PathBuf,
-    previous: PathBuf,
-    file: Option<File>,
-    len: u64,
+/// 常驻进程退出前释放后台writer，排空已经接受的记录。
+pub(crate) fn shutdown() {
+    if let Some(guard) = LOG_GUARD.get()
+        && let Ok(mut guard) = guard.lock()
+    {
+        drop(guard.take());
+    }
 }
 
-impl LogFile {
-    fn open(path: PathBuf, previous: PathBuf) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let len = file.metadata()?.len();
-        let mut log = Self {
-            path,
-            previous,
-            file: Some(file),
-            len,
-        };
-        if log.len > LOG_LIMIT {
-            log.rotate();
+struct AsyncWriter(LogWriter);
+struct EventWriter {
+    sink: LogWriter,
+    bytes: Vec<u8>,
+}
+impl<'a> MakeWriter<'a> for AsyncWriter {
+    type Writer = EventWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        EventWriter {
+            sink: self.0.clone(),
+            bytes: Vec::with_capacity(256),
         }
-        Ok(log)
-    }
-
-    fn rotate(&mut self) {
-        // 先关掉再改名：Windows 上不能给打开着的文件改名。
-        self.file = None;
-        let _ = fs::rename(&self.path, &self.previous);
-        self.file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-            .ok();
-        self.len = 0;
     }
 }
-
-impl Write for LogFile {
+impl Write for EventWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // 每条日志一次写进来，在两条之间换卷。
-        if self.len > 0 && self.len + buf.len() as u64 > LOG_LIMIT {
-            self.rotate();
-        }
-        // 文件打不开时丢掉这条日志，不影响程序运行。
-        let Some(file) = self.file.as_mut() else {
-            return Ok(buf.len());
-        };
-        let written = file.write(buf)?;
-        self.len += written as u64;
-        Ok(written)
+        let n = buf.len().min(
+            MAX_LOG_RECORD
+                .saturating_add(1)
+                .saturating_sub(self.bytes.len()),
+        );
+        self.bytes.extend_from_slice(&buf[..n]);
+        Ok(buf.len())
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        self.file.as_mut().map_or(Ok(()), File::flush)
+        Ok(())
+    }
+}
+impl Drop for EventWriter {
+    fn drop(&mut self) {
+        if !self.bytes.is_empty() {
+            self.sink.record(&self.bytes);
+        }
+    }
+}
+struct DualOutput<A, B>(A, B);
+impl<A: Write, B: Write> Write for DualOutput<A, B> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write_all(bytes)?;
+        self.1.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()?;
+        self.1.flush()
     }
 }

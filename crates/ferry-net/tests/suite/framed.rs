@@ -52,3 +52,35 @@ async fn protocol_violations_surface_as_decode_errors() {
     let mut rx = Framed::new(b, Channel::Input);
     assert!(matches!(rx.recv().await, Err(Error::Decode(_))));
 }
+
+#[tokio::test]
+async fn buffered_frames_and_a_cancelled_partial_frame_preserve_order() {
+    let (mut write, read) = duplex(32768);
+    let codec = Codec::new(Channel::Input);
+    let mut frames = Vec::new();
+    for nonce in 0..500 {
+        codec.encode(&Message::Ping { nonce }, &mut frames).unwrap();
+    }
+    let mut last = Vec::new();
+    codec
+        .encode(&Message::Pong { nonce: 999 }, &mut last)
+        .unwrap();
+    write.write_all(&frames).await.unwrap();
+    write.write_all(&last[..3]).await.unwrap();
+    let mut framed = Framed::new(read, Channel::Input);
+    for nonce in 0..500 {
+        assert_eq!(framed.recv().await.unwrap(), Some(Message::Ping { nonce }));
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), framed.recv())
+            .await
+            .is_err()
+    );
+    write.write_all(&last[3..]).await.unwrap();
+    drop(write);
+    assert_eq!(
+        framed.recv().await.unwrap(),
+        Some(Message::Pong { nonce: 999 })
+    );
+    assert_eq!(framed.recv().await.unwrap(), None);
+}

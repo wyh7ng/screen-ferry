@@ -8,11 +8,13 @@
 //! - 不是用安装包装的（例如开发时直接运行）不能自己更新：安装目录里没有卸载程序 `unins000.exe`。
 
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
 use ferry_platform::{Error, Prepared, Result, Updater};
+use ring::digest::{Context, SHA256};
 use windows::Win32::Foundation::{ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows::Win32::System::Registry::{
@@ -70,16 +72,13 @@ impl Updater for WinUpdater {
         parse_proxy_server(&key.string(w!("ProxyServer"))?)
     }
 
-    fn prepare(&self, package: &Path, _version: &str) -> Result<Prepared> {
+    fn prepare(&self, package: &Path, version: &str, size: u64, sha256: &str) -> Result<Prepared> {
         self.can_install()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ.0)
-            .open(package)
-            .map_err(|e| Error::Failed(format!("打不开安装包：{e}")))?;
+        let file = locked_package(package, size, sha256)?;
         *self.held.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
         Ok(Prepared {
             target: package.to_owned(),
+            version: version.to_owned(),
             backup: None,
             restart_self: false,
         })
@@ -116,6 +115,41 @@ impl Updater for WinUpdater {
     fn rollback(&self, _prepared: &Prepared) -> Result<()> {
         Ok(())
     }
+}
+
+/// 打开并锁定安装包后验证同一句柄，返回的句柄必须一直保留到启动结束。
+pub fn locked_package(path: &Path, size: u64, sha256: &str) -> Result<File> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+        .map_err(|e| Error::Failed(format!("打不开安装包：{e}")))?;
+    let mut hash = Context::new(&SHA256);
+    let mut bytes = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| Error::Failed(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(n as u64);
+        if bytes > size {
+            return Err(Error::Failed("安装包与签名清单不一致，请重新下载".into()));
+        }
+        hash.update(&buf[..n]);
+    }
+    let found: String = hash
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if bytes != size || !found.eq_ignore_ascii_case(sha256) {
+        return Err(Error::Failed("安装包与签名清单不一致，请重新下载".into()));
+    }
+    Ok(file)
 }
 
 /// `ProxyServer` 的值：`主机:端口`，或者按协议分开的 `http=主机:端口;https=主机:端口`。

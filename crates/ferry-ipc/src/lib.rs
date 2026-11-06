@@ -13,12 +13,13 @@ mod endpoint;
 mod error;
 mod message;
 
-pub use connection::{Connection, Incoming, Listener, Reader, Writer, connect};
+pub use connection::{Connection, Incoming, Listener, Reader, Writer, connect, probe_update};
 pub use endpoint::Endpoint;
 pub use error::{Error, Result};
 pub use message::{
-    ClipboardImage, ClipboardSync, DialError, FoundDevice, HourActivity, Link, LinkStatus, Local,
-    LogEntry, LogIcon, LogKind, MAX_LINE, Notice, PairingPrompt, PeerInfo, PeerRef, Phrase,
-    Problem, ProblemKind, Request, RunLogLevel, RunLogLine, Settings, SettingsPatch, State,
-    UpdateError, UpdateInfo, UpdateRelease, UpdateStatus, VERSION,
+    ClipboardImage, ClipboardSync, DialError, FoundDevice, HourActivity, InputMetrics,
+    LatencySummary, Link, LinkStatus, Local, LogEntry, LogIcon, LogKind, MAX_LINE, Notice,
+    PairingPrompt, PeerInfo, PeerPerformance, PeerRef, Performance, Phrase, Problem, ProblemKind,
+    QueueSummary, Request, RunLogLevel, RunLogLine, Settings, SettingsPatch, State, UpdateError,
+    UpdateInfo, UpdateRelease, UpdateStatus, VERSION,
 };

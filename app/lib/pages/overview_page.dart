@@ -15,6 +15,7 @@ import '../widgets/page_scaffold.dart';
 import '../widgets/pressable.dart';
 import '../widgets/status_banners.dart';
 import '../widgets/surface.dart';
+import 'performance_card.dart';
 
 class OverviewPage extends StatelessWidget {
   const OverviewPage({super.key});
@@ -57,6 +58,8 @@ class OverviewPage extends StatelessWidget {
                 _QuickTiles(wide: wide),
                 gap,
                 pair(const _DevicesCard(), const _TodayCard()),
+                gap,
+                const PerformanceCard(),
               ],
             );
           },
@@ -75,13 +78,15 @@ class _HeroCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.connection, AppAspect.local, AppAspect.devices, AppAspect.settings, AppAspect.clock},
+    );
     final c = SfColors.of(context);
     final l = context.l10n;
     final status = state.status;
     final peer = state.peer;
     final since = state.connectedAt;
-    final rtt = state.latestRtt;
 
     final (title, pill, tone) = switch (status) {
       // 本机给它起过名字就显示起的名字。
@@ -139,15 +144,7 @@ class _HeroCard extends StatelessWidget {
                       spacing: 8,
                       runSpacing: 8,
                       children: [
-                        if (rtt != null)
-                          Pill(
-                            rtt < 1
-                                ? l.overviewLatencyGreat
-                                : rtt < 5
-                                ? l.overviewLatencyGood
-                                : l.overviewLatencyHigh,
-                            tone: PillTone.good,
-                          ),
+                        const _LatencyBadge(),
                         Pill(
                           state.cursorOnPeer || state.cursorPeer != null
                               ? l.overviewCursorOn(state.cursorPeer?.displayName ?? state.peerName)
@@ -330,6 +327,25 @@ class _CoreButton extends StatelessWidget {
   }
 }
 
+class _LatencyBadge extends StatelessWidget {
+  const _LatencyBadge();
+  @override
+  Widget build(BuildContext context) {
+    final state = AppScope.of(context, aspects: const {AppAspect.rtt});
+    final rtt = state.latestRtt;
+    if (rtt == null) return const SizedBox.shrink();
+    final l = context.l10n;
+    return Pill(
+      rtt < 1
+          ? l.overviewLatencyGreat
+          : rtt < 5
+          ? l.overviewLatencyGood
+          : l.overviewLatencyHigh,
+      tone: PillTone.good,
+    );
+  }
+}
+
 // ── 延迟、剪贴板 ─────────────────────────────
 
 class _LatencyCard extends StatelessWidget {
@@ -337,7 +353,7 @@ class _LatencyCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.rtt, AppAspect.connection});
     final c = SfColors.of(context);
     String ms(double? v) => v == null ? '—' : v.toStringAsFixed(2);
     final rtt = state.rtt;
@@ -381,7 +397,10 @@ class _ClipboardCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.clipboard, AppAspect.connection, AppAspect.settings, AppAspect.clock},
+    );
     final c = SfColors.of(context);
     final clip = state.clipboard;
     Widget chip(String text) => Flexible(
@@ -511,7 +530,7 @@ class _QuickTiles extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.settings, AppAspect.connection, AppAspect.local});
     final s = state.settings;
     VoidCallback? toggle(SettingsPatch patch) => state.online ? () => state.updateSettings(patch) : null;
     final tiles = [
@@ -616,7 +635,10 @@ class _DevicesCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.devices, AppAspect.connection, AppAspect.local, AppAspect.settings, AppAspect.clock},
+    );
     final c = SfColors.of(context);
     final peers = state.peers;
     final found = state.found;
@@ -680,9 +702,13 @@ class _DevicesCard extends StatelessWidget {
                     children: [
                       Icon(Icons.radar_rounded, size: 18, color: c.muted),
                       const SizedBox(width: 8),
-                      Text(
-                        context.l10n.overviewFoundNew(found.length),
-                        style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: c.muted),
+                      Flexible(
+                        child: Text(
+                          context.l10n.overviewFoundNew(found.length),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: c.muted),
+                        ),
                       ),
                     ],
                   ),
@@ -740,7 +766,7 @@ class _TodayCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.activity, AppAspect.clock});
     final c = SfColors.of(context);
     final today = state.today;
     Widget stat(String value, String label) => Expanded(

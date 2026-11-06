@@ -25,6 +25,9 @@ fn kind(message: &Message) -> &'static str {
         Message::DropHint(_) => "DropHint",
         Message::OpenSettings => "OpenSettings",
         Message::AppInfo { .. } => "AppInfo",
+        Message::MotionFence { .. } => "MotionFence",
+        Message::MotionAck { .. } => "MotionAck",
+        Message::MotionSync(_) => "MotionSync",
         Message::Input(event) => match event {
             InputEvent::Key { .. } => "Key",
             InputEvent::PointerMotion { .. } => "PointerMotion",
@@ -48,7 +51,7 @@ fn kind(message: &Message) -> &'static str {
     }
 }
 
-const MESSAGE_KINDS: usize = 34;
+const MESSAGE_KINDS: usize = 37;
 
 fn decode(channel: Channel, buf: &[u8]) -> Result<Option<(Message, usize)>, DecodeError> {
     Codec::new(channel).decode(buf)

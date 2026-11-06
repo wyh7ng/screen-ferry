@@ -116,6 +116,30 @@ pub fn samples() -> Vec<(Channel, Message)> {
             code: KeyCode::new(KeyCode::CONSUMER_PAGE, 0xE9),
             action: KeyAction::Repeat,
         }),
+        (
+            Channel::Input,
+            Message::MotionFence {
+                generation: 7,
+                sequence: 10,
+                position: Some(at),
+            },
+        ),
+        (
+            Channel::Input,
+            Message::MotionAck {
+                generation: 7,
+                sequence: 10,
+            },
+        ),
+        (
+            Channel::Input,
+            Message::MotionSync(ferry_proto::MotionPacket {
+                generation: 7,
+                sequence: 11,
+                barrier: 10,
+                position: at,
+            }),
+        ),
         input(InputEvent::PointerMotion { position: at }),
         input(InputEvent::PointerDelta { dx: -3, dy: 5 }),
         input(InputEvent::Button {

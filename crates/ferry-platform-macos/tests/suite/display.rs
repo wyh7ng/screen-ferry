@@ -2,6 +2,7 @@ use ferry_platform::Displays;
 use ferry_platform_macos::MacDisplays;
 
 #[test]
+#[ignore = "需要唤醒的 macOS 显示器；实机桌面环境显式运行"]
 fn reports_one_primary_display_with_real_size() {
     let displays = MacDisplays.displays().unwrap();
     assert!(!displays.is_empty());

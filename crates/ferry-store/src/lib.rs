@@ -10,11 +10,15 @@ mod config;
 mod dirs;
 mod error;
 mod file;
+mod instance;
+mod log_writer;
 mod peers;
 mod store;
 mod update;
 
 pub use dirs::{default_cache_dir, default_data_dir, default_downloads_dir, home_dir};
 pub use error::{Error, Result};
+pub use instance::InstanceLock;
+pub use log_writer::{LogGuard, LogWriter, MAX_LOG_RECORD, RotatingLog};
 pub use store::Store;
 pub use update::{Installing, UpdateState};

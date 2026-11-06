@@ -67,9 +67,13 @@ void main() {
 
   test('后台会发的键都认得', () {
     // 直接从后台的源码里找：后台加了新的键而这里没跟上时，这条测试会失败。
-    final source = File('../crates/ferry-engine/src/resident/runtime.rs');
+    final sources = Directory('../crates/ferry-engine/src/resident')
+        .listSync(recursive: true)
+        .whereType<File>()
+        .where((file) => file.path.endsWith('.rs'));
     final keys = {
-      for (final m in RegExp(r'(?:Phrase::new|base)\("(\w+)"\)').allMatches(source.readAsStringSync())) m.group(1)!,
+      for (final source in sources)
+        for (final m in RegExp(r'(?:Phrase::new|base)\("(\w+)"\)').allMatches(source.readAsStringSync())) m.group(1)!,
     };
     expect(keys, hasLength(greaterThan(40)));
     for (final key in keys) {

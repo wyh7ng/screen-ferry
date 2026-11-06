@@ -2,10 +2,12 @@
 //!
 //! 常驻后台用它们拼出给设置界面看的状态；命令行模式不关心，传 [`Events::none`]。
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferry_core::clip_format::png_size;
@@ -19,6 +21,8 @@ use crate::error::Error;
 /// 一件发生了的事。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// 常驻后台的引擎代次。旧引擎排队中的事件不能覆盖新引擎状态。
+    Engine { generation: u64, event: Box<Event> },
     /// 服务端开始等待连接。
     Listening { port: u16, announced: bool },
     /// 客户端开始在局域网里寻找服务端。
@@ -39,6 +43,11 @@ pub enum Event {
     Disconnected {
         peer: Fingerprint,
         reason: Option<String>,
+    },
+    /// 本机输入性能快照；None是控制端捕获队列，Some是该设备会话的发送/接收。
+    Metrics {
+        peer: Option<Fingerprint>,
+        metrics: Box<crate::metrics::InputMetrics>,
     },
     /// 与 `peer` 的一次往返延迟。
     Rtt { peer: Fingerprint, rtt: Duration },
@@ -84,6 +93,8 @@ pub enum Event {
     /// 用户按地址连接（客户端）或邀请一台电脑（服务端）的结果。`error` 为 `None` 表示成了：
     /// 连上了、开始核对配对码，或者对方接受了邀请、正在连过来。
     Dialed {
+        /// 常驻后台分配的异步操作号，用来关联发起界面和请求；自动连接为 None。
+        request_id: Option<u64>,
         /// 连的是哪里，给用户看。
         address: String,
         invite: bool,
@@ -237,7 +248,7 @@ impl ClipSummary {
             Some(ClipImage {
                 width,
                 height,
-                png: Arc::from(png),
+                png: content.get_shared(ClipboardFormat::PNG)?,
             })
         });
         Self {
@@ -260,25 +271,151 @@ impl ClipSummary {
     }
 }
 
-/// 事件的去处。克隆后共用同一个接收方；没有接收方时事件直接丢弃。
+/// 高频状态只保留未消费的最新值；配对、终态与命令结果按序可靠交付。
 #[derive(Clone, Debug, Default)]
-pub struct Events(Option<UnboundedSender<Event>>);
+pub struct Events(Option<Arc<EventSink>>, Option<u64>);
+
+type EventKey = (Option<u64>, String);
+type LatestEvents = Arc<Mutex<HashMap<EventKey, (u64, Event)>>>;
+
+#[derive(Debug)]
+struct EventSink {
+    sender: UnboundedSender<QueuedEvent>,
+    next: AtomicU64,
+    latest: LatestEvents,
+}
+
+#[derive(Debug)]
+enum QueuedEvent {
+    Direct(Box<Event>),
+    Latest(EventKey, u64),
+}
+
+/// 与tokio接收端一样，recv可安全取消；高频事件不会随消费者暂停无限积压。
+pub struct EventReceiver {
+    receiver: UnboundedReceiver<QueuedEvent>,
+    latest: LatestEvents,
+}
+
+impl EventReceiver {
+    pub async fn recv(&mut self) -> Option<Event> {
+        loop {
+            let queued = self.receiver.recv().await?;
+            if let Some(event) = self.resolve(queued) {
+                return Some(event);
+            }
+        }
+    }
+    pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
+        loop {
+            let queued = self.receiver.try_recv()?;
+            if let Some(event) = self.resolve(queued) {
+                return Ok(event);
+            }
+        }
+    }
+    fn resolve(&self, queued: QueuedEvent) -> Option<Event> {
+        match queued {
+            QueuedEvent::Direct(event) => Some(*event),
+            QueuedEvent::Latest(key, token) => {
+                let mut latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+                if latest
+                    .get(&key)
+                    .is_some_and(|(current, _)| *current == token)
+                {
+                    latest.remove(&key).map(|(_, event)| event)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
 
 impl Events {
-    /// 不需要事件（命令行模式）。
     pub fn none() -> Self {
-        Self(None)
+        Self(None, None)
     }
 
-    /// 新建一对发送与接收端。
-    pub fn channel() -> (Self, UnboundedReceiver<Event>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self(Some(tx)), rx)
+    pub fn channel() -> (Self, EventReceiver) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let latest = Arc::new(Mutex::new(HashMap::new()));
+        (
+            Self(
+                Some(Arc::new(EventSink {
+                    sender,
+                    next: AtomicU64::new(0),
+                    latest: latest.clone(),
+                })),
+                None,
+            ),
+            EventReceiver { receiver, latest },
+        )
     }
 
-    pub fn emit(&self, event: Event) {
-        if let Some(tx) = &self.0 {
-            let _ = tx.send(event);
+    pub(crate) fn scoped(&self, generation: u64) -> Self {
+        Self(self.0.clone(), Some(generation))
+    }
+
+    pub fn emit(&self, mut event: Event) {
+        let Some(sink) = &self.0 else {
+            return;
+        };
+        if sink.sender.is_closed() {
+            return;
+        }
+        if let Event::Metrics { metrics, .. } = &mut event {
+            metrics
+                .collected_at
+                .get_or_insert_with(std::time::Instant::now);
+        }
+        let key = match &event {
+            Event::Rtt { peer, .. } => Some(format!("rtt:{}", peer.to_hex())),
+            Event::Metrics { peer, .. } => Some(format!(
+                "metrics:{}",
+                peer.map(|p| p.to_hex()).unwrap_or_default()
+            )),
+            Event::Transfer(t) if t.state == TransferState::Running => {
+                Some(format!("transfer:{}:{:?}", t.peer.to_hex(), t.id))
+            }
+            _ => None,
+        };
+        let wrap = |event| match self.1 {
+            Some(generation) => Event::Engine {
+                generation,
+                event: Box::new(event),
+            },
+            None => event,
+        };
+        let mut latest = sink.latest.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = key {
+            let key = (self.1, key);
+            if let Some(current) = latest.get_mut(&key) {
+                current.1 = wrap(event);
+            } else if latest.len() < 256 {
+                let token = sink.next.fetch_add(1, Ordering::Relaxed);
+                latest.insert(key.clone(), (token, wrap(event)));
+                if sink
+                    .sender
+                    .send(QueuedEvent::Latest(key.clone(), token))
+                    .is_err()
+                {
+                    latest.remove(&key);
+                }
+            }
+        } else {
+            // 终态/连接变化是屏障：先交付同代已合并的进度，之后不能出现旧Running覆盖Done。
+            let keys: Vec<_> = latest
+                .keys()
+                .filter(|(generation, _)| *generation == self.1)
+                .cloned()
+                .collect();
+            for key in keys {
+                if let Some((_, pending)) = latest.remove(&key) {
+                    let _ = sink.sender.send(QueuedEvent::Direct(Box::new(pending)));
+                }
+            }
+            let _ = sink.sender.send(QueuedEvent::Direct(Box::new(wrap(event))));
         }
     }
 }

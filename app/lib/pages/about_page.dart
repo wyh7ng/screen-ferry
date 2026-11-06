@@ -17,7 +17,16 @@ class AboutPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {
+        AppAspect.local,
+        AppAspect.connection,
+        AppAspect.settings,
+        AppAspect.updateReminder,
+        AppAspect.clock,
+      },
+    );
     final c = SfColors.of(context);
     return PageScaffold(
       title: context.l10n.aboutTitle,

@@ -6,6 +6,7 @@ use crate::pairing::{ConfirmPairing, PairingRequest};
 
 /// 一次待回答的配对请求。
 pub(crate) struct PairAsk {
+    pub(crate) generation: u64,
     pub(crate) request: PairingRequest,
     pub(crate) reply: oneshot::Sender<bool>,
 }
@@ -13,6 +14,7 @@ pub(crate) struct PairAsk {
 /// 引擎用来请用户确认配对的一端。
 #[derive(Clone)]
 pub(crate) struct UiConfirm {
+    pub(crate) generation: u64,
     pub(crate) asks: mpsc::UnboundedSender<PairAsk>,
 }
 
@@ -20,6 +22,7 @@ impl ConfirmPairing for UiConfirm {
     async fn confirm(&self, request: &PairingRequest) -> bool {
         let (reply, answer) = oneshot::channel();
         let ask = PairAsk {
+            generation: self.generation,
             request: request.clone(),
             reply,
         };

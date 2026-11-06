@@ -25,22 +25,22 @@ class PairingHost extends StatefulWidget {
 
 class _PairingHostState extends State<PairingHost> {
   /// 已经弹过的请求：拒绝后在后台确认结束之前，不要再弹一次。
-  final _shown = <int>{};
+  final _shown = <(String, int)>{};
   bool _showing = false;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _check(AppScope.of(context));
+    _check(AppScope.of(context, aspects: const {AppAspect.pairing, AppAspect.connection}));
   }
 
   /// 没有弹窗在显示、又有没弹过的请求时，弹出最早的那个。
   void _check(AppState state) {
-    _shown.retainWhere(state.isPromptOpen);
+    _shown.retainWhere((key) => state.isPromptOpen(key.$2, session: key.$1));
     if (_showing) return;
-    final next = state.prompts.where((p) => !_shown.contains(p.id)).firstOrNull;
+    final next = state.prompts.where((p) => !_shown.contains((p.session, p.id))).firstOrNull;
     if (next == null) return;
-    _shown.add(next.id);
+    _shown.add((next.session, next.id));
     _showing = true;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
@@ -96,13 +96,13 @@ class _PairingDialogState extends State<_PairingDialog> with TickerProviderState
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.pairing, AppAspect.connection, AppAspect.devices});
     final paired = state.peers.any((p) => p.fingerprint == _p.fingerprint);
     if (_stage == _Stage.waiting && paired) {
       // 两边都确认了：先给一个成功动画再关。随后的 build 会显示它。
       _stage = _Stage.paired;
       _closeAfter(const Duration(milliseconds: 1200));
-    } else if (!state.isPromptOpen(_p.id) && _stage != _Stage.paired) {
+    } else if (!state.isPromptOpen(_p.id, session: _p.session) && _stage != _Stage.paired) {
       // 后台说这次配对结束了（对方拒绝、超时或断开）。刚确认时成功的状态可能稍晚一点到，等一会儿。
       _closeAfter(_stage == _Stage.waiting ? const Duration(seconds: 1) : Duration.zero);
     }
@@ -120,7 +120,7 @@ class _PairingDialogState extends State<_PairingDialog> with TickerProviderState
 
   void _reply(bool accept) {
     final state = AppScope.read(context);
-    state.replyPairing(_p.id, accept: accept);
+    if (!state.replyPairing(_p.id, accept: accept, session: _p.session)) return;
     if (!accept) return _closeAfter(Duration.zero);
     _countdown.stop();
     setState(() => _stage = _Stage.waiting);

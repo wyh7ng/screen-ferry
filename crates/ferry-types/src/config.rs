@@ -112,6 +112,10 @@ pub struct Config {
     pub clipboard: bool,
     /// 剪贴板单项（一种格式）的大小上限，单位 MB，1–64。超过的不同步。
     pub clipboard_limit_mb: u32,
+    /// 所有文件发送共享的速度上限，十进制 MB/s；0 表示不限制。
+    pub file_rate_limit_mbps: u32,
+    /// 合并发送队列中连续普通鼠标移动；不影响按键、拖拽和切屏顺序。
+    pub coalesce_motion: bool,
     /// 客户端：服务端地址，空为在局域网里寻找。
     pub server: String,
     /// 设置界面的配色。
@@ -141,10 +145,28 @@ impl Config {
     ///   版本 3 里 `swap_cmd_ctrl = false` 的，迁移时给每台已配对的设备写上 `modifiers = "plain"`。
     /// - 5：新增 `language`（缺省 `system`，跟随系统；以前总是中文）。
     /// - 6：新增 `auto_update`（缺省开着）。
-    pub const SCHEMA_VERSION: u32 = 6;
+    /// - 7：新增文件发送速度上限（0，不限速）与鼠标移动合并（关闭）。
+    pub const SCHEMA_VERSION: u32 = 7;
+
+    /// 强调色预设数量；未知序号统一回退到蓝色。
+    pub const ACCENT_COUNT: u8 = 5;
+
+    pub fn accent(&self) -> u8 {
+        if self.accent < Self::ACCENT_COUNT {
+            self.accent
+        } else {
+            0
+        }
+    }
 
     /// 剪贴板单项大小上限的取值范围（MB）。
     pub const CLIPBOARD_LIMIT_MB: std::ops::RangeInclusive<u32> = 1..=64;
+
+    pub const MAX_FILE_RATE_MBPS: u32 = 1024;
+
+    pub fn file_rate_limit_bytes(&self) -> u64 {
+        u64::from(self.file_rate_limit_mbps.min(Self::MAX_FILE_RATE_MBPS)) * 1_000_000
+    }
 
     /// 本机鼠标 DPI 的取值范围，与每台设备的光标速度相同。
     pub const MOUSE_DPI: std::ops::RangeInclusive<u32> = DeviceSettings::POINTER_DPI;
@@ -206,6 +228,8 @@ impl Default for Config {
             announce: true,
             clipboard: true,
             clipboard_limit_mb: 32,
+            file_rate_limit_mbps: 0,
+            coalesce_motion: false,
             server: String::new(),
             theme: Theme::System,
             accent: 0,

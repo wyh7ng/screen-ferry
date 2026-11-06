@@ -14,7 +14,7 @@ mod drag_out;
 mod drop;
 mod paint;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -51,6 +51,7 @@ const WM_STOP: u32 = WM_APP + 22;
 pub(crate) struct Shared {
     /// 浮层窗口的句柄（以整数保存）；还没建好时为 0。
     hwnd: AtomicIsize,
+    update_pending: AtomicBool,
     wanted: Mutex<Wanted>,
     pub(crate) drag: Mutex<DragState>,
     /// 正在把卡片里的文件拖出去：经过浮层自己时不接。
@@ -88,12 +89,14 @@ impl Shared {
         }
     }
 
-    fn post(&self, msg: u32) {
+    fn post(&self, msg: u32) -> bool {
         let hwnd = self.hwnd.load(Ordering::Acquire);
         if hwnd != 0 {
             // SAFETY: 窗口在界面线程结束前一直存在；投递失败（窗口已关）可以忽略。
-            let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(0), LPARAM(0)) };
+            return unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(0), LPARAM(0)) }
+                .is_ok();
         }
+        false
     }
 }
 
@@ -111,6 +114,7 @@ impl WinOverlay {
         Self {
             shared: Arc::new(Shared {
                 hwnd: AtomicIsize::new(0),
+                update_pending: AtomicBool::new(false),
                 wanted: Mutex::new(Wanted::default()),
                 drag: Mutex::new(DragState::default()),
                 dragging_out: AtomicBool::new(false),
@@ -121,7 +125,10 @@ impl WinOverlay {
 
     fn update(&self, change: impl FnOnce(&mut Wanted)) {
         change(&mut lock(&self.shared.wanted));
-        self.shared.post(WM_UPDATE);
+        if !self.shared.update_pending.swap(true, Ordering::AcqRel) && !self.shared.post(WM_UPDATE)
+        {
+            self.shared.update_pending.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -211,6 +218,8 @@ struct Ui {
 
 thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
+    /// OLE/窗口调用重入时先记下更新，在外层放开 Ui 借用之后应用。
+    static DEFERRED_UPDATE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn ui_thread(shared: Arc<Shared>, ready: mpsc::Sender<Result<()>>) {
@@ -294,7 +303,14 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match msg {
         WM_UPDATE => {
-            with_ui(|ui| ui.apply(hwnd));
+            if with_ui(|ui| {
+                ui.shared.update_pending.store(false, Ordering::Release);
+                ui.apply(hwnd);
+            })
+            .is_none()
+            {
+                DEFERRED_UPDATE.with(|pending| pending.set(true));
+            }
             LRESULT(0)
         }
         WM_SHELL => {
@@ -359,10 +375,22 @@ fn mouse_at(lparam: LPARAM) -> (f32, f32) {
 
 /// 借用界面线程的状态做点事。正在借用时（系统在调用中途同步发来消息）跳过。
 fn with_ui<R>(work: impl FnOnce(&mut Ui) -> R) -> Option<R> {
-    UI.with(|ui| {
+    let result = UI.with(|ui| {
         let mut ui = ui.try_borrow_mut().ok()?;
         ui.as_mut().map(work)
-    })
+    });
+    if result.is_some() && DEFERRED_UPDATE.with(|pending| pending.replace(false)) {
+        UI.with(|ui| {
+            if let Some(ui) = ui.borrow_mut().as_mut() {
+                ui.shared.update_pending.store(false, Ordering::Release);
+                let hwnd = ui.shared.hwnd.load(Ordering::Acquire);
+                if hwnd != 0 {
+                    ui.apply(HWND(hwnd as *mut _));
+                }
+            }
+        });
+    }
+    result
 }
 
 impl Ui {

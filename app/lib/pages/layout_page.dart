@@ -20,7 +20,10 @@ class LayoutPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.devices, AppAspect.settings, AppAspect.connection, AppAspect.local},
+    );
     final c = SfColors.of(context);
     if (!state.isServer) {
       // 屏幕怎么摆由键鼠所在的那台（服务端）决定。
@@ -248,7 +251,10 @@ class _StageState extends State<_Stage> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.devices, AppAspect.settings, AppAspect.connection, AppAspect.local},
+    );
     final c = SfColors.of(context);
     return DecoratedBox(
       decoration: ShapeDecoration(color: c.card, shape: continuous(26)),

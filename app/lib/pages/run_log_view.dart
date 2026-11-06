@@ -20,7 +20,7 @@ class _ExportCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.diagnostics, AppAspect.connection, AppAspect.local});
     final c = SfColors.of(context);
     final exported = state.lastExport;
     final online = state.online;
@@ -123,7 +123,7 @@ class _VerboseRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.diagnostics, AppAspect.connection, AppAspect.clock});
     final since = state.verboseSince;
     final String subtitle;
     if (since == null) {
@@ -162,7 +162,7 @@ class _RunLogCardState extends State<_RunLogCard> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.runLog, AppAspect.connection});
     final c = SfColors.of(context);
     final lines = _problemsOnly
         ? state.runLog.where((l) => l.level == RunLogLevel.warn || l.level == RunLogLevel.error).toList()
@@ -199,6 +199,11 @@ class _RunLogCardState extends State<_RunLogCard> {
               ),
             ],
           ),
+          if (state.runLogError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(context.l10n.runLogReadFailed, style: TextStyle(color: c.danger)),
+            ),
           const SizedBox(height: 12),
           SizedBox(
             height: 420,

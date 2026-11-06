@@ -3415,6 +3415,192 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'更新没有装上：{message}'**
   String toastUpdateFailed(String message);
+
+  /// No description provided for @commandTimedOut.
+  ///
+  /// In zh, this message translates to:
+  /// **'后台未确认这次修改，请重试。'**
+  String get commandTimedOut;
+
+  /// No description provided for @macCapsMappingHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'macOS 将 Caps Lock 作为开关报告，因此只能保留原功能或禁用，无法映射成需要按住的键。'**
+  String get macCapsMappingHint;
+
+  /// No description provided for @settingsResponsiveness.
+  ///
+  /// In zh, this message translates to:
+  /// **'传输与响应'**
+  String get settingsResponsiveness;
+
+  /// No description provided for @settingsFileRate.
+  ///
+  /// In zh, this message translates to:
+  /// **'文件传输速度上限'**
+  String get settingsFileRate;
+
+  /// No description provided for @settingsFileRateHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'每秒最多传输多少 MB（1 MB = 1,000,000 字节）。0 表示不限速，范围 0–1024；限制大文件传输可为其他网络活动留出带宽。'**
+  String get settingsFileRateHint;
+
+  /// No description provided for @settingsCoalesceMotion.
+  ///
+  /// In zh, this message translates to:
+  /// **'合并连续鼠标移动'**
+  String get settingsCoalesceMotion;
+
+  /// No description provided for @settingsCoalesceMotionHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'适合高回报率鼠标或网络繁忙时，减少待发送的移动事件；按键、点击和滚轮保持顺序。需要逐个保留移动采样时关闭。'**
+  String get settingsCoalesceMotionHint;
+
+  /// No description provided for @performanceTitle.
+  ///
+  /// In zh, this message translates to:
+  /// **'性能统计'**
+  String get performanceTitle;
+
+  /// No description provided for @performanceHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'近 5 秒的本机处理阶段，分位数为近似值，最大值为实测。RTT 是网络往返时间，不是端到端输入延迟；无样本显示 —。'**
+  String get performanceHint;
+
+  /// No description provided for @performanceEmpty.
+  ///
+  /// In zh, this message translates to:
+  /// **'连接设备并操作键鼠后显示统计。'**
+  String get performanceEmpty;
+
+  /// No description provided for @performanceStage.
+  ///
+  /// In zh, this message translates to:
+  /// **'阶段'**
+  String get performanceStage;
+
+  /// No description provided for @performanceCount.
+  ///
+  /// In zh, this message translates to:
+  /// **'样本'**
+  String get performanceCount;
+
+  /// No description provided for @performanceMax.
+  ///
+  /// In zh, this message translates to:
+  /// **'最大'**
+  String get performanceMax;
+
+  /// No description provided for @performanceCaptureQueue.
+  ///
+  /// In zh, this message translates to:
+  /// **'捕获队列等待'**
+  String get performanceCaptureQueue;
+
+  /// No description provided for @performanceSendQueue.
+  ///
+  /// In zh, this message translates to:
+  /// **'发送队列等待'**
+  String get performanceSendQueue;
+
+  /// No description provided for @performanceSend.
+  ///
+  /// In zh, this message translates to:
+  /// **'发送耗时'**
+  String get performanceSend;
+
+  /// No description provided for @performanceInject.
+  ///
+  /// In zh, this message translates to:
+  /// **'注入耗时'**
+  String get performanceInject;
+
+  /// No description provided for @performanceRtt.
+  ///
+  /// In zh, this message translates to:
+  /// **'网络 RTT'**
+  String get performanceRtt;
+
+  /// No description provided for @performanceScheduler.
+  ///
+  /// In zh, this message translates to:
+  /// **'调度延迟'**
+  String get performanceScheduler;
+
+  /// No description provided for @performanceCapture.
+  ///
+  /// In zh, this message translates to:
+  /// **'捕获队列'**
+  String get performanceCapture;
+
+  /// No description provided for @performanceOutbound.
+  ///
+  /// In zh, this message translates to:
+  /// **'发送队列'**
+  String get performanceOutbound;
+
+  /// No description provided for @performanceDepth.
+  ///
+  /// In zh, this message translates to:
+  /// **'当前长度'**
+  String get performanceDepth;
+
+  /// No description provided for @performanceHighWater.
+  ///
+  /// In zh, this message translates to:
+  /// **'累计峰值'**
+  String get performanceHighWater;
+
+  /// No description provided for @performanceOldest.
+  ///
+  /// In zh, this message translates to:
+  /// **'最老等待'**
+  String get performanceOldest;
+
+  /// No description provided for @performanceMaxWait.
+  ///
+  /// In zh, this message translates to:
+  /// **'窗口最大等待'**
+  String get performanceMaxWait;
+
+  /// No description provided for @performanceCoalesced.
+  ///
+  /// In zh, this message translates to:
+  /// **'已合并'**
+  String get performanceCoalesced;
+
+  /// No description provided for @performanceOverflows.
+  ///
+  /// In zh, this message translates to:
+  /// **'已溢出'**
+  String get performanceOverflows;
+
+  /// No description provided for @performanceLocal.
+  ///
+  /// In zh, this message translates to:
+  /// **'本机'**
+  String get performanceLocal;
+
+  /// No description provided for @performanceUnits.
+  ///
+  /// In zh, this message translates to:
+  /// **'耗时单位：ms；超过 100 ms 一列为次数。'**
+  String get performanceUnits;
+
+  /// No description provided for @logRunVisible.
+  ///
+  /// In zh, this message translates to:
+  /// **'{size} · 当前显示 {count} 行'**
+  String logRunVisible(String size, String count);
+
+  /// No description provided for @runLogReadFailed.
+  ///
+  /// In zh, this message translates to:
+  /// **'日志暂时无法读取，将自动重试。'**
+  String get runLogReadFailed;
 }
 
 class _AppLocalizationsDelegate extends LocalizationsDelegate<AppLocalizations> {

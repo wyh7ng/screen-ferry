@@ -11,6 +11,7 @@ use crate::config;
 use crate::dirs::{default_cache_dir, default_data_dir, default_downloads_dir};
 use crate::error::{Error, Result};
 use crate::file::{self, io};
+use crate::instance::InstanceLock;
 use crate::peers;
 use crate::update::UpdateState;
 
@@ -47,6 +48,13 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 尝试取得后台单实例锁；已经运行时返回 `None`。
+    pub fn try_lock_instance(&self) -> Result<Option<InstanceLock>> {
+        fs::create_dir_all(&self.cache).map_err(|e| io(&self.cache, e))?;
+        let path = self.cache.join("instance.lock");
+        InstanceLock::acquire(&path).map_err(|e| io(&path, e))
     }
 
     /// 读取本机身份；还没有时生成一个并保存。`name` 只在生成时写进证书。

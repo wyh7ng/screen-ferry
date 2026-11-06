@@ -8,6 +8,7 @@ use crate::error::{DecodeError, EncodeError};
 use crate::file::{self, FileCancel, FileEnd, FileList, FileOffer, FileResume};
 use crate::handshake::{Bye, Channel, Hello, Reject, Welcome};
 use crate::limits::{MAX_DISPLAYS, MAX_VERSION_LEN, PAIRING_NONCE_LEN};
+use crate::motion::MotionPacket;
 use crate::screen::Enter;
 use crate::transfer::{Cancel, Chunk};
 use crate::wire::{Body, Reader, Writer};
@@ -52,6 +53,18 @@ pub enum Message {
         seq: u32,
     },
     Input(InputEvent),
+    /// QUIC_MOTION可靠屏障，必须在紧随其后的控制帧处理完毕后确认。
+    MotionFence {
+        generation: u64,
+        sequence: u64,
+        position: Option<Point>,
+    },
+    MotionAck {
+        generation: u64,
+        sequence: u64,
+    },
+    /// 丢失/乱序DATAGRAM的可靠最终位置补偿。
+    MotionSync(MotionPacket),
     /// 发送方位于接收方的哪一侧。会话开始和方向改变时发送。需要 `EDGE_DROP` 能力。
     PeerSide {
         side: Side,
@@ -120,6 +133,9 @@ mod ty {
     pub(super) const POINTER_DELTA: u16 = 0x0121;
     pub(super) const BUTTON: u16 = 0x0122;
     pub(super) const WHEEL: u16 = 0x0123;
+    pub(super) const MOTION_FENCE: u16 = 0x0130;
+    pub(super) const MOTION_ACK: u16 = 0x0131;
+    pub(super) const MOTION_SYNC: u16 = 0x0132;
 
     pub(super) const CLIPBOARD_OFFER: u16 = 0x0200;
     pub(super) const CLIPBOARD_REQUEST: u16 = 0x0201;
@@ -154,7 +170,10 @@ pub(crate) fn allowed(ty: u16, channel: Channel) -> Option<bool> {
         | ty::POINTER_MOTION
         | ty::POINTER_DELTA
         | ty::BUTTON
-        | ty::WHEEL => Channel::Input,
+        | ty::WHEEL
+        | ty::MOTION_FENCE
+        | ty::MOTION_ACK
+        | ty::MOTION_SYNC => Channel::Input,
         ty::CLIPBOARD_OFFER
         | ty::CLIPBOARD_REQUEST
         | ty::CHUNK
@@ -193,6 +212,9 @@ impl Message {
             Self::DropHint(_) => ty::DROP_HINT,
             Self::OpenSettings => ty::OPEN_SETTINGS,
             Self::AppInfo { .. } => ty::APP_INFO,
+            Self::MotionFence { .. } => ty::MOTION_FENCE,
+            Self::MotionAck { .. } => ty::MOTION_ACK,
+            Self::MotionSync(_) => ty::MOTION_SYNC,
             Self::Input(event) => match event {
                 InputEvent::Key { .. } => ty::KEY,
                 InputEvent::PointerMotion { .. } => ty::POINTER_MOTION,
@@ -218,6 +240,33 @@ impl Message {
 
     pub(crate) fn encode_body(&self, w: &mut Writer<'_>) -> Result<(), EncodeError> {
         match self {
+            Self::MotionFence {
+                generation,
+                sequence,
+                position,
+            } => {
+                w.u64(*generation);
+                w.u64(*sequence);
+                w.bool(position.is_some());
+                if let Some(position) = position {
+                    position.encode(w)?;
+                }
+                Ok(())
+            }
+            Self::MotionAck {
+                generation,
+                sequence,
+            } => {
+                w.u64(*generation);
+                w.u64(*sequence);
+                Ok(())
+            }
+            Self::MotionSync(packet) => {
+                w.u64(packet.generation);
+                w.u64(packet.sequence);
+                w.u64(packet.barrier);
+                packet.position.encode(w)
+            }
             Self::Hello(m) => m.encode(w),
             Self::Welcome(m) => m.encode(w),
             Self::Reject(m) => m.encode(w),
@@ -261,6 +310,25 @@ impl Message {
 
     pub(crate) fn decode_body(ty: u16, r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(match ty {
+            ty::MOTION_FENCE => Self::MotionFence {
+                generation: r.u64()?,
+                sequence: r.u64()?,
+                position: if r.bool()? {
+                    Some(Point::decode(r)?)
+                } else {
+                    None
+                },
+            },
+            ty::MOTION_ACK => Self::MotionAck {
+                generation: r.u64()?,
+                sequence: r.u64()?,
+            },
+            ty::MOTION_SYNC => Self::MotionSync(MotionPacket {
+                generation: r.u64()?,
+                sequence: r.u64()?,
+                barrier: r.u64()?,
+                position: Point::decode(r)?,
+            }),
             ty::HELLO => Self::Hello(Hello::decode(r)?),
             ty::WELCOME => Self::Welcome(Welcome::decode(r)?),
             ty::REJECT => Self::Reject(Reject::decode(r)?),

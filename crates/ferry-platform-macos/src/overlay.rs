@@ -354,6 +354,45 @@ fn on_panel(work: impl FnOnce(&Panel, MainThreadMarker) + Send + 'static) {
     });
 }
 
+/// 主线程只保留最新一帧；鼠标事件比绘制快时不累积过时的场景。
+struct PendingFrame {
+    frame: Option<(Frame, f32, Scene)>,
+    queued: bool,
+}
+
+static FRAME_UPDATE: Mutex<PendingFrame> = Mutex::new(PendingFrame {
+    frame: None,
+    queued: false,
+});
+
+fn update_frame(frame: Option<(Frame, f32, Scene)>) {
+    let mut pending = FRAME_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+    pending.frame = frame;
+    if pending.queued {
+        return;
+    }
+    pending.queued = true;
+    drop(pending);
+    on_panel(|panel, mtm| {
+        let frame = {
+            let mut pending = FRAME_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+            pending.queued = false;
+            pending.frame.take()
+        };
+        if let Some((frame, scale, scene)) = frame {
+            *panel.view.ivars().scene.borrow_mut() = scene;
+            panel.view.ivars().scale.set(f64::from(scale));
+            panel.panel.setFrame_display(cocoa_rect(frame, mtm), false);
+            panel.view.setNeedsDisplay(true);
+            if !panel.panel.isVisible() {
+                panel.panel.orderFrontRegardless();
+            }
+        } else {
+            panel.panel.orderOut(None);
+        }
+    });
+}
+
 /// 桌面坐标（左上角原点）→ Cocoa 坐标（主屏幕左下角原点）。
 fn cocoa_rect(frame: Frame, mtm: MainThreadMarker) -> CGRect {
     let height = NSScreen::screens(mtm)
@@ -379,6 +418,13 @@ impl Default for MacOverlay {
     }
 }
 
+impl Drop for MacOverlay {
+    fn drop(&mut self) {
+        *SINK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        update_frame(None);
+    }
+}
+
 impl Overlay for MacOverlay {
     fn start(&mut self, sink: OverlaySink) -> Result<()> {
         *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
@@ -386,20 +432,11 @@ impl Overlay for MacOverlay {
     }
 
     fn show(&mut self, frame: Frame, scale: f32, scene: Scene) {
-        on_panel(move |panel, mtm| {
-            *panel.view.ivars().scene.borrow_mut() = scene;
-            // macOS 的桌面坐标就是点，scale 恒为 1；仍按约定换算，保持与其他平台一致。
-            panel.view.ivars().scale.set(f64::from(scale));
-            panel.panel.setFrame_display(cocoa_rect(frame, mtm), false);
-            panel.view.setNeedsDisplay(true);
-            if !panel.panel.isVisible() {
-                panel.panel.orderFrontRegardless();
-            }
-        });
+        update_frame(Some((frame, scale, scene)));
     }
 
     fn hide(&mut self) {
-        on_panel(|panel, _| panel.panel.orderOut(None));
+        update_frame(None);
     }
 
     fn drag_count(&self) -> i64 {

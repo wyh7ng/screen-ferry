@@ -63,6 +63,8 @@ bitflags! {
         const REMOTE_SETTINGS = 1 << 5;
         /// 握手后互相告诉程序版本（`AppInfo` 消息）。
         const APP_INFO = 1 << 6;
+        /// QUIC独立ALPN实验：可靠屏障确认和可补偿的位置DATAGRAM。TCP不协商此位。
+        const QUIC_MOTION = 1 << 7;
     }
 }
 

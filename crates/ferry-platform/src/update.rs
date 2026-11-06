@@ -23,8 +23,9 @@ pub trait Updater: Send + Sync {
     /// 系统设置里的 HTTPS 代理，形如 `http://127.0.0.1:7890`；没有设置时为 `None`。
     fn proxy(&self) -> Option<String>;
 
-    /// 安装前的准备，可能要几秒，放在后台线程里调用。`version` 是清单里的版本号，用来核对。
-    fn prepare(&self, package: &Path, version: &str) -> Result<Prepared>;
+    /// 安装前的准备，可能要几秒，放在后台线程里调用。版本、大小和摘要来自签名清单。
+    /// Windows 必须锁定安装包后在同一句柄上验证，保持锁定直至 launch 返回。
+    fn prepare(&self, package: &Path, version: &str, size: u64, sha256: &str) -> Result<Prepared>;
 
     /// 启动新版本。Windows 上用户在 UAC 里点了“否”时返回 [`Error::Cancelled`](crate::Error::Cancelled)。
     fn launch(&self, prepared: &Prepared) -> Result<()>;
@@ -41,6 +42,8 @@ pub trait Updater: Send + Sync {
 pub struct Prepared {
     /// `launch` 启动什么：macOS 是换好的应用，Windows 是安装包。
     pub target: PathBuf,
+    /// 签名清单要求的应用版本，用于独立的更新健康探测。
+    pub version: String,
     /// macOS：旧应用的备份；Windows 没有。
     pub backup: Option<PathBuf>,
     /// 为真时由当前进程退出、等新版本起来（macOS）；为假时由安装包请当前进程退出（Windows）。

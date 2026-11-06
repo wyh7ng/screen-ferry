@@ -1,6 +1,6 @@
 # 本机通信协议（设置界面 ⇄ 后台）
 
-- 当前版本：**2**（版本 2 去掉了 `settings.swap_cmd_ctrl`，改为每台设备的 `settings.devices[].modifiers`）
+- 当前版本：**3**（版本 3 为界面命令增加结果确认，并把配对回答绑定到本次后台会话）
 - 实现：`crates/ferry-ipc`（Rust，后台）、`app/lib/ipc/`（Dart，设置界面）
 - 样例：`app/test/fixtures/ipc_samples.json`，由 `ferry-ipc` 的测试生成，两边的测试都按它编解码
 - 决策：ADR 0004；每台设备的单独设置见 ADR 0009
@@ -17,7 +17,7 @@
 | Windows | `%LOCALAPPDATA%\ScreenFerry\ipc.json` |
 
 ```json
-{ "port": 51234, "token": "64 位十六进制", "pid": 4242, "version": 2 }
+{ "port": 51234, "token": "64 位十六进制", "pid": 4242, "version": 3 }
 ```
 
 文件不存在、端口连不上，都表示后台没有运行。后台每次启动都换新端口和新令牌，界面断线后应重新读取这个文件再连。用 `--data-dir` 运行的后台把 `ipc.json` 写在该数据目录里。
@@ -32,31 +32,33 @@
 
 ## 3. 握手
 
-1. 界面发送 `{"type":"hello","token":"…","version":2}`，必须是第一条，3 秒内发出。
-2. 令牌不对、版本不同或第一条不是 `hello`，后台直接断开。
-3. 后台回 `{"type":"welcome","version":2}`，接着发送 `history`（已有日志，最新的在前）、`state`（当前状态），以及仍在等待的 `pairing`。
+1. 界面发送 `{"type":"hello","token":"…","version":3}`，必须是第一条，3 秒内发出。
+2. 令牌不对、版本不同或第一条不是 `hello`，后台直接断开（第 7 节的独立 `update_health` 探测除外）。
+3. 后台回 `{"type":"welcome","version":3}`，接着发送 `history`（已有日志，最新的在前）、`state`（当前状态），以及仍在等待的 `pairing`。
 
 ## 4. 后台 → 界面
 
 | type | 字段 | 说明 |
 |---|---|---|
 | `welcome` | `version` | 握手成功 |
+| `command_result` | `session`、`id`、`ok`、`message` | 指定命令处理结果，只回复发出命令的界面 |
 | `state` | `state` | 完整状态快照，有变化时推送，最多每秒 4 次。界面整体替换，不做合并 |
 | `history` | `entries` | 连接时发送一次 |
 | `log` | `entry` | 新日志 |
-| `pairing` | `prompt`：`id`、`peer_name`、`fingerprint`、`short`、`code` | 请用户核对配对码 |
+| `pairing` | `prompt`：`session`、`id`、`peer_name`、`fingerprint`、`short`、`code` | 请用户核对配对码 |
 | `pairing_closed` | `id` | 这次配对已结束，关闭对话框 |
 | `toast` | `text`、`phrase` | 简短提示。`phrase` 见 4.1 节 |
 | `show_device` | `fingerprint` | 翻到这台设备的设置页：它请本机打开了设置（本机是服务端、它被本机控制时） |
-| `dialed` | `address`、`invite`、`error` | 一次 `connect_address`（`invite` 为 false）或 `invite`（为 true）的结果。`error` 为 null 表示成了：按地址连接是已经连上（没配对时接着发 `pairing`），邀请是对方答应了、正在连过来。否则是 `bad_address`（地址不对）、`refused`（那里没有在等的 ScreenFerry）、`unreachable`（连不上）、`not_screen_ferry`、`incompatible`（版本不兼容）、`busy`（对方正连着别的电脑）、`wrong_role`（本机的角色做不了） |
+| `dialed` | `request_id`（可空）、`address`、`invite`、`error` | 一次 `connect_address`（`invite` 为 false）或 `invite`（为 true）的结果。`error` 为 null 表示成了：按地址连接是已经连上（没配对时接着发 `pairing`），邀请是对方答应了、正在连过来。否则是 `bad_address`（地址不对）、`refused`（那里没有在等的 ScreenFerry）、`unreachable`（连不上）、`not_screen_ferry`、`incompatible`（版本不兼容）、`busy`（对方正连着别的电脑）、`wrong_role`（本机的角色做不了） |
 | `quit` | | 后台要退出了（托盘里的“退出”或 `quit` 命令），界面随之关闭。之后连接断开 |
-| `run_log` | `lines`、`next`、`fresh`、`bytes`、`lines_total` | 回应 `read_run_log`，只发给发出命令的界面。`lines[]` 是 `{ at（本机时间 HH:MM:SS，旧格式为空）, level(debug\|info\|warn\|error), text }`，设备名等照原样显示；`fresh` 为真时整个替换，否则接在后面；`next` 是下次读的位置；`bytes`、`lines_total` 是当前这卷的大小和行数 |
+| `run_log` | `lines`、`next`、`cursor`、`request_id`、`fresh`、`more`、`error`、`bytes`、`lines_total` | 回应 `read_run_log`，只发给发出命令的界面。`lines[]` 是 `{ at（本机时间 HH:MM:SS，旧格式为空）, level(debug\|info\|warn\|error), text }`，设备名等照原样显示；`fresh` 为真时整个替换，否则接在后面；`next` 是下次读的位置；`bytes` 是当前卷大小；`lines_total` 是当前游标累计读到的完整行数，首次尾读不扫描全卷 |
 | `diagnostics_exported` | `path`、`bytes` | 诊断文件存好了，只发给发出命令的界面 |
 | `diagnostics_summary` | `text` | 诊断摘要，只发给发出命令的界面，界面复制到剪贴板 |
 
 `state` 的结构（字段含义见 `crates/ferry-ipc/src/message.rs`）：
 
 ```text
+session   后台每次启动重新生成的会话标识
 local     name · fingerprint · short · role(server|client) · data_dir · version · port（服务端监听的端口，否则 null）
           platform（本机系统，macos|windows…；旧版后台没有，为空）
           natural_scrolling（macOS：开着“自然滚动”；其他系统为 null）
@@ -77,6 +79,7 @@ peers[]   { name（它自己报的名字）, fingerprint, short, online, last_se
 found[]   { name, fingerprint, short, addr, paired }        只有客户端会有
 settings  { name, side(left|right|top|bottom), layout[], announce, clipboard,
             clipboard_limit_mb（剪贴板单项上限，1–64）, mouse_dpi（本机鼠标的 DPI，100–12800）,
+            file_rate_limit_mbps（十进制 MB/s，0–1024，0 不限）、coalesce_motion（普通移动合并，缺省false），
             server（客户端：只连这个地址，空为自动寻找）, autostart, theme(system|light|dark), accent,
             language(system|zh|en)（界面语言，system 为跟随系统）,
             auto_update（每天检查一次更新，有新版本时在后台下载好）, devices[] }
@@ -146,19 +149,20 @@ update    { status(idle|checking|up_to_date|available|downloading|ready|installi
 | type | 字段 | 说明 |
 |---|---|---|
 | `hello` | `token`、`version` | 见第 3 节 |
+| `execute` | `session`、`id`、`request` | 需要结果确认的命令封装，见第 7 节 |
 | `set_sharing` | `on` | 暂停或继续共享 |
 | `update_settings` | `settings`：`settings` 的任意子集，另可带 `role`（server\|client） | 只改出现的字段；`layout` 整份替换；改 `role` 会断开现有的连接、以新角色重新开始 |
 | `set_device` | `device`：`settings.devices[]` 的一项，整份 | 换上一台设备的单独设置；全是缺省值即恢复默认 |
 | `open_peer_settings` | `fingerprint` | 客户端：请连着的服务端打开它的设置界面、翻到本机的设置页，结果以 `toast` 告知 |
 | `forget` | `fingerprint` | 删除一台已配对设备，连同它的单独设置 |
-| `pair_reply` | `id`、`accept` | 回答配对请求 |
+| `pair_reply` | `id`、`accept` | 回答配对请求，必须包含在 `execute` 中 |
 | `connect` | `fingerprint` | 客户端：连接 `found` 中的一台服务端，未配对时先配对 |
 | `connect_address` | `address`：IP、IP:端口或电脑名，不写端口用 24810 | 客户端：连接这个地址上的服务端，未配对时先配对，结果以 `dialed` 告知。只连这一次，不改 `settings.server`；连上后断线会回到这个地址重连 |
 | `invite` | `address`：同上，不写端口用 24811 | 服务端：请这个地址上的客户端连过来，结果以 `dialed` 告知 |
 | `open_permission_settings` | | 打开系统中授予键鼠控制权限的页面 |
 | `clear_log` | | 清空日志 |
 | `open_settings` | | 请后台打开设置界面（另一份后台用） |
-| `read_run_log` | 可选 `since`：上次 `run_log` 给的 `next` | 读运行日志：不带 `since` 时取最近的一段（最多 500 行），否则取之后新写的，结果以 `run_log` 告知 |
+| `read_run_log` | `cursor`、`request_id`；兼容旧 `since` | 首次取尾部最多500行，后续回传opaque cursor增量分页；每页最多128KiB/1000行，响应回相同request_id。见第8节 |
 | `export_diagnostics` | | 把诊断文件存到“下载”文件夹（设备名、文件名、用户目录换成代号），结果以 `diagnostics_exported` 告知，出错时以 `toast` |
 | `copy_diagnostics` | | 取诊断摘要（版本、系统和最近 200 行运行日志），结果以 `diagnostics_summary` 告知 |
 | `reveal_diagnostics` | | 在访达或资源管理器里显示最近导出的诊断文件 |
@@ -173,7 +177,7 @@ update    { status(idle|checking|up_to_date|available|downloading|ready|installi
 | `send_files` | `paths`：本机绝对路径的列表；可选 `to`：目标设备的证书指纹 | 把这些文件和文件夹发给 `to`，不填时发给光标最近去过的那台（只连着一台时就是它；`screenferry send` 用），结果以 `toast` 和日志告知 |
 
 除了 `connect_address`、`invite` 以 `dialed` 回复，`read_run_log`、`export_diagnostics`、`copy_diagnostics` 有各自的通知，
-命令没有逐条回执：结果体现在随后的 `state`、`log`、`toast` 里。
+直接发送的命令结果体现在随后的 `state`、`log`、`toast` 里；界面使用 `execute` 为设置修改、设备移除、配对回答和连接邀请取得逐条回执（第 7 节）。
 
 ## 6. 修改协议
 
@@ -181,3 +185,25 @@ update    { status(idle|checking|up_to_date|available|downloading|ready|installi
 2. 运行 `UPDATE_IPC_SAMPLES=1 cargo test -p ferry-ipc` 重新生成样例。
 3. 改 `app/lib/ipc/` 中对应的 Dart 类型，直到 `flutter test` 通过。
 4. 只加字段、加消息种类不改版本号；改变已有字段的含义或删除字段时递增 `VERSION`。
+
+
+## 7. 命令确认、启动会话和更新探测
+
+设置界面与后台一起更新到协议版本 3。`state.session` 和 `pairing.prompt.session` 是每次后台启动重新生成的随机会话标识。
+界面断线立即清空待确认命令及配对弹窗；收到新的完整状态后才能发命令。配对回答必须使用当前弹窗的会话标识，禁止直接发送未封装的 `pair_reply`。
+
+需要确认结果的命令写成 `{"type":"execute","session":"…","id":42,"request":{"type":"update_settings","settings":{"accent":1}}}`。
+`id` 由每个界面递增生成。后台处理完成后先向该界面发送最新 `state`，再发送 `{"type":"command_result","session":"…","id":42,"ok":true,"message":""}`；失败为 `ok:false`，界面仅撤销该编号的乐观更新。未确认的界面修改三秒后回退。
+`dialed` 新增可空 `request_id`，关联 `execute.id`；连接/邀请的异步结果不会覆盖较新的操作。
+
+更新后的健康探测独立于 UI 协议版本：首条消息 `{"type":"update_health","token":"…"}`，后台只核对本次 `ipc.json` 的令牌，回复 `{"type":"update_health","version":"0.2.0"}` 后关闭连接。
+旧进程核对新进程返回的实际应用版本，不使用普通 `hello` 的协议版本作为更新成功条件。
+
+
+## 8. 性能与增量日志扩展
+
+未发布的IPC3追加可选字段，旧消息缺少时取默认值。`settings`/`update_settings.settings`支持`file_rate_limit_mbps`和`coalesce_motion`，设置持久化失败时保留原值并返回命令失败。
+
+`state.performance.peers[]`为`{ fingerprint: string|null, measured_at: Unix毫秒, metrics }`，null指本机捕获阶段。`metrics.window_ms`给出采样窗口；`capture_queue/send_queue/send/inject/rtt/scheduler`均为`{count,p50_us,p95_us,p99_us,max_us,over_100ms}`，单位微秒，分位数是固定直方图近似，count=0不解释为0ms。`capture/outbound`为`{depth,high_water,oldest_us,max_wait_us,coalesced,overflows}`；oldest_us为null表示不能测量当前最老事件，max_wait_us是该窗已消费事件最大等待。仅本机时钟差值，不是跨机单程时间。
+
+`read_run_log`新增`cursor:string|null`、`request_id:u64|null`，保留`since`兼容。新界面优先原样回传opaque cursor，不自行解析；后端回相同request_id。`run_log.cursor`用于下一页，`more=true`表示当前还有可读取的分页；`fresh=true`替换旧行。`error`非空时保留旧行与游标，释放在途状态稍后重试；界面拒绝不匹配当前request_id的迟到响应。换页/断线时取消观察不会让旧响应覆盖新一轮。

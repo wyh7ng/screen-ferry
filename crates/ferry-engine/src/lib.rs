@@ -15,21 +15,33 @@ mod error;
 mod events;
 mod files;
 mod heartbeat;
+mod input_queue;
 mod invite;
 mod link;
+mod metrics;
 mod pairing;
+mod quic_motion;
 pub mod resident;
 mod server;
 
-pub use client::{ClientCommand, ClientConfig, ServerAddr, connect};
+pub use client::{ClientCommand, ClientConfig, ServerAddr, connect, connect_with_transport};
 pub use clipboard::{ClipLimit, DEFAULT_CLIP_LIMIT};
 pub use edge_drop::{Edge, EdgeDrop, EdgeFeed, Pointer};
 pub use error::{Error, Result};
 pub use events::{
-    ClipImage, ClipSummary, DialError, Event, Events, FoundServer, TransferState, TransferUpdate,
+    ClipImage, ClipSummary, DialError, Event, EventReceiver, Events, FoundServer, TransferState,
+    TransferUpdate,
 };
-pub use files::Files;
+pub use files::{FileRateLimit, Files};
+pub use input_queue::{
+    InputReceiver, InputSender, InputSettings, QueueError, QueuedInput, input_queue,
+};
 pub use invite::{INVITE_PORT, invite};
 pub use link::DEFAULT_PORT;
+pub use metrics::{InputMetrics, LatencyHistogram, LatencySummary, QueueSummary};
 pub use pairing::{ConfirmPairing, PairingRequest};
-pub use server::{Live, ServerConfig, serve};
+pub use server::{Live, ServerConfig, serve, serve_with_transport};
+
+pub use ferry_net::Transport;
+
+pub use quic_motion::{MotionPlan, MotionReceiver, MotionSender};

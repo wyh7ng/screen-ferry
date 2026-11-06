@@ -18,6 +18,7 @@ mod error;
 mod file;
 mod handshake;
 mod message;
+mod motion;
 mod screen;
 mod transfer;
 mod wire;
@@ -31,5 +32,6 @@ pub use handshake::{
     Bye, ByeReason, Capabilities, Channel, Hello, PROTOCOL_VERSION, Reject, RejectReason, Welcome,
 };
 pub use message::Message;
+pub use motion::MotionPacket;
 pub use screen::Enter;
 pub use transfer::{Cancel, CancelReason, Chunk};

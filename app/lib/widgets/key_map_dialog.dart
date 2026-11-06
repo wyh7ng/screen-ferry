@@ -87,7 +87,10 @@ class _KeyMapDialogState extends State<KeyMapDialog> {
     setState(() {
       _recording = false;
       // Esc 是取消录制，不录它。
-      if (event.logicalKey != LogicalKeyboardKey.escape) _from = event.physicalKey.usbHidUsage;
+      if (event.logicalKey != LogicalKeyboardKey.escape) {
+        _from = event.physicalKey.usbHidUsage;
+        if (widget.localMac && _from == 0x00070039 && _to != 0 && _to != 0x00070039) _to = null;
+      }
     });
     return KeyEventResult.handled;
   }
@@ -97,6 +100,7 @@ class _KeyMapDialogState extends State<KeyMapDialog> {
 
   /// 网格里列出的目标键：没输入搜索时是常用键，否则是名字里含着输入的键。
   List<int> get _choices {
+    if (widget.localMac && _from == 0x00070039) return [0x00070039, 0];
     final q = _search.text.trim().toLowerCase();
     if (q.isEmpty) return commonTargets;
     return [
@@ -207,7 +211,12 @@ class _KeyMapDialogState extends State<KeyMapDialog> {
                     ),
                   ),
                   const SizedBox(height: 6),
-                  Text(context.l10n.keyMapModifiersToo, style: TextStyle(fontSize: 13, color: c.muted)),
+                  Text(
+                    widget.localMac && from == 0x00070039
+                        ? context.l10n.macCapsMappingHint
+                        : context.l10n.keyMapModifiersToo,
+                    style: TextStyle(fontSize: 13, color: c.muted),
+                  ),
                   const SizedBox(height: 18),
                   _label(c, context.l10n.keyMapStep2(widget.peerName)),
                   const SizedBox(height: 8),

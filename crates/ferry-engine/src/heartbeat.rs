@@ -51,7 +51,7 @@ impl Heartbeat {
 
     /// 收到 Pong，返回这次的往返延迟；不是本连接发出的 nonce 时为 `None`。
     pub(crate) fn pong(&mut self, nonce: u64) -> Option<Duration> {
-        let sent = self.epoch + Duration::from_micros(nonce);
+        let sent = self.epoch.checked_add(Duration::from_micros(nonce))?;
         let now = Instant::now();
         if sent > now {
             return None;
@@ -115,12 +115,11 @@ impl fmt::Display for Report {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         write!(
             f,
-            "往返延迟（过去 1 分钟 {} 次）：最小 {:.2} ms · 平均 {:.2} ms · 最大 {:.2} ms，单程约 {:.2} ms",
+            "往返延迟（过去 1 分钟 {} 次）：最小 {:.2} ms · 平均 {:.2} ms · 最大 {:.2} ms",
             self.count,
             ms(self.min),
             ms(self.avg),
             ms(self.max),
-            ms(self.avg) / 2.0,
         )
     }
 }

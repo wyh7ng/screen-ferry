@@ -2,7 +2,18 @@
   "notices": [
     {
       "type": "welcome",
-      "version": 2
+      "version": 3
+    },
+    {
+      "type": "update_health",
+      "version": "0.2.0"
+    },
+    {
+      "id": 42,
+      "message": "保存失败",
+      "ok": false,
+      "session": "sample-session",
+      "type": "command_result"
     },
     {
       "state": {
@@ -86,7 +97,11 @@
             "version": "0.1.0"
           }
         ],
+        "performance": {
+          "peers": []
+        },
         "problem": null,
+        "session": "sample-session",
         "settings": {
           "accent": 2,
           "announce": true,
@@ -94,6 +109,7 @@
           "autostart": false,
           "clipboard": true,
           "clipboard_limit_mb": 32,
+          "coalesce_motion": false,
           "devices": [
             {
               "alias": "书房的电脑",
@@ -125,6 +141,7 @@
               "text_shortcuts": true
             }
           ],
+          "file_rate_limit_mbps": 0,
           "language": "en",
           "layout": [
             {
@@ -221,10 +238,14 @@
             "version": "0.1.0"
           }
         ],
+        "performance": {
+          "peers": []
+        },
         "problem": {
           "kind": "permission",
           "message": "需要在“隐私与安全性”中允许 ScreenFerry 控制电脑"
         },
+        "session": "sample-session",
         "settings": {
           "accent": 2,
           "announce": true,
@@ -232,6 +253,7 @@
           "autostart": false,
           "clipboard": true,
           "clipboard_limit_mb": 32,
+          "coalesce_motion": false,
           "devices": [
             {
               "alias": "书房的电脑",
@@ -263,6 +285,7 @@
               "text_shortcuts": true
             }
           ],
+          "file_rate_limit_mbps": 0,
           "language": "en",
           "layout": [
             {
@@ -343,6 +366,7 @@
         "fingerprint": "3f9a12c477e0b1d2aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55",
         "id": 3,
         "peer_name": "会议室 PC",
+        "session": "sample-session",
         "short": "3F9A-12C4-77E0-B1D2"
       },
       "type": "pairing"
@@ -366,12 +390,14 @@
       "address": "192.168.2.12",
       "error": null,
       "invite": false,
+      "request_id": 42,
       "type": "dialed"
     },
     {
       "address": "192.168.2.18",
       "error": "not_screen_ferry",
       "invite": true,
+      "request_id": 42,
       "type": "dialed"
     },
     {
@@ -379,6 +405,7 @@
     },
     {
       "bytes": 2097152,
+      "cursor": "",
       "fresh": true,
       "lines": [
         {
@@ -393,6 +420,7 @@
         }
       ],
       "lines_total": 18241,
+      "more": false,
       "next": 204800,
       "type": "run_log"
     },
@@ -410,7 +438,20 @@
     {
       "token": "abababababababababababababababababababababababababababababababab",
       "type": "hello",
-      "version": 2
+      "version": 3
+    },
+    {
+      "token": "abababababababababababababababababababababababababababababababab",
+      "type": "update_health"
+    },
+    {
+      "id": 42,
+      "request": {
+        "on": false,
+        "type": "set_sharing"
+      },
+      "session": "sample-session",
+      "type": "execute"
     },
     {
       "on": false,
@@ -595,5 +636,5 @@
       "version": "0.2.0"
     }
   ],
-  "version": 2
+  "version": 3
 }

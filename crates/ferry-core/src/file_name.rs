@@ -70,7 +70,19 @@ pub fn numbered(name: &str, n: u32) -> String {
         Some(i) if i > 0 => name.split_at(i),
         _ => (name, ""),
     };
-    shorten(&format!("{stem} ({n}){ext}"))
+    let suffix = format!(" ({n})");
+    // 编号必须留下：先给编号和扩展名留空间，再截短名字。
+    // 过长的扩展名视为名字的一部分，和 clean_name 的截短规则一致。
+    let (stem, ext) = if ext.len() <= 16 {
+        (stem, ext)
+    } else {
+        (name, "")
+    };
+    let mut kept = stem.len().min(MAX_NAME_BYTES - suffix.len() - ext.len());
+    while !stem.is_char_boundary(kept) {
+        kept -= 1;
+    }
+    format!("{}{suffix}{ext}", &stem[..kept])
 }
 
 /// 在 `taken` 为真的名字之外，挑一个不重名的：先试原名，再试 `(2)`、`(3)`……

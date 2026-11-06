@@ -22,14 +22,16 @@ const ALPN: &[u8] = b"screenferry";
 /// 发给服务端的名字。验证器不看它，只为满足 TLS 格式。
 const SERVER_NAME: &str = "screenferry.local";
 
-pub type ServerStream = tokio_rustls::server::TlsStream<TcpStream>;
-pub type ClientStream = tokio_rustls::client::TlsStream<TcpStream>;
+pub type ServerStream = crate::transport::TransportStream;
+pub type ClientStream = crate::transport::TransportStream;
 
 /// 本机身份对应的 TLS 配置，服务端与客户端两种用途都有。克隆很便宜。
 #[derive(Clone)]
 pub struct Tls {
     acceptor: TlsAcceptor,
     connector: TlsConnector,
+    #[cfg(feature = "quic-experiment")]
+    quic: crate::quic::QuicConfig,
 }
 
 impl Tls {
@@ -50,7 +52,11 @@ impl Tls {
             .with_client_auth_cert(identity.cert_chain(), identity.private_key())?;
         client.alpn_protocols = vec![ALPN.to_vec()];
 
+        #[cfg(feature = "quic-experiment")]
+        let quic = crate::quic::QuicConfig::new(server.clone(), client.clone())?;
         Ok(Self {
+            #[cfg(feature = "quic-experiment")]
+            quic,
             acceptor: TlsAcceptor::from(Arc::new(server)),
             connector: TlsConnector::from(Arc::new(client)),
         })
@@ -64,7 +70,10 @@ impl Tls {
             stream.get_ref().1.alpn_protocol(),
             stream.get_ref().1.peer_certificates(),
         )?;
-        Ok((Framed::new(stream, Channel::Input), peer))
+        Ok((
+            Framed::new(ServerStream::Tcp(Box::new(stream.into())), Channel::Input),
+            peer,
+        ))
     }
 
     /// 连接到 `addr` 并完成 TLS 握手。
@@ -82,7 +91,41 @@ impl Tls {
             stream.get_ref().1.alpn_protocol(),
             stream.get_ref().1.peer_certificates(),
         )?;
-        Ok((Framed::new(stream, channel), peer))
+        Ok((
+            Framed::new(ClientStream::Tcp(Box::new(stream.into())), channel),
+            peer,
+        ))
+    }
+
+    pub async fn connect_with(
+        &self,
+        addr: SocketAddr,
+        channel: Channel,
+        transport: crate::Transport,
+    ) -> Result<(Framed<ClientStream>, Fingerprint)> {
+        let transport = if matches!(channel, Channel::Data | Channel::File) {
+            crate::Transport::Tcp
+        } else {
+            transport
+        };
+        if transport != crate::Transport::Tcp {
+            #[cfg(feature = "quic-experiment")]
+            match self.quic.connect(addr, channel).await {
+                Ok(connected) => return Ok(connected),
+                Err(error) if !transport.falls_back() => return Err(error),
+                Err(_) => {}
+            }
+            #[cfg(not(feature = "quic-experiment"))]
+            if !transport.falls_back() {
+                return Err(std::io::Error::other("需要quic-experiment编译feature").into());
+            }
+        }
+        self.connect(addr, channel).await
+    }
+
+    #[cfg(feature = "quic-experiment")]
+    pub fn listen_quic(&self, addr: SocketAddr) -> Result<crate::quic::QuicListener> {
+        self.quic.listen(addr)
     }
 }
 

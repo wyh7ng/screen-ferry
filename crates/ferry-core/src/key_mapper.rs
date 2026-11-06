@@ -10,6 +10,8 @@
 //!   先按下 Ctrl 再松开它们；不用按 Ctrl 的，先轻点一下 Ctrl 再松开，两者都不再算“单独按了一下”。
 //! - 每个键按下时发给对方的是什么都记下来，松开时照着发，中途换了设置也对得上。
 
+use std::collections::BTreeMap;
+
 use ferry_types::{DeviceSettings, KeyAction, KeyCode, ModifierMap, ModifierTarget};
 
 const LEFT: KeyCode = KeyCode::keyboard(0x50);
@@ -143,6 +145,10 @@ pub struct KeyMapper {
     rules: &'static [Rule],
     /// 对方是 Windows：单独松开 Alt、Windows 键要防着。
     remote_windows: bool,
+    /// Mac 的 Caps Lock 捕获是一对瞬时事件，不能充当需要保持的修饰键。
+    local_command: bool,
+    /// 多个源键可以映射到同一个目标；最后一个来源松开时才真正松开。
+    sent_counts: BTreeMap<KeyCode, usize>,
     held: Vec<Held>,
     active: Option<Active>,
 }
@@ -177,6 +183,8 @@ impl KeyMapper {
             modifiers: settings.modifier_map(differ),
             rules,
             remote_windows: !remote_command,
+            local_command,
+            sent_counts: BTreeMap::new(),
             held: Vec::new(),
             active: None,
         }
@@ -191,6 +199,24 @@ impl KeyMapper {
             KeyAction::Repeat => self.repeat(code, &mut out),
             KeyAction::Up => self.up(code, &mut out),
         }
+        out.retain(|&(target, action)| match action {
+            KeyAction::Down => {
+                let count = self.sent_counts.entry(target).or_default();
+                *count += 1;
+                *count == 1
+            }
+            KeyAction::Up => match self.sent_counts.get_mut(&target) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                _ => {
+                    self.sent_counts.remove(&target);
+                    true
+                }
+            },
+            KeyAction::Repeat => true,
+        });
         out
     }
 
@@ -198,10 +224,21 @@ impl KeyMapper {
     pub fn reset(&mut self) {
         self.held.clear();
         self.active = None;
+        self.sent_counts.clear();
     }
 
     /// 一个键按设置换成对方的哪个键；`None` 表示不发送。
     fn map(&self, code: KeyCode) -> Option<KeyCode> {
+        let mapped = self.mapped(code);
+        if self.local_command && code == KeyCode::CAPS_LOCK && mapped.is_some_and(is_modifier) {
+            // 旧配置或额外映射也遵守界面上的限制：保留原来的 Caps Lock 行为。
+            Some(KeyCode::CAPS_LOCK)
+        } else {
+            mapped
+        }
+    }
+
+    fn mapped(&self, code: KeyCode) -> Option<KeyCode> {
         if let Some(&(_, to)) = self.extra.iter().find(|(from, _)| *from == code) {
             return to;
         }
@@ -283,7 +320,9 @@ impl KeyMapper {
             }
             // 光标过来之前就按着的键：照现在的映射松开。
             None => {
-                if let Some(t) = self.map(code) {
+                if let Some(t) = self.map(code)
+                    && !self.sent_counts.contains_key(&t)
+                {
                     out.push((t, KeyAction::Up));
                 }
             }

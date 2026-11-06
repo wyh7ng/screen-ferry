@@ -53,13 +53,13 @@ class _LogPageState extends State<LogPage> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.log, AppAspect.runLog, AppAspect.connection});
     final c = SfColors.of(context);
     final run = _filter == _Filter.run;
     final items = state.log.where(_match).toList();
     final bytes = state.runLogBytes;
     final count = run
-        ? (bytes == null ? '' : context.l10n.logRunSize(sizeText(bytes), _thousands(state.runLogLines ?? 0)))
+        ? (bytes == null ? '' : context.l10n.logRunVisible(sizeText(bytes), _thousands(state.runLog.length)))
         : context.l10n.logCount(items.length);
     return PageScaffold(
       title: context.l10n.logTitle,
@@ -133,7 +133,9 @@ class _LogRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = SfColors.of(context);
     final phrase = entry.phrase;
-    final local = phrase == null ? null : logLine(context.l10n, phrase, mac: AppScope.of(context).localIsMac);
+    final local = phrase == null
+        ? null
+        : logLine(context.l10n, phrase, mac: AppScope.of(context, aspects: const {AppAspect.local}).localIsMac);
     final (text, detail) = local ?? (entry.text, entry.detail);
     Widget row = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),

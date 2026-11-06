@@ -72,6 +72,17 @@ impl Incoming {
             .await
             .map_err(|_| Error::Timeout)??;
         match hello {
+            Some(Request::UpdateHealth { token }) => {
+                if !same(token.as_bytes(), self.token.as_bytes()) {
+                    return Err(Error::BadToken);
+                }
+                conn.send(&Notice::UpdateHealth {
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                })
+                .await?;
+                // 健康探测不创建 UI 会话，也不依赖 UI 消息协议版本。
+                return Err(Error::Closed);
+            }
             Some(Request::Hello { token, version }) => {
                 if !same(token.as_bytes(), self.token.as_bytes()) {
                     return Err(Error::BadToken);
@@ -117,6 +128,22 @@ pub async fn connect(endpoint: &Endpoint) -> Result<Connection> {
         Some(_) => Err(Error::Unexpected),
         None => Err(Error::Closed),
     }
+}
+
+/// 更新器探测新进程：使用新 endpoint 的随机令牌和预期版本，不协商 UI 协议。
+pub async fn probe_update(endpoint: &Endpoint, expected_version: &str) -> Result<bool> {
+    timeout(HANDSHAKE_TIMEOUT, async {
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port)).await?;
+        let mut conn = Connection::new(stream)?;
+        conn.send(&Request::UpdateHealth {
+            token: endpoint.token.clone(),
+        })
+        .await?;
+        Ok(matches!(conn.recv::<Notice>().await?,
+            Some(Notice::UpdateHealth { version }) if version == expected_version))
+    })
+    .await
+    .map_err(|_| Error::Timeout)?
 }
 
 /// 一条已握手的连接。需要同时收发时用 [`Connection::split`] 拆开。

@@ -21,7 +21,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let parsed = cli::parse(std::env::args().skip(1));
     app::init_output(&parsed);
-    match parsed {
+    let result = match parsed {
         Ok(cli::Parsed::Run(options)) => app::run(options),
         Ok(cli::Parsed::Help) => {
             println!("{}", cli::USAGE);
@@ -31,5 +31,7 @@ fn main() -> ExitCode {
             eprintln!("{e}\n\n{}", cli::USAGE);
             ExitCode::from(2)
         }
-    }
+    };
+    logging::shutdown();
+    result
 }

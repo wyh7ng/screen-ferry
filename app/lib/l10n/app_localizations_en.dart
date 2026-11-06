@@ -2042,4 +2042,103 @@ class AppLocalizationsEn extends AppLocalizations {
   String toastUpdateFailed(String message) {
     return 'The update wasn’t installed: $message';
   }
+
+  @override
+  String get commandTimedOut => 'The background service did not confirm the change. Please try again.';
+
+  @override
+  String get macCapsMappingHint =>
+      'macOS reports Caps Lock as a toggle. It can stay Caps Lock or be disabled; mapping it to a held key is unavailable.';
+
+  @override
+  String get settingsResponsiveness => 'Transfers and responsiveness';
+
+  @override
+  String get settingsFileRate => 'File transfer speed limit';
+
+  @override
+  String get settingsFileRateHint =>
+      'Maximum MB per second (1 MB = 1,000,000 bytes). 0 means unlimited; range 0–1024. Limit large transfers to leave bandwidth for other network activity.';
+
+  @override
+  String get settingsCoalesceMotion => 'Combine consecutive mouse movements';
+
+  @override
+  String get settingsCoalesceMotionHint =>
+      'For high polling rate mice or busy networks, reduce queued movement events. Keys, clicks and scrolling keep their order. Turn off to retain every movement sample.';
+
+  @override
+  String get performanceTitle => 'Performance';
+
+  @override
+  String get performanceHint =>
+      'Local processing stages over the last 5 seconds. Percentiles are approximate; maximums are measured. RTT is network round-trip time, not end-to-end input latency. — means no samples.';
+
+  @override
+  String get performanceEmpty => 'Connect a device and use the keyboard or mouse to see measurements.';
+
+  @override
+  String get performanceStage => 'Stage';
+
+  @override
+  String get performanceCount => 'Samples';
+
+  @override
+  String get performanceMax => 'Max';
+
+  @override
+  String get performanceCaptureQueue => 'Capture queue wait';
+
+  @override
+  String get performanceSendQueue => 'Send queue wait';
+
+  @override
+  String get performanceSend => 'Send duration';
+
+  @override
+  String get performanceInject => 'Injection duration';
+
+  @override
+  String get performanceRtt => 'Network RTT';
+
+  @override
+  String get performanceScheduler => 'Scheduler delay';
+
+  @override
+  String get performanceCapture => 'Capture queue';
+
+  @override
+  String get performanceOutbound => 'Outbound queue';
+
+  @override
+  String get performanceDepth => 'Current depth';
+
+  @override
+  String get performanceHighWater => 'Lifetime peak';
+
+  @override
+  String get performanceOldest => 'Oldest wait';
+
+  @override
+  String get performanceMaxWait => 'Window max wait';
+
+  @override
+  String get performanceCoalesced => 'Combined';
+
+  @override
+  String get performanceOverflows => 'Overflows';
+
+  @override
+  String get performanceLocal => 'This computer';
+
+  @override
+  String get performanceUnits => 'Durations in ms; >100 ms shows a count.';
+
+  @override
+  String logRunVisible(String size, String count) {
+    return '$size · Showing $count lines';
+  }
+
+  @override
+  String get runLogReadFailed => 'The log is temporarily unavailable. Retrying automatically.';
 }

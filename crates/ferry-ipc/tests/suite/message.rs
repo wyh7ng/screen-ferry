@@ -59,6 +59,14 @@ fn requests() -> Vec<Request> {
             token: "ab".repeat(32),
             version: VERSION,
         },
+        Request::UpdateHealth {
+            token: "ab".repeat(32),
+        },
+        Request::Execute {
+            session: "sample-session".into(),
+            id: 42,
+            request: Box::new(Request::SetSharing { on: false }),
+        },
         Request::SetSharing { on: false },
         Request::UpdateSettings {
             settings: SettingsPatch {
@@ -131,8 +139,14 @@ fn requests() -> Vec<Request> {
             to: Some(FP_PC.into()),
         },
         Request::Quit,
-        Request::ReadRunLog { since: None },
         Request::ReadRunLog {
+            since: None,
+            cursor: None,
+            request_id: None,
+        },
+        Request::ReadRunLog {
+            cursor: None,
+            request_id: None,
             since: Some(204_800),
         },
         Request::ExportDiagnostics,
@@ -152,6 +166,7 @@ fn requests() -> Vec<Request> {
 
 fn state() -> State {
     State {
+        session: "sample-session".into(),
         local: Local {
             name: "Mac Studio".into(),
             fingerprint: FP_MAC.into(),
@@ -217,6 +232,7 @@ fn state() -> State {
             addr: "192.168.2.31".into(),
             paired: false,
         }],
+        performance: Default::default(),
         settings: Settings {
             name: String::new(),
             side: Side::Right,
@@ -227,6 +243,8 @@ fn state() -> State {
             announce: true,
             clipboard: true,
             clipboard_limit_mb: 32,
+            file_rate_limit_mbps: 0,
+            coalesce_motion: false,
             mouse_dpi: 1600,
             server: String::new(),
             autostart: false,
@@ -297,6 +315,15 @@ fn notices() -> Vec<Notice> {
     };
     vec![
         Notice::Welcome { version: VERSION },
+        Notice::UpdateHealth {
+            version: "0.2.0".into(),
+        },
+        Notice::CommandResult {
+            session: "sample-session".into(),
+            id: 42,
+            ok: false,
+            message: "保存失败".into(),
+        },
         Notice::State {
             state: Box::new(state()),
         },
@@ -309,6 +336,7 @@ fn notices() -> Vec<Notice> {
         Notice::Log { entry },
         Notice::Pairing {
             prompt: PairingPrompt {
+                session: "sample-session".into(),
                 id: 3,
                 peer_name: "会议室 PC".into(),
                 fingerprint: FP_PC.into(),
@@ -325,11 +353,13 @@ fn notices() -> Vec<Notice> {
             fingerprint: FP_PC.into(),
         },
         Notice::Dialed {
+            request_id: Some(42),
             address: "192.168.2.12".into(),
             invite: false,
             error: None,
         },
         Notice::Dialed {
+            request_id: Some(42),
             address: "192.168.2.18".into(),
             invite: true,
             error: Some(DialError::NotScreenFerry),
@@ -352,6 +382,10 @@ fn notices() -> Vec<Notice> {
             fresh: true,
             bytes: 2_097_152,
             lines_total: 18_241,
+            cursor: String::new(),
+            more: false,
+            error: None,
+            request_id: None,
         },
         Notice::DiagnosticsExported {
             path: "/Users/me/Downloads/ScreenFerry-诊断-20261102-0624.txt".into(),

@@ -1969,4 +1969,99 @@ class AppLocalizationsZh extends AppLocalizations {
   String toastUpdateFailed(String message) {
     return '更新没有装上：$message';
   }
+
+  @override
+  String get commandTimedOut => '后台未确认这次修改，请重试。';
+
+  @override
+  String get macCapsMappingHint => 'macOS 将 Caps Lock 作为开关报告，因此只能保留原功能或禁用，无法映射成需要按住的键。';
+
+  @override
+  String get settingsResponsiveness => '传输与响应';
+
+  @override
+  String get settingsFileRate => '文件传输速度上限';
+
+  @override
+  String get settingsFileRateHint => '每秒最多传输多少 MB（1 MB = 1,000,000 字节）。0 表示不限速，范围 0–1024；限制大文件传输可为其他网络活动留出带宽。';
+
+  @override
+  String get settingsCoalesceMotion => '合并连续鼠标移动';
+
+  @override
+  String get settingsCoalesceMotionHint => '适合高回报率鼠标或网络繁忙时，减少待发送的移动事件；按键、点击和滚轮保持顺序。需要逐个保留移动采样时关闭。';
+
+  @override
+  String get performanceTitle => '性能统计';
+
+  @override
+  String get performanceHint => '近 5 秒的本机处理阶段，分位数为近似值，最大值为实测。RTT 是网络往返时间，不是端到端输入延迟；无样本显示 —。';
+
+  @override
+  String get performanceEmpty => '连接设备并操作键鼠后显示统计。';
+
+  @override
+  String get performanceStage => '阶段';
+
+  @override
+  String get performanceCount => '样本';
+
+  @override
+  String get performanceMax => '最大';
+
+  @override
+  String get performanceCaptureQueue => '捕获队列等待';
+
+  @override
+  String get performanceSendQueue => '发送队列等待';
+
+  @override
+  String get performanceSend => '发送耗时';
+
+  @override
+  String get performanceInject => '注入耗时';
+
+  @override
+  String get performanceRtt => '网络 RTT';
+
+  @override
+  String get performanceScheduler => '调度延迟';
+
+  @override
+  String get performanceCapture => '捕获队列';
+
+  @override
+  String get performanceOutbound => '发送队列';
+
+  @override
+  String get performanceDepth => '当前长度';
+
+  @override
+  String get performanceHighWater => '累计峰值';
+
+  @override
+  String get performanceOldest => '最老等待';
+
+  @override
+  String get performanceMaxWait => '窗口最大等待';
+
+  @override
+  String get performanceCoalesced => '已合并';
+
+  @override
+  String get performanceOverflows => '已溢出';
+
+  @override
+  String get performanceLocal => '本机';
+
+  @override
+  String get performanceUnits => '耗时单位：ms；超过 100 ms 一列为次数。';
+
+  @override
+  String logRunVisible(String size, String count) {
+    return '$size · 当前显示 $count 行';
+  }
+
+  @override
+  String get runLogReadFailed => '日志暂时无法读取，将自动重试。';
 }

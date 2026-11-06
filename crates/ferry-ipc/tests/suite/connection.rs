@@ -114,3 +114,38 @@ async fn an_endless_line_is_cut_off() {
     let _ = stream.write_all(&vec![b'x'; MAX_LINE + 10]).await;
     assert!(matches!(server.await.unwrap(), Err(Error::LineTooLong)));
 }
+
+#[tokio::test]
+async fn update_health_does_not_depend_on_the_ui_protocol_version() {
+    let (listener, mut endpoint) = listen().await;
+    let server = tokio::spawn(async move { listener.accept().await.unwrap().authenticate().await });
+    endpoint.version = VERSION + 1;
+    assert!(
+        ferry_ipc::probe_update(&endpoint, env!("CARGO_PKG_VERSION"))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(server.await.unwrap(), Err(Error::Closed)));
+}
+
+#[tokio::test]
+async fn update_health_checks_the_token_and_expected_application_version() {
+    let (listener, mut endpoint) = listen().await;
+    let server = tokio::spawn(async move { listener.accept().await.unwrap().authenticate().await });
+    assert!(
+        !ferry_ipc::probe_update(&endpoint, "99.99.99")
+            .await
+            .unwrap()
+    );
+    assert!(matches!(server.await.unwrap(), Err(Error::Closed)));
+    let (listener, _) = listen().await;
+    endpoint.port = listener.local_addr().unwrap().port();
+    endpoint.token = "00".repeat(32);
+    let server = tokio::spawn(async move { listener.accept().await.unwrap().authenticate().await });
+    assert!(
+        !ferry_ipc::probe_update(&endpoint, env!("CARGO_PKG_VERSION"))
+            .await
+            .unwrap_or(false)
+    );
+    assert!(matches!(server.await.unwrap(), Err(Error::BadToken)));
+}

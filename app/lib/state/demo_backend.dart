@@ -66,6 +66,8 @@ class DemoBackend implements Backend {
     _seedLog(now);
   }
 
+  String session = 'demo-session';
+
   final Role role;
 
   /// 本机系统。不给时按角色推断：服务端是 Mac，客户端是 Windows。
@@ -187,6 +189,7 @@ class DemoBackend implements Backend {
     emit(
       PairingNotice(
         PairingPrompt(
+          session: session,
           id: id,
           peerName: peerName,
           fingerprint: _fp('new'),
@@ -201,6 +204,14 @@ class DemoBackend implements Backend {
   @override
   bool send(Request request) {
     if (_link.value != DaemonLink.online) return false;
+    final envelope = request is ExecuteRequest ? request : null;
+    if (envelope != null) {
+      if (envelope.session != session) {
+        emit(CommandResultNotice(session: session, id: envelope.id, ok: false, message: 'Session changed'));
+        return true;
+      }
+      request = envelope.request;
+    }
     sent.add(request);
     switch (request) {
       case SetSharingRequest(:final on):
@@ -223,17 +234,19 @@ class DemoBackend implements Backend {
         _settings = _settings.withDevice(device);
       // 演示：地址里带 9.9.9.9 的连不上，其余都成。
       case ConnectAddressRequest(:final address):
-        emit(DialedNotice(address: address, invite: false, error: _demoDial(address)));
+        emit(DialedNotice(address: address, invite: false, error: _demoDial(address), requestId: envelope?.id));
       case InviteRequest(:final address):
-        emit(DialedNotice(address: address, invite: true, error: _demoDial(address)));
+        emit(DialedNotice(address: address, invite: true, error: _demoDial(address), requestId: envelope?.id));
       case QuitRequest():
         emit(const QuitNotice());
       // 演示：运行日志第一次给一段，之后没有新的。
-      case ReadRunLogRequest(:final since):
+      case ReadRunLogRequest(:final since, :final requestId):
         emit(
           RunLogNotice(
             lines: since == null ? _demoRunLog() : const [],
             next: 2097152,
+            cursor: 'demo-log:2097152',
+            requestId: requestId,
             fresh: since == null,
             bytes: 2097152,
             linesTotal: 18241,
@@ -283,6 +296,7 @@ class DemoBackend implements Backend {
           emit(
             PairingNotice(
               PairingPrompt(
+                session: session,
                 id: id,
                 peerName: device.name,
                 fingerprint: device.fingerprint,
@@ -348,10 +362,15 @@ class DemoBackend implements Backend {
         _setUpdate(UpdateStatus.installing);
       case DismissUpdateRequest(:final version):
         _setUpdate(_update.status, dismissed: version);
-      case HelloRequest() || OpenPermissionSettingsRequest() || OpenSettingsRequest():
+      case HelloRequest() ||
+          UpdateHealthRequest() ||
+          ExecuteRequest() ||
+          OpenPermissionSettingsRequest() ||
+          OpenSettingsRequest():
         break;
     }
     _emitState();
+    if (envelope != null) emit(CommandResultNotice(session: session, id: envelope.id, ok: true, message: ''));
     return true;
   }
 
@@ -449,6 +468,7 @@ class DemoBackend implements Backend {
     final linkPeer = connected ? _linkPeer : null;
     final arrangement = Arrangement.of(_peers, _settings);
     return DaemonState(
+      session: session,
       local: Local(
         name: _localName,
         fingerprint: _fp('local'),

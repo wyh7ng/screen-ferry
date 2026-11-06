@@ -174,6 +174,21 @@ void main() {
     await daemon.close();
   });
 
+  test('握手不回应时超时并重新读取连接信息', () async {
+    final daemon = await FakeDaemon.start();
+    await daemon.writeEndpoint(path);
+    final client = IpcClient(path: path, retry: const Duration(milliseconds: 30))..start();
+    final first = await daemon.next();
+    await first.read();
+    await until(client, DaemonLink.offline);
+    final second = await daemon.next();
+    expect((await second.read())['type'], 'hello');
+    second.write({'type': 'welcome', 'version': ipcVersion});
+    await until(client, DaemonLink.online);
+    await client.dispose();
+    await daemon.close();
+  });
+
   test('ipc.json 的位置', () {
     expect(
       endpointPath(environment: {'HOME': '/Users/me'}, os: 'macos'),

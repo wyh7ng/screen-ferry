@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -17,6 +18,7 @@ use super::{Daemon, MockHost};
 struct Site {
     base: String,
     files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl Site {
@@ -25,6 +27,8 @@ impl Site {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let files: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::default();
         let served = files.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -37,6 +41,7 @@ impl Site {
                         break;
                     }
                 }
+                count.fetch_add(1, Ordering::SeqCst);
                 let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
                 let body = served.lock().unwrap().get(&path).cloned();
                 let (status, body) = match body {
@@ -51,7 +56,11 @@ impl Site {
                 let _ = stream.write_all(&body);
             }
         });
-        Self { base, files }
+        Self {
+            base,
+            files,
+            requests,
+        }
     }
 
     fn put(&self, path: &str, body: Vec<u8>) {
@@ -347,11 +356,94 @@ async fn after_an_update_the_new_version_says_so_and_reopens_the_settings() {
         })
         .await;
     assert_eq!(phrase.args["to"], env!("CARGO_PKG_VERSION"));
-    assert!(
-        host.settings_opened
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 1
-    );
+    assert!(host.settings_opened.load(Ordering::SeqCst) >= 1);
     assert!(daemon.device.store.update_state().installing.is_none());
+    daemon.task.abort();
+}
+
+/// 快进到自动检查的窗口，然后恢复真实时间供阻塞 HTTP 线程完成。
+async fn first_automatic_check() {
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(181)).await;
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn an_offline_automatic_check_does_not_claim_the_app_is_current() {
+    let (site, key) = (Site::start(), Key::new());
+    let host = MockHost {
+        update_source: Some(UpdateSource {
+            manifest_url: format!("{}/update.json", site.base),
+            keys: vec![key.public],
+        }),
+        ..MockHost::default()
+    };
+    let daemon = Daemon::start(host).await;
+    let mut ui = daemon.ui().await;
+    ui.state_where("首次状态", |_| true).await;
+    first_automatic_check().await;
+    crate::support::eventually("自动尝试检查", || {
+        site.requests.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    ui.send(Request::SetVerbose { on: true }).await;
+    let state = ui
+        .state_where("检查失败仍然未知", |s| {
+            s.local.verbose_since.is_some()
+        })
+        .await;
+    assert_eq!(state.update.status, UpdateStatus::Idle);
+    assert_eq!(state.update.checked_at, None);
+    assert_eq!(site.requests.load(Ordering::SeqCst), 1, "失败后不立刻重试");
+    daemon.task.abort();
+}
+
+#[tokio::test]
+async fn automatic_signature_failures_back_off() {
+    let (site, ours, theirs) = (Site::start(), Key::new(), Key::new());
+    publish(&site, &theirs, 180 * 86_400);
+    let host = MockHost {
+        update_source: Some(UpdateSource {
+            manifest_url: format!("{}/update.json", site.base),
+            keys: vec![ours.public],
+        }),
+        ..MockHost::default()
+    };
+    let daemon = Daemon::start(host).await;
+    let mut ui = daemon.ui().await;
+    ui.state_where("首次状态", |_| true).await;
+    first_automatic_check().await;
+    ui.state_where("自动验签失败", |s| {
+        s.update.error == Some(UpdateError::VerifyFailed)
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    assert_eq!(
+        site.requests.load(Ordering::SeqCst),
+        2,
+        "仅请求一次清单和签名"
+    );
+    daemon.task.abort();
+}
+
+#[tokio::test]
+async fn snapshots_use_cached_install_capability() {
+    let host = MockHost::default();
+    let daemon = Daemon::start(host.clone()).await;
+    let mut ui = daemon.ui().await;
+    ui.state_where("平台能力准备好了", |s| s.update.can_install)
+        .await;
+    let checks = host.updater.capability_checks();
+    for on in [true, false, true] {
+        ui.send(Request::SetVerbose { on }).await;
+        ui.state_where("状态更新", |s| s.local.verbose_since.is_some() == on)
+            .await;
+    }
+    assert_eq!(
+        host.updater.capability_checks(),
+        checks,
+        "快照不再执行系统能力检查"
+    );
     daemon.task.abort();
 }

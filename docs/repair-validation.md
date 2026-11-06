@@ -1,0 +1,127 @@
+# 修复与验证记录
+
+首批记录日期：2026-11-05；第二批文件补充日期：2026-11-06。基线：`fc5e14378219c294cb88a73b1bb87edfd6843753`。
+工作分支：`codex/reliability-fixes`。代码位于 `/Users/wyh/Desktop/codex/screen-ferry-fixes`，当前保留为未提交改动，供审核。
+
+## 首批已完成
+
+- 文件原子不覆盖提交、最长文件名编号、跨盘临时复制、部分提交失败保留已公开文件。
+- 文件独立连接重试、幂等通告/接受、完成回执重放、EOF/取消乱序处理、清单与并发预算、失败错误脱敏。
+- 双向每设备文件/剪贴板策略；数据连接独立建立与恢复；恢复时避免旧剪贴板覆盖活动端内容。
+- 专用剪贴板线程，平台同步读写和图片转换不再占用输入执行线程。
+- 浮层过期计时忙等修复、按帧截止绘制、静止跳过场景构建、合并原生刷新。
+- Windows 光标句柄复用、Mac 看守线程复用、多对一按键映射持有计数；Mac Caps 保持型映射采取平台限制和旧配置回退。
+- IPC 3 会话/请求绑定、配对断线重建、异步结果按窗口路由、失败回滚、Welcome 超时、强调色范围回退。
+- 后台单实例锁、握手任务回收、旧引擎事件失效、后台邀请任务管理、固定主机名异步解析。
+- 文件准备、日志读取、诊断与预览后台任务化；日志每窗口单任务，预览串行合并；更新能力和平台信息缓存。
+- 更新失败状态及退避、Windows 锁定句柄后重新验包、Mac 跨 IPC 版本健康探测及改名应用更新。
+
+## 首批检查结果（历史记录，2026-11-05）
+
+本表对应首批修复快照，不表示后续第二批全部改动已经通过相同的全项目检查。
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | 通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
+| `cargo test --workspace` | 383 通过，0 失败，2 个依赖局域网组播的测试按原配置忽略 |
+| `cargo xtask lint` | 14 个 crate 均通过 |
+| `cargo deny check` | advisories、bans、licenses、sources 均通过；存在仓库已有重复依赖提示 |
+| `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` | 通过；交叉类型/编译检查，不是 Windows 执行测试 |
+| Windows 平台 all-targets 交叉 Clippy | 通过 |
+| Flutter 格式与 `flutter analyze` | 通过 |
+| `flutter test` | 124 通过 |
+
+Rust 为仓库固定的 1.91.0，Flutter 为 CI 使用的 3.47.8。工具位于 `/Users/wyh/.cache/screen-ferry-tooling/`；
+Rust 命令使用该目录下的 cargo/rustup，未修改用户 shell 初始化文件。为 Windows 交叉检查安装了 MinGW。
+
+文件测试使用真实回环 TLS 和可控故障，不靠大文件传输速度碰巧产生中断；浮层到期测试使用可控时间。
+macOS 原子提交已执行并发碰撞与目录测试；Windows 同类测试及更新文件锁测试已交叉编译，仍需 Windows 环境执行。
+
+## 首批交付与验证边界
+
+- 当前交付为源码修复，没有安装到正在使用的 ScreenFerry，也没有发布远端版本。
+- UI 与后台需使用同一构建（IPC 3）；设备间线协议仍为 1。两台都升级可取得完整故障恢复行为。
+- 原始版本的 `partial/<传输号>/` 不迁移。第一批修复后的设备隔离缓存与第二批的兼容行为见下文，不能笼统写成所有旧缓存都不可复用。发送端待发送任务只在内存，发送进程重启后仍需重新发起任务。清理完成回执会移除相应去重信息。
+- 原子文件改名与回执落盘之间仍不具备跨目录掉电事务保证；不能将断线恢复承诺扩大成任意断电均完全事务化。
+- 已经进入的系统剪贴板调用不能强行中断；取消会丢弃未执行请求，输入线程继续运行。
+- 首批自动检查未覆盖 Mac/Windows 实机辅助功能、实际键鼠、UAC、拖放与休眠唤醒验收，以及用户 Wi-Fi 环境的 p95/p99 对照。这些是证据边界，不是本轮要求用户继续操作的前置条件。
+
+首批保留 TCP，没有实现 QUIC、输入移动合并、传输限速、日志增量化与更细的 UI 重建优化。后续实现进度与本表的历史检查结果分开记录。
+
+实现边界和兼容性详见 [ADR 0015](adr/0015-reliable-lifecycle-and-input-isolation.md)。
+
+## 第二批文件实现（2026-11-06）
+
+- `Files::set_rate_limit(u64)` 在线设置总文件内容发送字节预算；默认 0 不限速。所有设备和并发任务共享 FIFO 队列，动态分块、在线降速、取消不占用输入线程；协议开销、接收流量与物理带宽不在此预算保证范围内。
+- 完成回执按 7 天 / 最近 1024 份保留策略后台清理，启动、每次完成和每小时触发。清理跳过活动任务、partial 内容及未完成提交意图，只删除缓存，不删除下载内容。
+- 提交前持久化清单指纹、源/目标、稳定文件身份与内容摘要；名称碰撞和跨卷只更新单项意图。恢复确认已经公开的同一对象，避免改名成功而回执尚未落盘时重复提交。
+- 跨卷复制前登记私有容器身份，内容与目标卷来源记录同步后再提交；新引擎实例可从磁盘恢复。用户修改或替换目标时保留内容和恢复记录并报冲突；多项提交后续失败保留已经公开的文件。
+- 新增平台文件身份、已打开文件句柄身份、原子记录替换及目录同步接口。Mac 使用卷/文件身份并尽可能同步目录；Windows 使用卷序列号/文件 ID 与 `WRITE_THROUGH`，不伪称支持目录 fsync。
+- 准备清单稳定排序、规范化源路径去重、清洗后名称编号复用递增游标；扫描与错误数量有预算，汇总错误而不发送部分准备结果，错误内容不暴露源路径。
+
+### 实际已执行的文件范围检查
+
+| 检查 | 结果与范围 |
+|---|---|
+| `cargo test -p ferry-engine --test suite files -- --nocapture` | 38 通过，0 失败；过滤名也匹配部分已有 edge_drop / diagnostics 测试，不是 38 项全部为新增文件测试 |
+| `cargo test -p ferry-platform-macos file_commit -- --nocapture` | 4 通过：原子碰撞、目录不覆盖、稳定句柄身份、记录替换；实际在 Mac 本地文件系统执行 |
+| `cargo clippy -p ferry-engine -p ferry-platform-macos -p ferry-platform-mock --all-targets -- -D warnings` | 通过，针对当时整合快照的上述目标；不是第二批全 workspace 最终检查结论 |
+| `cargo check -p ferry-platform-windows --all-targets --target x86_64-pc-windows-gnu` | 通过；类型/编译检查，没有执行 Windows 测试 |
+| `cargo clippy -p ferry-platform-windows --all-targets --target x86_64-pc-windows-gnu -- -D warnings` | 通过；同样不是 Windows 原生执行结果 |
+| 文件范围 `rustfmt` 与 `git diff --check` | 通过；未据此宣布第二批全项目发布就绪 |
+
+该记录沿用前述隔离工具链。第二批其他模块、全 workspace 最终检查与打包状态由后续整合记录给出，不能把首批 383/124 的历史数字直接搬作第二批结果。
+
+### 证据与保证范围
+
+| 承诺 | 当前证据 | 尚不能推出的结论 |
+|---|---|---|
+| 共享限速、公平与在线调整 | `files/budget.rs` 用暂停时钟验证 FIFO 总预算、调高/调低、取消排队；真实回环 TLS 测试确认 1 B/s 的文件取消及时结束 | 未做真实 Wi-Fi 吞吐误差、并发公平性长期压测；不等于输入延迟下降或物理网络隔离 |
+| 原子不覆盖与跨卷提交 | 已有并发同名、目录哨兵、Mac 原生改名测试；注入 `CrossesDevices` 验证 staging 路径与清理 | 注入跨卷错误不等于真实不同卷/不同文件系统掉电测试；Windows 原生测试仅交叉编译 |
+| 改名后恢复 | 在改名已成功、后续持久化失败处注入故障；销毁旧引擎，新 `Files` 实例仅靠磁盘与配对恢复；同卷/跨卷各验证不生成第二份 | 不是拔电、杀进程或文件系统写入重排实验；不保证所有文件系统具有跨目录事务性 |
+| 目标用户修改保护 | 恢复前修改目标内容，验证不覆盖、不删除、不另存第二份；部分提交后用户修改的文件也保留 | 尚无针对所有目标移动/同内容替换/复杂目录变更时序的独立回归，相关分支不能写成全部实测 |
+| 回执清理 | 人工过期与超过 1024 份记录、活动任务、partial 和未完成意图保护测试 | 未做真实持续运行 7 天；定时扫描是异步策略，磁盘故障或保护中的任务可使实际回收延后 |
+| 清单稳定去重与失败汇总 | 重复源/不同源同名、两处准备失败且不发送有效项的回归；首批保留长文件名编号与路径校验测试 | 未做 100,000 项性能基准或大目录扫描中取消的专项压力测试，不能宣称具体耗时/内存收益 |
+| 文件生命周期 | 保留独立 File TLS 建连失败、重复 Offer、最终确认丢失、EOF 先于 Cancel、确定性整会话续传与取消回归 | 自动时序注入不代替 Mac/Windows 原生拖放、网络或 UAC 验收 |
+
+### 缓存兼容与恢复边界
+
+- 原始基线的 `partial/<id>/` 缺少设备指纹隔离，不自动迁移；第一批的 `partial/<fingerprint>/<id>/state` 续传格式仍读取，旧二元素完成回执仍读取并以文件修改时间参与清理。该兼容来自实现审查，目前没有单独的旧回执格式升级回归。
+- 新的 `commit-intent.json` / `commit-items/` 是本地格式，不更改设备间协议 1。旧程序不理解它们，因此不承诺降级后保持第二批恢复语义。
+- 恢复发生在同一设备以同一任务 ID、匹配清单再次通告时。接收端新进程能恢复记录，不等于发送端进程重启后能找回仅在内存中的发送任务。
+- 完成回执被清理、手工删缓存或使用新任务 ID 后，不再承诺历史去重。7 天 / 1024 份限制针对可清理完成回执，不能据此强删活跃任务或未完成意图；每小时触发意味着并非到期瞬间回收。
+- 内容与记录使用同步写入、原子替换和可用的平台持久化请求，但文件系统语义、硬件缓存与系统故障仍影响掉电结果。已缩小并可恢复“改名成功、回执未落盘”的可识别窗口，仍不宣称任意掉电完全事务化。
+
+文件线上行为与本地恢复顺序见 [protocol.md](protocol.md) 第 6 节，决策见 [ADR 0016](adr/0016-bounded-input-and-performance-observability.md)。本次文档复核没有重新执行大范围测试或原生双机验收。
+
+
+## 第二批整合时的显示器环境限制
+
+2026-11-06 首次全工作区运行在原有 `reports_one_primary_display_with_real_size` 失败：CoreGraphics返回0个活动显示器。只读系统信息确认PHL显示器 `spdisplays_asleep=yes`，显示器实现本轮没有改动。该测试仍保留原断言，标为需要唤醒桌面的显式原生测试，避免无头CI/显示器睡眠把环境前置条件当代码失败；未唤醒设备、未继续人工验收。后续全套中的跳过数量须包含这一项，不能称该项已通过。可在未来具备条件时显式执行 `cargo test -p ferry-platform-macos reports_one_primary_display_with_real_size -- --ignored`。
+
+
+## 第二批最终整合（2026-11-06）
+
+首批和后续常规优化、QUIC可选实验已合并在当前工作副本，未提交/推送/发布，完整要求与证据映射见 [development-completion.md](development-completion.md)。人工验收按用户要求停止，本节均为开发过程的自动检查。
+
+| 最终检查 | 结果 |
+|---|---|
+| cargo fmt --all --check；git diff --check | 通过 |
+| cargo clippy --workspace --all-targets -- -D warnings | 通过 |
+| cargo clippy --workspace --all-targets --all-features -- -D warnings | 通过 |
+| cargo test --workspace | 438通过，0失败，3跳过 |
+| cargo test --workspace --all-features | 448通过，0失败，3跳过 |
+| cargo xtask lint | 14 crate通过 |
+| cargo deny check | advisories/bans/licenses/sources通过；重复依赖及未使用许可白名单提示，无阻断 |
+| Windows全workspace/all-targets/all-features交叉Clippy | 通过（x86_64-pc-windows-gnu，不是Windows原生执行） |
+| Dart格式与Flutter analyze | 通过 |
+| Flutter完整测试 | 133通过 |
+| macOS release后台（含可选QUIC） | 构建通过，默认传输仍TCP |
+| Windows x64 GNU release后台（含可选QUIC） | 交叉链接通过，尚未在Windows运行本次产物 |
+
+三项跳过为两项既有组播测试、一项需要唤醒显示器的原生测试（环境说明见上节）。拆分resident模块后，Flutter短语覆盖测试已改为递归扫描整个resident源码目录，继续检查所有后台短语，不放宽原覆盖条件。
+
+本轮完成：输入阶段指标与队列背压/可选合并、全局文件预算与提交恢复/回执清理、剪贴板共享缓存、日志有界后台写入与分页游标、UI分域刷新、后台职责拆分、QUIC可靠与DATAGRAM实验及回退。新配置schema7默认不限速/不合并，默认与常驻传输TCP；界面和后台仍需同构建IPC3。物理网络尾延迟收益、Windows原生执行、完整应用包/更新/休眠等不从这些检查推断。
+
+检查日志在 `/tmp/screen-ferry-final-*.log`。最新开发二进制与来源摘要保存在 `target/development/`；不与先前首批验收包混淆。

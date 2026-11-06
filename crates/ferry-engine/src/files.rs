@@ -6,18 +6,23 @@
 //!
 //! 服务端可能同时连着几台设备：每台一条数据连接、一组任务，续传只对同一台设备有效（ADR 0006）。
 
+mod budget;
+mod commit;
 mod manifest;
 mod receive;
 mod send;
+pub use budget::FileRateLimit;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ferry_net::{ClientStream, Framed};
+use ferry_platform::FileCommit;
 use ferry_proto::{CancelReason, FileCancel, FileOffer, Message};
 use ferry_store::Store;
 use ferry_trust::Fingerprint;
@@ -25,8 +30,7 @@ use ferry_types::{TransferId, mark};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
-use tokio::task::AbortHandle;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -42,6 +46,12 @@ const MAX_RETRIES: u32 = 3;
 
 /// 传输中报告进度的最短间隔。
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_JOBS: usize = 64;
+const MAX_PEER_JOBS: usize = 8;
+const MAX_CANCELLED: usize = 512;
+const RECEIPT_TTL: u64 = 7 * 24 * 3600;
+const MAX_RECEIPTS: usize = 1024;
 
 /// 客户端打开一条已完成握手的文件连接。
 pub(crate) type Opener = Arc<
@@ -61,6 +71,10 @@ struct Inner {
     downloads: PathBuf,
     events: Events,
     state: Mutex<State>,
+    commit: Arc<dyn FileCommit>,
+    scans: Arc<Semaphore>,
+    rate: FileRateLimit,
+    cleanup: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -70,6 +84,7 @@ struct State {
     /// 每次连上数据连接加一，旧连接迟到的断开据此识别。
     generation: u64,
     jobs: HashMap<TransferId, Job>,
+    cancelled: VecDeque<(TransferId, Fingerprint)>,
 }
 
 impl State {
@@ -93,9 +108,88 @@ struct Job {
     peer: Fingerprint,
     kind: JobKind,
     /// 正在传输时的任务。
-    task: Option<AbortHandle>,
+    task: Option<Cancellation>,
     /// 本会话内因文件连接断开而重试的次数。
     retries: u32,
+    attempt: u64,
+    retry_at: Instant,
+    committed: bool,
+    cancelled_by_peer: bool,
+}
+
+/// 网络等待可立即取消；阻塞的复制/提交协作退出，结束前不会清理它正在使用的目录。
+#[derive(Clone, Default)]
+pub(crate) struct Cancellation(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    // 0：运行；1：断线；2：取消；3：已提交，之后的取消不能撤销成功。
+    state: AtomicU8,
+    changed: Notify,
+}
+
+impl Cancellation {
+    fn request(&self, state: u8) -> bool {
+        let mut old = self.0.state.load(Ordering::Acquire);
+        loop {
+            if old == 3 {
+                return false;
+            }
+            match self.0.state.compare_exchange_weak(
+                old,
+                old.max(state),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.0.changed.notify_waiters();
+                    return true;
+                }
+                Err(now) => old = now,
+            }
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<(), Stop> {
+        match self.0.state.load(Ordering::Acquire) {
+            1 => Err(Stop::Net("文件连接已关闭".into())),
+            2 => Err(Stop::Cancelled),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn commit(&self) -> Result<(), Stop> {
+        match self
+            .0
+            .state
+            .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(3) => Ok(()),
+            Err(_) => self.check(),
+        }
+    }
+
+    /// 原子改名已经成功：取消不能撤销已经公开的用户文件。
+    pub(crate) fn published(&self) {
+        self.0.state.store(3, Ordering::Release);
+    }
+
+    pub(crate) async fn wait<T>(&self, work: impl Future<Output = T>) -> Result<T, Stop> {
+        let stopped = async {
+            loop {
+                let changed = self.0.changed.notified();
+                if let Err(stop) = self.check() {
+                    return stop;
+                }
+                changed.await;
+            }
+        };
+        tokio::select! {
+            biased;
+            stop = stopped => Err(stop),
+            result = work => Ok(result),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -139,11 +233,19 @@ pub(crate) enum Stop {
     Net(String),
     /// 出错了，不再继续。
     Fail(String),
+    Cancelled,
 }
 
 impl From<ferry_net::Error> for Stop {
     fn from(e: ferry_net::Error) -> Self {
-        Self::Net(e.to_string())
+        match e {
+            ferry_net::Error::Decode(_)
+            | ferry_net::Error::Encode(_)
+            | ferry_net::Error::UnexpectedMessage { .. } => {
+                Self::Fail("对方的文件传输消息不符合协议".into())
+            }
+            _ => Self::Net(e.to_string()),
+        }
     }
 }
 
@@ -155,14 +257,126 @@ impl From<Error> for Stop {
 
 impl Files {
     /// 收到的文件放在 `store` 的下载目录，接收中的部分放在它的 `partial/`。
-    pub fn new(store: &Store, events: Events) -> Self {
-        Self {
+    pub fn new(store: &Store, events: Events, commit: Arc<dyn FileCommit>) -> Self {
+        let files = Self {
             inner: Arc::new(Inner {
                 partial: store.partial_dir(),
                 downloads: store.downloads_dir(),
                 events,
                 state: Mutex::new(State::default()),
+                commit,
+                scans: Arc::new(Semaphore::new(2)),
+                rate: FileRateLimit::default(),
+                cleanup: Arc::new(Semaphore::new(1)),
             }),
+        };
+        files.schedule_cleanup();
+        files.maintain_receipts();
+        files
+    }
+
+    /// 所有设备、所有文件发送任务共用的上限，单位字节/秒，0 不限。立即影响排队中的任务。
+    pub fn set_rate_limit(&self, bytes_per_second: u64) {
+        self.inner.rate.set(bytes_per_second);
+    }
+
+    pub fn rate_limit(&self) -> u64 {
+        self.inner.rate.get()
+    }
+
+    /// 清理超过7天或最近1024份之外的已完成回执。窗口以先到者为准。
+    /// 活动任务、含未完成意图或内容的目录不清理；不删除下载目录中的文件。
+    pub async fn prune_receipts(&self) -> std::result::Result<usize, String> {
+        let Ok(permit) = self.inner.cleanup.clone().try_acquire_owned() else {
+            return Ok(0);
+        };
+        let files = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut candidates = Vec::new();
+            let peers = match std::fs::read_dir(&files.inner.partial) {
+                Ok(peers) => peers,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(_) => return Err("无法读取完成回执缓存".into()),
+            };
+            for peer in peers.flatten() {
+                if !peer.file_type().is_ok_and(|ty| ty.is_dir()) {
+                    continue;
+                }
+                let Ok(fingerprint) = peer.file_name().to_string_lossy().parse::<Fingerprint>()
+                else {
+                    continue;
+                };
+                let Ok(entries) = std::fs::read_dir(peer.path()) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if !entry.file_type().is_ok_and(|ty| ty.is_dir()) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if path.join("data").exists() || path.join(commit::INTENT).exists() {
+                        continue;
+                    }
+                    if let Some(at) = commit::completed_at(&path) {
+                        candidates.push((at, fingerprint, entry.file_name(), path));
+                    }
+                }
+            }
+            candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.3.cmp(&b.3)));
+            let now = commit::now();
+            let mut removed = 0;
+            for (index, (at, peer, name, path)) in candidates.into_iter().enumerate() {
+                if index < MAX_RECEIPTS && now.saturating_sub(at) < RECEIPT_TTL {
+                    continue;
+                }
+                // 和新任务登记互斥：清理检查后不会突然出现读取这份回执的新任务。
+                let state = files.lock();
+                let active = state
+                    .jobs
+                    .iter()
+                    .any(|(id, job)| job.peer == peer && id.to_string() == name.to_string_lossy());
+                if active || path.join("data").exists() || path.join(commit::INTENT).exists() {
+                    continue;
+                }
+                if std::fs::remove_file(path.join(commit::RECEIPT)).is_ok() {
+                    let _ = std::fs::remove_file(path.join("state"));
+                    let _ = std::fs::remove_dir(&path);
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })
+        .await
+        .map_err(|_| "清理完成回执时出错".to_owned())?
+    }
+
+    fn schedule_cleanup(&self) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let files = self.clone();
+            runtime.spawn(async move {
+                if let Err(error) = files.prune_receipts().await {
+                    warn!(%error, "完成回执清理失败");
+                }
+            });
+        }
+    }
+
+    fn maintain_receipts(&self) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let inner = Arc::downgrade(&self.inner);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    let Some(inner) = inner.upgrade() else {
+                        break;
+                    };
+                    let files = Files { inner };
+                    if let Err(error) = files.prune_receipts().await {
+                        warn!(%error, "完成回执定时清理失败");
+                    }
+                }
+            });
         }
     }
 
@@ -174,14 +388,29 @@ impl Files {
             return Err(Error::NotConnected);
         }
         let id = new_id()?;
-        let plan = tokio::task::spawn_blocking(move || manifest::build(id, &paths))
-            .await
-            .map_err(|_| Error::Transfer("整理要发送的文件时出错".into()))?
-            .map_err(Error::Transfer)?;
+        self.check_budget(peer)?;
+        let permit = self
+            .inner
+            .scans
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Transfer("正在整理其他文件，请稍后再试".into()))?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _scan = ScanGuard(cancelled.clone());
+        let plan = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manifest::build(id, &paths, &cancelled)
+        })
+        .await
+        .map_err(|_| Error::Transfer("整理要发送的文件时出错".into()))?
+        .map_err(Error::Transfer)?;
         let plan = Arc::new(plan);
         let offer = plan.offer();
         {
             let mut state = self.lock();
+            if !within_budget(&state, peer) {
+                return Err(Error::Transfer("正在传输的任务太多，请稍后再试".into()));
+            }
             let Some(tx) = state.tx(&peer) else {
                 return Err(Error::NotConnected);
             };
@@ -193,6 +422,10 @@ impl Files {
                     kind: JobKind::Send(plan.clone()),
                     task: None,
                     retries: 0,
+                    attempt: 0,
+                    retry_at: Instant::now() + OPEN_WAIT,
+                    committed: false,
+                    cancelled_by_peer: false,
                 },
             );
         }
@@ -203,6 +436,7 @@ impl Files {
             "准备发送文件"
         );
         self.emit(JobKind::Send(plan).update(peer, 0, TransferState::Waiting));
+        self.watch(id);
         Ok(id)
     }
 
@@ -214,6 +448,14 @@ impl Files {
     /// 取消一次传输。对方会收到通知；接收方删掉已收到的部分。
     pub fn cancel(&self, id: TransferId) {
         self.stop(id, false);
+    }
+
+    fn check_budget(&self, peer: Fingerprint) -> Result<()> {
+        if within_budget(&self.lock(), peer) {
+            Ok(())
+        } else {
+            Err(Error::Transfer("正在传输的任务太多，请稍后再试".into()))
+        }
     }
 
     /// 与 `peer` 连上一条数据连接。之前没传给它的发送任务立即重新通告，接着传。
@@ -238,12 +480,16 @@ impl Files {
                 .jobs
                 .values_mut()
                 .filter(|job| job.peer == peer)
-                .filter_map(|job| match &job.kind {
-                    JobKind::Send(plan) => {
-                        job.retries = 0;
-                        Some(plan.clone())
+                .filter_map(|job| {
+                    job.retries = 0;
+                    job.retry_at = Instant::now() + RETRY_DELAY;
+                    match &job.kind {
+                        JobKind::Send(plan) => {
+                            job.retries = 0;
+                            Some(plan.clone())
+                        }
+                        JobKind::Receive(_) => None,
                     }
-                    JobKind::Receive(_) => None,
                 })
                 .collect();
             (generation, resumed)
@@ -275,10 +521,9 @@ impl Files {
 
     /// 这次传输是不是和 `peer` 之间的。
     fn belongs(&self, id: TransferId, peer: Fingerprint) -> bool {
-        self.lock()
-            .jobs
-            .get(&id)
-            .is_some_and(|job| job.peer == peer)
+        let state = self.lock();
+        state.jobs.get(&id).is_some_and(|job| job.peer == peer)
+            || state.cancelled.contains(&(id, peer))
     }
 
     /// 服务端收到 `peer` 的一条文件连接（握手已完成）：等它说明是哪次传输，再开始收发。
@@ -305,34 +550,67 @@ impl Files {
                 return;
             }
             let worker = files.clone();
-            files.launch(id, async move { worker.run(id, framed).await });
+            files.launch(id, move |cancel| async move {
+                worker.run(id, framed, cancel).await
+            });
         });
     }
 
     fn on_offer(&self, peer: Fingerprint, offer: FileOffer) {
         let id = offer.id;
-        let (tx, opener) = {
+        let (tx, opener, new) = {
             let mut state = self.lock();
-            if state.jobs.contains_key(&id) {
-                return;
-            }
             let Some(link) = state.links.get(&peer) else {
                 return;
             };
             let found = (link.tx.clone(), link.opener.clone());
-            state.jobs.insert(
-                id,
-                Job {
-                    peer,
-                    kind: JobKind::Receive(offer.clone()),
-                    task: None,
-                    retries: 0,
-                },
-            );
-            found
+            if state.cancelled.contains(&(id, peer)) {
+                let _ = found.0.send(Message::FileCancel(FileCancel {
+                    id,
+                    reason: CancelReason::CANCELLED,
+                }));
+                return;
+            }
+            if let Some(job) = state.jobs.get(&id) {
+                if job.peer != peer || !matches!(&job.kind, JobKind::Receive(old) if *old == offer)
+                {
+                    let _ = found.0.send(Message::FileCancel(FileCancel {
+                        id,
+                        reason: CancelReason::UNAVAILABLE,
+                    }));
+                    return;
+                }
+                // 相同通告可以重发：重新确认，正在运行的任务不会启动第二份。
+                (found.0, found.1, false)
+            } else {
+                if !within_budget(&state, peer) {
+                    let _ = found.0.send(Message::FileCancel(FileCancel {
+                        id,
+                        reason: CancelReason::UNAVAILABLE,
+                    }));
+                    return;
+                }
+                state.jobs.insert(
+                    id,
+                    Job {
+                        peer,
+                        kind: JobKind::Receive(offer.clone()),
+                        task: None,
+                        retries: 0,
+                        attempt: 0,
+                        retry_at: Instant::now() + OPEN_WAIT,
+                        committed: false,
+                        cancelled_by_peer: false,
+                    },
+                );
+                (found.0, found.1, true)
+            }
         };
-        info!(name = %mark::file(&offer.name), files = offer.files, bytes = offer.bytes, "对方发来文件，开始接收");
-        self.emit(JobKind::Receive(offer).update(peer, 0, TransferState::Waiting));
+        if new {
+            info!(name = %mark::file(&offer.name), files = offer.files, bytes = offer.bytes, "对方发来文件，开始接收");
+            self.emit(JobKind::Receive(offer).update(peer, 0, TransferState::Waiting));
+            self.watch(id);
+        }
         let _ = tx.send(Message::FileAccept { id });
         if let Some(opener) = opener {
             self.open_and_run(id, opener);
@@ -359,14 +637,19 @@ impl Files {
     /// 客户端：打开文件连接并开始收发。
     fn open_and_run(&self, id: TransferId, opener: Opener) {
         let files = self.clone();
-        self.launch(id, async move {
-            let mut framed = opener().await?;
-            framed.send(&Message::FileOpen { id }).await?;
-            files.run(id, framed).await
+        self.launch(id, move |cancel| async move {
+            let mut framed = cancel.wait(opener()).await??;
+            send::send(&mut framed, &Message::FileOpen { id }, &cancel).await?;
+            files.run(id, framed, cancel).await
         });
     }
 
-    async fn run<S>(&self, id: TransferId, mut framed: Framed<S>) -> Result<Vec<PathBuf>, Stop>
+    async fn run<S>(
+        &self,
+        id: TransferId,
+        mut framed: Framed<S>,
+        cancel: Cancellation,
+    ) -> Result<Vec<PathBuf>, Stop>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -380,14 +663,18 @@ impl Files {
         };
         let mut progress = Progress::new(self.inner.events.clone(), peer, kind.clone());
         match &kind {
-            JobKind::Send(plan) => send::run(&mut framed, plan, &mut progress).await,
+            JobKind::Send(plan) => {
+                send::run(&mut framed, plan, &mut progress, &cancel, &self.inner.rate).await
+            }
             JobKind::Receive(offer) => {
                 receive::run(
                     &mut framed,
                     offer,
-                    &self.inner.partial,
+                    &self.inner.partial.join(peer.to_hex()),
                     &self.inner.downloads,
                     &mut progress,
+                    self.inner.commit.clone(),
+                    &cancel,
                 )
                 .await
             }
@@ -397,33 +684,46 @@ impl Files {
     /// 在后台运行一次传输，结束后交给 [`Files::finish`]。
     ///
     /// 任务先记下自己的句柄再开工，取消时一定能找到它。
-    fn launch<F>(&self, id: TransferId, work: F)
+    fn launch<F>(&self, id: TransferId, work: impl FnOnce(Cancellation) -> F + Send + 'static)
     where
         F: Future<Output = Result<Vec<PathBuf>, Stop>> + Send + 'static,
     {
-        let (go, ready) = oneshot::channel::<()>();
-        let files = self.clone();
-        let handle = tokio::spawn(async move {
-            if ready.await.is_err() {
-                return;
-            }
-            let outcome = work.await;
-            files.finish(id, outcome);
-        });
-        {
+        let cancel = Cancellation::default();
+        let attempt = {
             let mut state = self.lock();
-            match state.jobs.get_mut(&id) {
-                Some(job) if job.task.is_none() => job.task = Some(handle.abort_handle()),
-                _ => {
-                    handle.abort();
-                    return;
-                }
-            }
-        }
-        let _ = go.send(());
+            let Some(job) = state.jobs.get_mut(&id).filter(|job| job.task.is_none()) else {
+                return;
+            };
+            job.attempt += 1;
+            job.task = Some(cancel.clone());
+            job.attempt
+        };
+        let files = self.clone();
+        tokio::spawn(async move {
+            let outcome = work(cancel).await;
+            files.finish(id, attempt, outcome);
+        });
     }
 
-    fn finish(&self, id: TransferId, outcome: Result<Vec<PathBuf>, Stop>) {
+    fn finish(&self, id: TransferId, attempt: u64, outcome: Result<Vec<PathBuf>, Stop>) {
+        let cancelled = {
+            let mut state = self.lock();
+            let Some(job) = state.jobs.get_mut(&id).filter(|j| j.attempt == attempt) else {
+                return;
+            };
+            job.committed |= job
+                .task
+                .as_ref()
+                .is_some_and(|c| c.0.state.load(Ordering::Acquire) == 3);
+            job.task
+                .as_ref()
+                .is_some_and(|c| matches!(c.check(), Err(Stop::Cancelled)))
+        };
+        let outcome = if cancelled {
+            Err(Stop::Cancelled)
+        } else {
+            outcome
+        };
         match outcome {
             Ok(saved) => {
                 let Some(job) = self.lock().jobs.remove(&id) else {
@@ -441,36 +741,34 @@ impl Files {
                     job.kind
                         .update(job.peer, total, TransferState::Done { saved }),
                 );
+                self.schedule_cleanup();
             }
             Err(Stop::Net(reason)) => {
-                let (peer, kind, retry) = {
+                let (peer, kind, exhausted) = {
                     let mut state = self.lock();
                     let Some(peer) = state.jobs.get(&id).map(|job| job.peer) else {
                         return;
                     };
-                    let tx = state.tx(&peer);
+                    let online = state.links.contains_key(&peer);
                     let Some(job) = state.jobs.get_mut(&id) else {
                         return;
                     };
                     job.task = None;
                     let kind = job.kind.clone();
-                    let retry = match (&kind, tx) {
-                        (JobKind::Send(plan), Some(tx)) if job.retries < MAX_RETRIES => {
-                            job.retries += 1;
-                            Some((tx, plan.offer()))
-                        }
-                        _ => None,
-                    };
-                    if matches!(kind, JobKind::Receive(_)) {
-                        // 发送方会用同一个编号重新通告，届时再接着收。
-                        state.jobs.remove(&id);
+                    if online {
+                        job.retries += 1;
                     }
-                    (peer, kind, retry)
+                    job.retry_at = Instant::now() + RETRY_DELAY;
+                    (peer, kind, online && job.retries > MAX_RETRIES)
                 };
                 warn!(%reason, "文件传输中断");
                 self.emit(kind.update(peer, 0, TransferState::Interrupted));
-                if let Some((tx, offer)) = retry {
-                    let _ = tx.send(Message::FileOffer(offer));
+                if exhausted {
+                    self.finish(
+                        id,
+                        attempt,
+                        Err(Stop::Fail("文件连接多次失败，请重新发送".into())),
+                    );
                 }
             }
             Err(Stop::Fail(reason)) => {
@@ -492,30 +790,50 @@ impl Files {
                     let _ = tx.send(Message::FileCancel(cancel));
                 }
                 if matches!(job.kind, JobKind::Receive(_)) {
-                    self.discard_partial(id);
+                    self.discard_partial(job.peer, id);
                 }
                 self.emit(
                     job.kind
                         .update(job.peer, 0, TransferState::Failed { reason }),
                 );
             }
+            Err(Stop::Cancelled) => {
+                let Some(job) = self.lock().jobs.remove(&id) else {
+                    return;
+                };
+                self.finish_cancel(id, job.peer, job.kind, job.cancelled_by_peer);
+            }
         }
     }
 
     /// 停止并忘掉一次传输。`by_peer` 表示是对方取消的，不必再通知对方。
     fn stop(&self, id: TransferId, by_peer: bool) {
-        let (job, tx) = {
+        let (peer, kind, working, tx) = {
             let mut state = self.lock();
-            let job = state.jobs.remove(&id);
-            let tx = job.as_ref().and_then(|job| state.tx(&job.peer));
-            (job, tx)
+            let Some(job) = state.jobs.get(&id) else {
+                return;
+            };
+            if job.committed {
+                return;
+            }
+            if job.task.as_ref().is_some_and(|task| !task.request(2)) {
+                return;
+            }
+            let peer = job.peer;
+            let kind = job.kind.clone();
+            let working = job.task.is_some();
+            let tx = state.tx(&peer);
+            if !working {
+                state.jobs.remove(&id);
+            } else if let Some(job) = state.jobs.get_mut(&id) {
+                job.cancelled_by_peer = by_peer;
+            }
+            state.cancelled.push_back((id, peer));
+            while state.cancelled.len() > MAX_CANCELLED {
+                state.cancelled.pop_front();
+            }
+            (peer, kind, working, tx)
         };
-        let Some(job) = job else {
-            return;
-        };
-        if let Some(task) = &job.task {
-            task.abort();
-        }
         if !by_peer && let Some(tx) = tx {
             let cancel = FileCancel {
                 id,
@@ -523,14 +841,9 @@ impl Files {
             };
             let _ = tx.send(Message::FileCancel(cancel));
         }
-        if matches!(job.kind, JobKind::Receive(_)) {
-            self.discard_partial(id);
+        if !working {
+            self.finish_cancel(id, peer, kind, by_peer);
         }
-        info!(%id, by_peer, "文件传输已取消");
-        self.emit(
-            job.kind
-                .update(job.peer, 0, TransferState::Cancelled { by_peer }),
-        );
     }
 
     /// 与 `peer` 的数据连接断开：停下和它之间正在进行的传输。发送任务留着，下次连上接着传。
@@ -545,21 +858,17 @@ impl Files {
                 return;
             }
             state.links.remove(&peer);
-            let stopped = state
+            state
                 .jobs
                 .values_mut()
                 .filter(|job| job.peer == peer)
                 .map(|job| {
-                    if let Some(task) = job.task.take() {
-                        task.abort();
+                    if let Some(task) = &job.task {
+                        task.request(1);
                     }
                     job.kind.clone()
                 })
-                .collect();
-            state
-                .jobs
-                .retain(|_, job| job.peer != peer || matches!(job.kind, JobKind::Send(_)));
-            stopped
+                .collect()
         };
         for kind in stopped {
             self.emit(kind.update(peer, 0, TransferState::Interrupted));
@@ -567,11 +876,108 @@ impl Files {
     }
 
     /// 删掉一次接收已经收到的部分。
-    fn discard_partial(&self, id: TransferId) {
-        let dir = self.inner.partial.join(id.to_string());
+    fn discard_partial(&self, peer: Fingerprint, id: TransferId) {
+        let dir = self.inner.partial.join(peer.to_hex()).join(id.to_string());
         tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(dir);
+            // 已完成回执是幂等性的依据，后续错误或迟到取消不能删除它。
+            if !dir.join("committed.json").exists() && !dir.join(commit::INTENT).exists() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
         });
+    }
+
+    fn finish_cancel(&self, id: TransferId, peer: Fingerprint, kind: JobKind, by_peer: bool) {
+        let dir = self.inner.partial.join(peer.to_hex()).join(id.to_string());
+        let events = self.inner.events.clone();
+        let platform = self.inner.commit.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = TransferState::Cancelled { by_peer };
+            if matches!(kind, JobKind::Receive(_))
+                && dir.join(commit::INTENT).exists()
+                && !matches!(commit::abandon(&dir, &*platform), Ok(true))
+            {
+                state = TransferState::Failed {
+                    reason: "传输已停止，但已有提交记录需恢复；内容已安全保留".into(),
+                };
+            }
+            if matches!(kind, JobKind::Receive(_))
+                && !dir.join("committed.json").exists()
+                && !dir.join(commit::INTENT).exists()
+                && let Err(e) = std::fs::remove_dir_all(dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                state = TransferState::Failed {
+                    reason: "传输已停止，但无法删除接收缓存，请检查写入权限".into(),
+                };
+            }
+            info!(%id, by_peer, "文件传输已停止并完成清理");
+            events.emit(Event::Transfer(kind.update(peer, 0, state)));
+        });
+    }
+
+    /// 等待确认/文件连接也有期限；双方都能重试，重复消息不会生成第二个工作任务。
+    fn watch(&self, id: TransferId) {
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(RETRY_DELAY).await;
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                let files = Files { inner };
+                if !files.retry(id) {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn retry(&self, id: TransferId) -> bool {
+        let action = {
+            let mut state = self.lock();
+            let Some(job) = state.jobs.get(&id) else {
+                return false;
+            };
+            if job.task.is_some() || Instant::now() < job.retry_at {
+                return true;
+            }
+            let peer = job.peer;
+            let Some(link) = state.links.get(&peer) else {
+                return true;
+            };
+            let (tx, opener) = (link.tx.clone(), link.opener.clone());
+            let job = state.jobs.get_mut(&id).expect("刚刚找到任务");
+            if job.retries > MAX_RETRIES {
+                Some((job.attempt, None, None))
+            } else {
+                job.retries += 1;
+                job.retry_at = Instant::now() + OPEN_WAIT;
+                let message = match &job.kind {
+                    JobKind::Send(plan) => Message::FileOffer(plan.offer()),
+                    JobKind::Receive(_) => Message::FileAccept { id },
+                };
+                let opener = matches!(job.kind, JobKind::Receive(_))
+                    .then_some(opener)
+                    .flatten();
+                Some((job.attempt, Some((tx, message)), opener))
+            }
+        };
+        if let Some((attempt, message, opener)) = action {
+            match message {
+                Some((tx, message)) => {
+                    let _ = tx.send(message);
+                }
+                None => self.finish(
+                    id,
+                    attempt,
+                    Err(Stop::Fail("对方没有开始文件传输，请重新发送".into())),
+                ),
+            }
+            if let Some(opener) = opener {
+                self.open_and_run(id, opener);
+            }
+        }
+        true
     }
 
     fn emit(&self, update: TransferUpdate) {
@@ -657,4 +1063,17 @@ fn new_id() -> Result<TransferId> {
         .fill(&mut id)
         .map_err(|_| Error::Transfer("系统随机数不可用".into()))?;
     Ok(TransferId(id))
+}
+
+fn within_budget(state: &State, peer: Fingerprint) -> bool {
+    state.jobs.len() < MAX_JOBS
+        && state.jobs.values().filter(|job| job.peer == peer).count() < MAX_PEER_JOBS
+}
+
+struct ScanGuard(Arc<AtomicBool>);
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }

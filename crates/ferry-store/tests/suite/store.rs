@@ -109,7 +109,7 @@ fn config_defaults_until_saved_then_round_trips() {
     store.save_config(&config).unwrap();
     let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
     assert!(
-        text.starts_with("schema_version = 6\n"),
+        text.starts_with("schema_version = 7\n"),
         "第一行必须是 schema_version：{text}"
     );
     assert_eq!(store.config().unwrap(), config);
@@ -133,10 +133,10 @@ fn config_tolerates_missing_and_unknown_fields() {
 fn config_from_a_newer_version_is_refused() {
     let dir = TempDir::new();
     let store = Store::open(dir.path()).unwrap();
-    fs::write(dir.path().join("config.toml"), "schema_version = 7\n").unwrap();
+    fs::write(dir.path().join("config.toml"), "schema_version = 8\n").unwrap();
     assert!(matches!(
         store.config(),
-        Err(Error::TooNew { found: 7, .. })
+        Err(Error::TooNew { found: 8, .. })
     ));
 }
 
@@ -177,7 +177,7 @@ fn a_version_1_config_reads_as_version_2_with_an_empty_layout() {
     };
     store.save_config(&config).unwrap();
     let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
-    assert!(text.starts_with("schema_version = 6\n"), "{text}");
+    assert!(text.starts_with("schema_version = 7\n"), "{text}");
     assert!(text.contains("[[layout]]"), "{text}");
     assert_eq!(store.config().unwrap(), config);
 }
@@ -280,7 +280,7 @@ fn a_version_3_config_with_the_swap_off_makes_every_paired_device_plain() {
     // 写回之后是版本 4，旧字段不再出现，读回来一样。
     store.save_config(&config).unwrap();
     let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
-    assert!(text.starts_with("schema_version = 6\n"), "{text}");
+    assert!(text.starts_with("schema_version = 7\n"), "{text}");
     assert!(!text.contains("swap_cmd_ctrl"), "{text}");
     assert!(text.contains("[[devices]]"), "{text}");
     assert_eq!(store.config().unwrap(), config);
@@ -387,4 +387,26 @@ fn the_update_state_round_trips_and_is_empty_when_missing_or_broken() {
         UpdateState::default(),
         "只是缓存，读不懂就当没有"
     );
+}
+
+#[test]
+fn version_six_migration_preserves_settings_and_disables_new_optimizations() {
+    let dir = TempDir::new();
+    let store = Store::open(dir.path()).unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        r#"schema_version = 6
+name = "desktop"
+clipboard = false
+mouse_dpi = 2400
+"#,
+    )
+    .unwrap();
+    let config = store.config().unwrap();
+    assert_eq!(config.schema_version, ferry_types::Config::SCHEMA_VERSION);
+    assert_eq!(config.name, "desktop");
+    assert!(!config.clipboard);
+    assert_eq!(config.mouse_dpi, 2400);
+    assert_eq!(config.file_rate_limit_mbps, 0);
+    assert!(!config.coalesce_motion);
 }

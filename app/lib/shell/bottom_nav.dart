@@ -16,7 +16,7 @@ class BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.navigation});
     final c = SfColors.of(context);
     final index = navIndexOf(state.page);
     return Container(

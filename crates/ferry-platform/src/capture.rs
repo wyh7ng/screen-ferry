@@ -1,5 +1,7 @@
 //! 输入捕获：定义 `InputCapture` trait。
 
+use std::time::Instant;
+
 use ferry_types::{KeyAction, KeyCode, LockKeys, MouseButton, Point};
 
 use crate::error::Result;
@@ -34,6 +36,8 @@ pub enum CaptureEvent {
 /// 处理方靠 `grabbed` 判断它当时是交给了本机还是被吞掉了，和现在的状态对不上就是过时的。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Captured {
+    /// 本机捕获回调开始时刻，仅用于本机排队统计，不发送到对端。
+    pub captured_at: Instant,
     pub event: CaptureEvent,
     /// 事件发生时是否处于抓取状态：为真时本机没有收到它，光标也没有动。
     pub grabbed: bool,

@@ -64,7 +64,7 @@ class _AddressDialogState extends State<AddressDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.dial, AppAspect.connection, AppAspect.local});
     final c = SfColors.of(context);
     final dial = state.dial?.invite == widget.invite ? state.dial : null;
     final connecting = dial != null && !dial.done;

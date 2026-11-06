@@ -26,3 +26,23 @@ fn invalid_utf8_is_not_text() {
     assert_eq!(content.as_text(), None);
     assert!(!content.is_empty());
 }
+
+#[test]
+fn cloned_contents_share_bytes_and_format_removal_is_independent() {
+    use std::sync::Arc;
+    let mut original = ClipboardContent::text("plain");
+    original.insert(ClipboardFormat::PNG, vec![7; 1024]);
+    let image = original.get_shared(ClipboardFormat::PNG).unwrap();
+    let mut peer = original.clone();
+    assert!(Arc::ptr_eq(
+        &image,
+        &peer.get_shared(ClipboardFormat::PNG).unwrap()
+    ));
+    let removed = peer.remove_shared(ClipboardFormat::PNG).unwrap();
+    assert!(Arc::ptr_eq(&image, &removed));
+    assert!(peer.get(ClipboardFormat::PNG).is_none());
+    assert_eq!(original.get(ClipboardFormat::PNG), Some(&vec![7; 1024][..]));
+    let mut owned = original.remove(ClipboardFormat::PNG).unwrap();
+    owned[0] = 8;
+    assert_eq!(image[0], 7, "兼容的可变Vec API也不能改变共享原图");
+}

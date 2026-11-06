@@ -14,11 +14,11 @@ use crate::error::{Error, Result};
 pub const DEFAULT_PORT: u16 = 24810;
 
 /// 本机声明的可选能力。`command_key`：本机的快捷键以 Command 键为主。
-pub(crate) fn capabilities(clipboard: bool, command_key: bool) -> Capabilities {
-    let mut caps = Capabilities::FILES
-        | Capabilities::EDGE_DROP
-        | Capabilities::REMOTE_SETTINGS
-        | Capabilities::APP_INFO;
+pub(crate) fn capabilities(clipboard: bool, files: bool, command_key: bool) -> Capabilities {
+    let mut caps = Capabilities::REMOTE_SETTINGS | Capabilities::APP_INFO;
+    if files {
+        caps |= Capabilities::FILES | Capabilities::EDGE_DROP;
+    }
     if clipboard {
         caps |= Capabilities::CLIPBOARD;
     }

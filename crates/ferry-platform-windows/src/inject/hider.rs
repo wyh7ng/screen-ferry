@@ -8,19 +8,19 @@
 //! 调用方紧接着注入的移动必须排在后面，否则光标刚移到入口，又被挪回屏幕中央。
 
 use std::cell::Cell;
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 use ferry_platform::{Error, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetSystemMetrics, HWND_TOPMOST, KillTimer, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SM_CXCURSOR, SM_CXSCREEN, SM_CYCURSOR, SM_CYSCREEN, SMTO_ABORTIFHUNG, SW_HIDE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetCursorPos, SetTimer, SetWindowPos,
-    ShowWindow, TranslateMessage, WM_APP, WM_DESTROY, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
+    CreateCursor, CreateWindowExW, DefWindowProcW, DestroyCursor, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetMessageW, GetSystemMetrics, HWND_TOPMOST, KillTimer, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, SM_CXCURSOR, SM_CXSCREEN, SM_CYCURSOR, SM_CYSCREEN,
+    SMTO_ABORTIFHUNG, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetCursorPos,
+    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_DESTROY, WM_TIMER, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WindowFromPoint,
 };
 use windows::core::w;
 
@@ -127,34 +127,8 @@ fn create_window() -> Result<HWND> {
     // SAFETY: 参数都是有效的常量、刚取得的句柄或在调用期间有效的缓冲区。
     unsafe {
         let instance = GetModuleHandleW(None).map_err(|e| os("GetModuleHandleW", e))?;
-        let (width, height) = (
-            GetSystemMetrics(SM_CXCURSOR).max(1),
-            GetSystemMetrics(SM_CYCURSOR).max(1),
-        );
-        // 单色位图每行按 16 位对齐。AND 全 1、XOR 全 0：每个像素都透明。
-        let stride = (width as usize).div_ceil(16) * 2;
-        let and_mask = vec![0xFF_u8; stride * height as usize];
-        let xor_mask = vec![0_u8; stride * height as usize];
-        let blank = CreateCursor(
-            Some(instance.into()),
-            0,
-            0,
-            width,
-            height,
-            and_mask.as_ptr().cast(),
-            xor_mask.as_ptr().cast(),
-        )
-        .map_err(|e| os("CreateCursor", e))?;
-
+        register_class()?;
         let class = w!("ScreenFerryCursorHider");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(window_proc),
-            hInstance: instance.into(),
-            hCursor: blank,
-            lpszClassName: class,
-            ..Default::default()
-        };
-        RegisterClassW(&wc);
         CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class,
@@ -171,6 +145,51 @@ fn create_window() -> Result<HWND> {
         )
         .map_err(|e| os("CreateWindowExW", e))
     }
+}
+
+/// 类和透明光标属于进程：重复启停共享时复用，不为已注册的类继续创建光标。
+fn register_class() -> Result<()> {
+    static CLASS: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    let registered = CLASS.get_or_init(|| {
+        // SAFETY: 固定的类名、窗口过程和本进程模块；注册成功后光标由类使用至进程结束。
+        unsafe {
+            let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+            let (width, height) = (
+                GetSystemMetrics(SM_CXCURSOR).max(1),
+                GetSystemMetrics(SM_CYCURSOR).max(1),
+            );
+            let stride = (width as usize).div_ceil(16) * 2;
+            let and_mask = vec![0xFF_u8; stride * height as usize];
+            let xor_mask = vec![0_u8; stride * height as usize];
+            let blank = CreateCursor(
+                Some(instance.into()),
+                0,
+                0,
+                width,
+                height,
+                and_mask.as_ptr().cast(),
+                xor_mask.as_ptr().cast(),
+            )
+            .map_err(|e| e.to_string())?;
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                hCursor: blank,
+                lpszClassName: w!("ScreenFerryCursorHider"),
+                ..Default::default()
+            };
+            if RegisterClassW(&wc) == 0 {
+                let error = windows::core::Error::from_thread();
+                let _ = DestroyCursor(blank);
+                return Err(error.to_string());
+            }
+            Ok(())
+        }
+    });
+    registered.as_ref().copied().map_err(|detail| Error::Os {
+        call: "RegisterClassW",
+        detail: detail.clone(),
+    })
 }
 
 unsafe extern "system" fn window_proc(

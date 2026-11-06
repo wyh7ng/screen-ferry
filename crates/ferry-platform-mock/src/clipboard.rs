@@ -16,6 +16,7 @@ struct State {
     content: ClipboardContent,
     count: u64,
     writes: usize,
+    reads: usize,
 }
 
 impl MockClipboard {
@@ -40,6 +41,11 @@ impl MockClipboard {
         self.lock().writes
     }
 
+    /// 被测代码读取系统剪贴板的次数（观察 content 不计入）。
+    pub fn reads(&self) -> usize {
+        self.lock().reads
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -60,7 +66,9 @@ impl Clipboard for MockClipboard {
     }
 
     fn read(&mut self) -> Result<ClipboardContent> {
-        Ok(self.lock().content.clone())
+        let mut state = self.lock();
+        state.reads += 1;
+        Ok(state.content.clone())
     }
 
     fn write(&mut self, content: &ClipboardContent) -> Result<u64> {

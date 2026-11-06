@@ -84,3 +84,24 @@ fn unique_skips_names_already_taken() {
     assert_eq!(unique("报告.pdf", |n| taken.contains(&n)), "报告 (3).pdf");
     assert_eq!(unique("新文件.txt", |n| taken.contains(&n)), "新文件.txt");
 }
+
+#[test]
+fn numbering_a_maximum_length_name_always_preserves_the_number() {
+    for name in [
+        "a".repeat(MAX_NAME_BYTES),
+        format!("{}.pdf", "文".repeat(83)),
+    ] {
+        let first = clean_name(&name);
+        let second = numbered(&first, 2);
+        let third = numbered(&first, 3);
+        assert!(second.len() <= MAX_NAME_BYTES);
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert!(second.contains(" (2)"));
+        assert_eq!(
+            unique(&first, |candidate| candidate == first
+                || candidate == second),
+            third
+        );
+    }
+}

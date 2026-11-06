@@ -80,7 +80,8 @@ pub(crate) fn run(options: Options) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let files = Files::new(&store, Events::none());
+    let files = Files::new(&store, Events::none(), file_committer());
+    files.set_rate_limit(u64::from(options.file_rate_limit_mbps) * 1_000_000);
     let result = runtime.block_on(async move {
         let work = async {
             match options.mode {
@@ -105,6 +106,9 @@ pub(crate) fn run(options: Options) -> ExitCode {
                             devices: Vec::new(),
                             fallback,
                             mouse_dpi: Config::default().mouse_dpi,
+                            input: ferry_engine::InputSettings {
+                                coalesce_motion: options.coalesce_motion,
+                            },
                         }
                         .fixed(),
                         name: options.name,
@@ -118,7 +122,7 @@ pub(crate) fn run(options: Options) -> ExitCode {
                         files,
                         edge: EdgeFeed::none(),
                     };
-                    serve(listen, config).await
+                    serve(listen, config, options.transport).await
                 }
                 Mode::Connect { server } => {
                     let config = ClientConfig {
@@ -136,7 +140,7 @@ pub(crate) fn run(options: Options) -> ExitCode {
                         commands: None,
                         invite_port: None,
                     };
-                    connect(config).await
+                    connect(config, options.transport).await
                 }
                 Mode::Resident { .. }
                 | Mode::Peers
@@ -216,9 +220,13 @@ fn resident(store: Store, autostart: bool) -> Result<(), Box<dyn std::error::Err
             });
             // 退出菜单或 Ctrl+C：引擎已经停下，主线程的事件循环随进程一起结束。
             match result {
-                Ok(()) => std::process::exit(0),
+                Ok(()) => {
+                    crate::logging::shutdown();
+                    std::process::exit(0)
+                }
                 Err(e) => {
                     error!("{e}");
+                    crate::logging::shutdown();
                     std::process::exit(1);
                 }
             }
@@ -311,80 +319,112 @@ fn forget(store: &Store, target: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[cfg(target_os = "macos")]
-async fn serve(listen: SocketAddr, config: ServerConfig) -> AppResult {
+async fn serve(
+    listen: SocketAddr,
+    config: ServerConfig,
+    transport: ferry_engine::Transport,
+) -> AppResult {
     use ferry_platform::Permissions;
     use ferry_platform_macos::{MacCapture, MacClipboard, MacDisplays, MacPermissions};
 
     MacPermissions.check_input()?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let (capture, clipboard) = (MacCapture::new(), MacClipboard::new());
-    let engine = ferry_engine::serve(
+    let engine = ferry_engine::serve_with_transport(
         listener,
         config,
         capture,
         MacDisplays,
         clipboard,
         TerminalConfirm,
+        transport,
     );
     Ok(engine.await?)
 }
 
 #[cfg(target_os = "windows")]
-async fn serve(listen: SocketAddr, config: ServerConfig) -> AppResult {
+async fn serve(
+    listen: SocketAddr,
+    config: ServerConfig,
+    transport: ferry_engine::Transport,
+) -> AppResult {
     use ferry_platform_windows::{WinCapture, WinClipboard, WinDisplays};
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let (capture, displays) = (WinCapture::new(), WinDisplays::new());
-    let engine = ferry_engine::serve(
+    let engine = ferry_engine::serve_with_transport(
         listener,
         config,
         capture,
         displays,
         WinClipboard::new(),
         TerminalConfirm,
+        transport,
     );
     Ok(engine.await?)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-async fn serve(_listen: SocketAddr, _config: ServerConfig) -> AppResult {
+async fn serve(
+    _listen: SocketAddr,
+    _config: ServerConfig,
+    _transport: ferry_engine::Transport,
+) -> AppResult {
     Err("目前只能在 macOS 和 Windows 上运行 serve".into())
 }
 
 #[cfg(target_os = "macos")]
-async fn connect(config: ClientConfig) -> AppResult {
+async fn connect(config: ClientConfig, transport: ferry_engine::Transport) -> AppResult {
     use ferry_platform::Permissions;
     use ferry_platform_macos::{MacClipboard, MacDisplays, MacInject, MacPermissions};
 
     MacPermissions.check_input()?;
-    let engine = ferry_engine::connect(
+    let engine = ferry_engine::connect_with_transport(
         config,
         MacInject::new()?,
         MacDisplays,
         MacClipboard::new(),
         TerminalConfirm,
+        transport,
     );
     Ok(engine.await?)
 }
 
 #[cfg(target_os = "windows")]
-async fn connect(config: ClientConfig) -> AppResult {
+async fn connect(config: ClientConfig, transport: ferry_engine::Transport) -> AppResult {
     use ferry_platform::Permissions;
     use ferry_platform_windows::{WinClipboard, WinDisplays, WinInject, WinPermissions};
 
     WinPermissions.check_input()?;
     let (inject, displays) = (WinInject::new(), WinDisplays::new());
-    let engine = ferry_engine::connect(
+    let engine = ferry_engine::connect_with_transport(
         config,
         inject,
         displays,
         WinClipboard::new(),
         TerminalConfirm,
+        transport,
     );
     Ok(engine.await?)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-async fn connect(_config: ClientConfig) -> AppResult {
+async fn connect(_config: ClientConfig, _transport: ferry_engine::Transport) -> AppResult {
     Err("目前只能在 macOS 和 Windows 上运行 connect".into())
+}
+
+/// 命令行模式与常驻模式使用相同的平台文件提交保证。
+fn file_committer() -> std::sync::Arc<dyn ferry_platform::FileCommit> {
+    #[cfg(target_os = "macos")]
+    {
+        std::sync::Arc::new(ferry_platform_macos::MacFileCommit)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::sync::Arc::new(ferry_platform_windows::WinFileCommit)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        unreachable!("当前平台不支持运行 ScreenFerry")
+    }
 }

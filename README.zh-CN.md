@@ -86,6 +86,12 @@ Windows 安装包：
 光标在对方屏幕上时，按 <kbd>Ctrl</kbd>+<kbd>Option</kbd>+<kbd>Esc</kbd>（Windows 控制时是 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd>）强制回到本机。
 使用前请退出其他键鼠共享软件，避免争抢键鼠。
 
+### 传输与响应
+
+设置中可限制所有文件发送的总速度（MB/s，十进制；0 表示不限速），以给键鼠和其他应用留出带宽。限速不能消除无线链路本身的抖动。
+“合并鼠标移动”默认关闭，开启后只合并积压的普通移动，按键、拖拽和切屏保持顺序。
+总览的性能统计显示最近采样窗内的本机阶段耗时与队列情况；分位数为近似值，RTT 不是输入到画面显示的延迟。
+
 ### 命令行
 
 | 命令 | 作用 |
@@ -116,6 +122,11 @@ cargo xtask bundle
 
 在哪个系统上运行就打哪个系统的包，产物在 `target/bundle/`：macOS 是 `ScreenFerry.app` 和它的更新包 `ScreenFerry-<版本>-macos-<架构>.zip`（加 `--dmg` 另做安装盘），Windows 是 `ScreenFerry-<版本>-windows-x64-setup.exe`。发布用 `cargo xtask release <版本>`，见 ADR 0014。
 macOS 上钥匙串里有 Developer ID 证书时自动签名（也可以用 `SCREENFERRY_SIGN_IDENTITY` 指定），否则用临时签名，每次重新打包都要重新授予辅助功能权限。
+
+### QUIC 输入实验（可选）
+
+默认构建与常驻应用继续使用 TCP。开发者可用 `cargo build -p ferry-daemon --features quic-experiment` 构建实验后台，再以 `serve/connect --transport quic` 运行；`--transport auto` 在建立连接失败时回退 TCP。`--quic-reliable-only` 可关闭位置数据报作对照。剪贴板和文件仍走 TCP。
+协议、配对、顺序屏障和命令示例见 [ADR 0017](docs/adr/0017-quic-input-experiment.md)。这是开发实验，尚无真实局域网延迟收益结论。
 
 ## 开发
 
@@ -158,6 +169,9 @@ cargo xtask lint
 | [docs/protocol.md](docs/protocol.md) | 线协议 |
 | [docs/ipc.md](docs/ipc.md) | 设置界面与后台之间的本机通信 |
 | [docs/adr/](docs/adr/) | 架构决策记录 |
+
+
+本分支修复了文件重名提交、连接恢复、配对会话和后台阻塞问题，说明见 [ADR 0015](docs/adr/0015-reliable-lifecycle-and-input-isolation.md)。设置界面与后台使用本机 IPC 3，需要同包升级；设备间仍使用线协议 1。升级时请重新发送尚未完成的文件任务。Mac 上 Caps Lock 的自定义对应目前只支持保留和不发送。
 
 ## 许可证
 

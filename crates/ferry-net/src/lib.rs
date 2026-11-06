@@ -16,7 +16,10 @@ mod error;
 mod framed;
 mod handshake;
 mod https;
+#[cfg(feature = "quic-experiment")]
+mod quic;
 mod tls;
+mod transport;
 
 pub use addresses::local_addresses;
 pub use error::{Error, Result};
@@ -24,3 +27,7 @@ pub use framed::Framed;
 pub use handshake::{accept, initiate};
 pub use https::{Downloaded, Https};
 pub use tls::{ClientStream, ServerStream, Tls};
+
+#[cfg(feature = "quic-experiment")]
+pub use quic::QuicListener;
+pub use transport::{Datagrams, Transport, TransportStream};

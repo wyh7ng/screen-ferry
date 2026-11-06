@@ -151,6 +151,10 @@ mod mac {
             MacOverlay::new()
         }
 
+        fn file_committer(&self) -> std::sync::Arc<dyn ferry_platform::FileCommit> {
+            std::sync::Arc::new(ferry_platform_macos::MacFileCommit)
+        }
+
         fn updater(&self) -> ferry_platform_macos::MacUpdater {
             ferry_platform_macos::MacUpdater::new()
         }
@@ -326,6 +330,10 @@ mod win {
 
         fn overlay(&self) -> WinOverlay {
             WinOverlay::new()
+        }
+
+        fn file_committer(&self) -> std::sync::Arc<dyn ferry_platform::FileCommit> {
+            std::sync::Arc::new(ferry_platform_windows::WinFileCommit)
         }
 
         fn updater(&self) -> ferry_platform_windows::WinUpdater {

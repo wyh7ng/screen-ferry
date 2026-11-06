@@ -6,6 +6,7 @@
 
 mod confirm;
 mod diagnostics;
+mod performance;
 mod record;
 mod runtime;
 mod ui;
@@ -57,6 +58,8 @@ pub trait Host: Send + Sync + 'static {
     fn overlay(&self) -> Self::Overlay;
     /// 自己更新（ADR 0014）。
     fn updater(&self) -> Self::Updater;
+    /// 文件或目录的原子不覆盖提交。
+    fn file_committer(&self) -> std::sync::Arc<dyn ferry_platform::FileCommit>;
     /// 更新清单从哪里取、用哪些公钥校验。
     fn update_source(&self) -> UpdateSource {
         UpdateSource::official()
@@ -175,6 +178,20 @@ pub fn control() -> (Control, Handle) {
 /// 启动时在 `store` 指定的位置写下 `ipc.json`，退出时删除。
 /// 只有无法启动（例如数据目录不可用）时返回错误；引擎出的问题报告给界面，过一会儿自动重试。
 pub async fn run<H: Host>(store: Store, host: H, mut control: Control) -> Result<()> {
+    // 从检查到发布 endpoint 都由进程锁保护。旧后台暂时忙碌也不会启动第二份。
+    let Some(instance) = store.try_lock_instance()? else {
+        for _ in 0..20 {
+            if hand_over_to_running(&store).await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "ScreenFerry 已在运行，但暂时没有响应",
+        )
+        .into());
+    };
     let (listener, endpoint) = Listener::bind().await?;
     let endpoint_path = store.ipc_endpoint_path();
     endpoint.save(&endpoint_path)?;
@@ -186,7 +203,8 @@ pub async fn run<H: Host>(store: Store, host: H, mut control: Control) -> Result
 
     let (events, mut engine_events) = Events::channel();
     let (asks, mut pair_asks) = mpsc::unbounded_channel();
-    let (ui_tx, mut ui_events) = mpsc::unbounded_channel();
+    let (ui_tx, mut ui_events) = mpsc::channel(256);
+    let mut ui_tasks = tokio::task::JoinSet::new();
     let (update_tx, mut update_events) = mpsc::unbounded_channel();
     let mut rt = Runtime::new(store, host, events, asks, update_tx)?;
     rt.start_engine();
@@ -196,7 +214,10 @@ pub async fn run<H: Host>(store: Store, host: H, mut control: Control) -> Result
     loop {
         tokio::select! {
             incoming = listener.accept() => match incoming {
-                Ok(incoming) => ui::accept(incoming, rt.next_client_id(), ui_tx.clone()),
+                Ok(incoming) if ui_tasks.len() < 32 => {
+                    ui_tasks.spawn(ui::accept(incoming, rt.next_client_id(), ui_tx.clone()));
+                }
+                Ok(_) => warn!("本机界面连接达到上限"),
                 Err(e) => warn!("接受设置界面的连接失败：{e}"),
             },
             Some(event) = ui_events.recv() => {
@@ -217,7 +238,8 @@ pub async fn run<H: Host>(store: Store, host: H, mut control: Control) -> Result
                 Some(Command::Quit) | None => break,
                 Some(command) => rt.on_command(command).await,
             },
-            exit = rt.engine_exit() => rt.on_engine_exit(exit),
+            work = rt.next_work() => rt.on_work(work),
+            _ = ui_tasks.join_next(), if !ui_tasks.is_empty() => {},
             _ = tick.tick() => rt.on_tick(),
         }
         control.summary.send_if_modified(|current| {
@@ -230,21 +252,26 @@ pub async fn run<H: Host>(store: Store, host: H, mut control: Control) -> Result
     info!("正在退出");
     let mut waiting = rt.farewell();
     rt.stop_engine().await;
+    rt.shutdown_workers().await;
     // 等每个界面的发送任务把最后一条通知写出去：写完后它结束，随即报告 Left。
     let flushed = async {
-        while waiting > 0 {
+        while !waiting.is_empty() {
             match ui_events.recv().await {
-                Some(ui::UiEvent::Left { .. }) => waiting -= 1,
+                Some(ui::UiEvent::Left { id }) => {
+                    waiting.remove(&id);
+                }
                 Some(_) => {}
                 None => break,
             }
         }
     };
     let _ = tokio::time::timeout(FAREWELL, flushed).await;
+    ui_tasks.shutdown().await;
     // 为安装更新退出（macOS）：先删掉 ipc.json 让出位置，再启动新版本、等它起来。
     if let Some((updater, prepared)) = rt.take_restart() {
         let path = _endpoint.path.clone();
         drop(_endpoint);
+        drop(instance);
         update::finish(updater, prepared, path).await;
     }
     Ok(())

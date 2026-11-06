@@ -19,7 +19,7 @@ class SettingsPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.settings, AppAspect.connection, AppAspect.local});
     final c = SfColors.of(context);
     final s = state.settings;
     final l = context.l10n;
@@ -143,6 +143,35 @@ class SettingsPage extends StatelessWidget {
                 onChanged: state.online ? (mb) => state.updateSettings(SettingsPatch(clipboardLimitMb: mb)) : null,
               ),
             ),
+          ],
+        ),
+        SectionTitle(l.settingsResponsiveness),
+        SfGroup(
+          children: [
+            SfRow(
+              icon: Icons.speed_rounded,
+              title: l.settingsFileRate,
+              subtitle: l.settingsFileRateHint,
+              trailing: DpiField(
+                value: s.fileRateLimitMbps,
+                min: 0,
+                max: 1024,
+                unit: 'MB/s',
+                label: l.settingsFileRate,
+                onChanged: state.online ? (v) => state.updateSettings(SettingsPatch(fileRateLimitMbps: v)) : null,
+              ),
+            ),
+            if (state.isServer)
+              SfRow(
+                icon: Icons.mouse_outlined,
+                title: l.settingsCoalesceMotion,
+                subtitle: l.settingsCoalesceMotionHint,
+                trailing: SfSwitch(
+                  value: s.coalesceMotion,
+                  label: l.settingsCoalesceMotion,
+                  onChanged: set((v) => SettingsPatch(coalesceMotion: v)),
+                ),
+              ),
           ],
         ),
         SectionTitle(l.settingsGeneral),

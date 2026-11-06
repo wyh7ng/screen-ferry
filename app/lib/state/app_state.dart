@@ -9,7 +9,9 @@ import 'package:flutter/services.dart';
 
 import '../ipc/messages.dart';
 import '../l10n/l10n.dart';
+import '../theme/tokens.dart';
 import 'arrangement.dart';
+import 'aspects.dart';
 import 'backend.dart';
 import 'demo_backend.dart';
 import 'dial_text.dart';
@@ -73,7 +75,8 @@ class Appearance extends ChangeNotifier {
 
   void apply({ThemeMode? mode, int? accent, UiLanguage? language}) {
     final m = mode ?? _mode;
-    final a = accent ?? _accent;
+    final requested = accent ?? _accent;
+    final a = requested >= 0 && requested < AccentChoice.all.length ? requested : 0;
     final l = language ?? _language;
     if (m == _mode && a == _accent && l == _language) return;
     _mode = m;
@@ -117,7 +120,9 @@ class TodayStats {
 
 /// 一次按地址连接或邀请。
 class DialAttempt {
-  const DialAttempt({required this.address, required this.invite, this.done = false, this.error});
+  const DialAttempt({required this.address, required this.invite, this.done = false, this.error, this.requestId});
+
+  final int? requestId;
 
   final String address;
   final bool invite;
@@ -170,6 +175,144 @@ class AppState extends ChangeNotifier {
     WidgetsBinding.instance.addObserver(_localeWatch);
   }
 
+  final _values = <AppAspect, Object?>{};
+  final _revisions = <AppAspect, int>{};
+  int _logRevision = 0;
+  int _runLogRevision = 0;
+  Map<AppAspect, int> get revisions => Map.unmodifiable(_revisions);
+
+  @override
+  void notifyListeners() {
+    final s = settings;
+    final local = _daemon?.local;
+    final p = peer;
+    final c = clipboard;
+    final u = updateInfo;
+    final r = u.latest;
+    final values = <AppAspect, Object?>{
+      AppAspect.navigation: [page, sidebarCollapsed, openedDevice, _daemon != null],
+      AppAspect.local: [
+        localName,
+        localFingerprint,
+        role,
+        dataDir,
+        version,
+        platform,
+        naturalScrolling,
+        [...localAddresses],
+        local?.port,
+        local?.invitePort,
+        system,
+      ],
+      AppAspect.connection: [
+        _link,
+        online,
+        disconnected,
+        sharing,
+        status,
+        cursorOnPeer,
+        connectedAt,
+        p?.fingerprint,
+        p?.name,
+        p?.short,
+        p?.addr,
+        problem?.kind,
+        problem?.message,
+        problem?.port,
+      ],
+      AppAspect.devices: [
+        [
+          for (final p in peers)
+            [
+              p.name,
+              p.fingerprint,
+              p.short,
+              p.online,
+              p.lastSeen,
+              p.side,
+              p.cursor,
+              p.alias,
+              p.platform,
+              p.addr,
+              p.version,
+            ],
+        ],
+        [
+          for (final f in found) [f.name, f.fingerprint, f.short, f.addr, f.paired],
+        ],
+      ],
+      AppAspect.settings: [
+        s.name,
+        s.side,
+        [for (final p in s.layout) p.toJson()],
+        s.announce,
+        s.clipboard,
+        s.clipboardLimitMb,
+        s.mouseDpi,
+        s.fileRateLimitMbps,
+        s.coalesceMotion,
+        s.server,
+        s.autostart,
+        s.theme,
+        s.accent,
+        s.language,
+        s.autoUpdate,
+        [for (final d in s.devices) d.toJson()],
+      ],
+      AppAspect.rtt: [...rtt],
+      AppAspect.performance: performance.value,
+      AppAspect.clipboard: [
+        c?.toPeer,
+        c?.peer,
+        c?.chars,
+        c?.bytes,
+        c?.preview,
+        c?.rich,
+        c?.image?.width,
+        c?.image?.height,
+        c?.image?.path,
+        c?.at,
+      ],
+      AppAspect.activity: [
+        for (final a in _daemon?.activity ?? <HourActivity>[]) [a.hour, a.switches, a.clips, a.connectedSecs],
+      ],
+      AppAspect.update: [
+        u.status,
+        u.done,
+        u.total,
+        u.error,
+        u.message,
+        u.checkedAt,
+        u.canInstall,
+        u.needsLocalConfirm,
+        u.dismissed,
+        r?.version,
+        r?.published,
+        r?.size,
+        r?.notesZh,
+        r?.notesEn,
+        r?.breaksPeers,
+      ],
+      AppAspect.updateReminder: [updateReminder, showUpdateBanner, u.readyVersion, u.checkedAt, r?.version],
+      AppAspect.pairing: [
+        for (final p in _prompts) [p.session, p.id, p.peerName, p.fingerprint, p.short, p.code],
+      ],
+      AppAspect.dial: [_dial?.requestId, _dial?.address, _dial?.invite, _dial?.done, _dial?.error],
+      AppAspect.log: _logRevision,
+      AppAspect.runLog: [_runLogRevision, runLogBytes, runLogLines, runLogError],
+      AppAspect.diagnostics: [verboseSince, lastExport?.path, lastExport?.bytes],
+    };
+    var changed = false;
+    for (final entry in values.entries) {
+      if (!_values.containsKey(entry.key) || !sameValue(_values[entry.key], entry.value)) {
+        _values[entry.key] = entry.value;
+        _revisions[entry.key] = (_revisions[entry.key] ?? 0) + 1;
+        changed = true;
+      }
+    }
+    if (changed) super.notifyListeners();
+  }
+
   /// 跟随系统时，系统换了语言就重画。
   late final _localeWatch = _LocaleWatch(appearance.refresh);
 
@@ -202,19 +345,21 @@ class AppState extends ChangeNotifier {
   DaemonState? get daemon => _daemon;
 
   /// 已连上后台并拿到了状态，可以发命令。
-  bool get online => _link == DaemonLink.online && _daemon != null;
+  bool _hasSnapshot = false;
+  bool get online => _link == DaemonLink.online && _hasSnapshot;
 
   /// 连上过后台、现在断开了。
   bool get disconnected => _daemon != null && _link != DaemonLink.online;
 
   // ── 乐观更新 ──
   SettingsPatch _pending = const SettingsPatch();
-  DateTime _pendingAt = DateTime.fromMillisecondsSinceEpoch(0);
+  final _commands = <int, (Request, Timer)>{};
+  int _nextCommand = 1;
 
   /// 改了还没等到后台确认的设备设置，按指纹。
   final _pendingDevices = <String, (DeviceSettings, DateTime)>{};
   bool? _pendingSharing;
-  DateTime _pendingSharingAt = DateTime.fromMillisecondsSinceEpoch(0);
+
   final _forgotten = <String>{};
   final _freshPeers = <String, DateTime>{};
 
@@ -254,6 +399,8 @@ class AppState extends ChangeNotifier {
   String get version => _daemon?.local.version ?? '';
 
   // ── 版本更新 ──
+
+  PerformanceInfo get performance => _daemon?.performance ?? const PerformanceInfo();
 
   UpdateInfo get updateInfo => _daemon?.update ?? const UpdateInfo();
 
@@ -408,7 +555,8 @@ class AppState extends ChangeNotifier {
   /// 还在等待用户核对的配对请求，先来的在前。
   List<PairingPrompt> get prompts => List.unmodifiable(_prompts);
 
-  bool isPromptOpen(int id) => _prompts.any((p) => p.id == id);
+  bool isPromptOpen(int id, {String? session}) =>
+      _prompts.any((p) => p.id == id && (session == null || p.session == session));
 
   // ── 界面状态 ──
 
@@ -455,21 +603,65 @@ class AppState extends ChangeNotifier {
     return false;
   }
 
-  void setSharing(bool on) {
-    if (!_send(SetSharingRequest(on))) return;
-    _pendingSharing = on;
-    _pendingSharingAt = DateTime.now();
+  int? _execute(Request request, {String? session}) {
+    final current = _daemon?.session;
+    if (!online || current == null || current.isEmpty || session != null && session != current) {
+      showToast(l10n.toastNotConnected);
+      return null;
+    }
+    final id = _nextCommand++;
+    if (!backend.send(ExecuteRequest(session: current, id: id, request: request))) {
+      showToast(l10n.toastNotConnected);
+      return null;
+    }
+    _commands[id] = (
+      request,
+      Timer(_pendingTimeout, () {
+        if (_commands.remove(id) == null) return;
+        _rebuildPending();
+        showToast(l10n.commandTimedOut);
+        notifyListeners();
+      }),
+    );
+    _rebuildPending();
     notifyListeners();
+    return id;
   }
 
-  /// 修改设置：先按新值显示，等后台的状态确认。
-  void updateSettings(SettingsPatch patch) {
-    if (!_send(UpdateSettingsRequest(patch))) return;
-    _pending = _pending.merge(patch);
-    _pendingAt = DateTime.now();
+  void _rebuildPending() {
+    _pending = const SettingsPatch();
+    _pendingSharing = null;
+    _pendingDevices.clear();
+    _forgotten.clear();
+    for (final (request, _) in _commands.values) {
+      switch (request) {
+        case UpdateSettingsRequest(:final settings):
+          _pending = _pending.merge(settings);
+        case SetSharingRequest(:final on):
+          _pendingSharing = on;
+        case SetDeviceRequest(:final device):
+          _pendingDevices[device.fingerprint] = (device, DateTime.now());
+        case ForgetRequest(:final fingerprint):
+          _forgotten.add(fingerprint);
+        default:
+          break;
+      }
+    }
     _applyAppearance();
-    notifyListeners();
   }
+
+  void _clearCommands() {
+    for (final (_, timer) in _commands.values) {
+      timer.cancel();
+    }
+    _commands.clear();
+    _rebuildPending();
+  }
+
+  void setSharing(bool on) => _execute(SetSharingRequest(on));
+
+  /// 每条乐观更新都由对应的命令结果确认，失败或超时只撤销那一条。
+  void updateSettings(SettingsPatch patch) => _execute(UpdateSettingsRequest(patch));
 
   void setTheme(ThemeMode mode) => updateSettings(SettingsPatch(theme: UiTheme.values.byName(mode.name)));
 
@@ -503,18 +695,12 @@ class AppState extends ChangeNotifier {
   }
 
   void forget(PeerInfo peer) {
-    if (!_send(ForgetRequest(peer.fingerprint))) return;
-    _forgotten.add(peer.fingerprint);
+    if (_execute(ForgetRequest(peer.fingerprint)) == null) return;
     if (openedDevice == peer.fingerprint) openedDevice = null;
     notifyListeners();
   }
 
-  /// 换上一台设备的设置：先按新值显示，等后台的状态确认。
-  void setDevice(DeviceSettings device) {
-    if (!_send(SetDeviceRequest(device))) return;
-    _pendingDevices[device.fingerprint] = (device, DateTime.now());
-    notifyListeners();
-  }
+  void setDevice(DeviceSettings device) => _execute(SetDeviceRequest(device));
 
   /// 恢复默认设置，保留名字。
   void resetDevice(String fingerprint) => setDevice(deviceSettings(fingerprint).reset());
@@ -529,13 +715,20 @@ class AppState extends ChangeNotifier {
   void dialAddress(String address, {required bool invite}) {
     final text = address.trim();
     if (text.isEmpty) return;
-    if (!_send(invite ? InviteRequest(text) : ConnectAddressRequest(text))) return;
-    _dial = DialAttempt(address: text, invite: invite);
+    final id = _execute(invite ? InviteRequest(text) : ConnectAddressRequest(text));
+    if (id == null) return;
+    _dial = DialAttempt(address: text, invite: invite, requestId: id);
     _dialTimer?.cancel();
     _dialTimer = Timer(_dialTimeout, () {
       final d = _dial;
       if (d == null || d.done) return;
-      _dial = DialAttempt(address: d.address, invite: d.invite, done: true, error: DialError.unreachable);
+      _dial = DialAttempt(
+        address: d.address,
+        invite: d.invite,
+        requestId: d.requestId,
+        done: true,
+        error: DialError.unreachable,
+      );
       notifyListeners();
     });
     notifyListeners();
@@ -553,7 +746,11 @@ class AppState extends ChangeNotifier {
     if (_send(ConnectRequest(device.fingerprint))) showToast(l10n.toastConnectingTo(device.name));
   }
 
-  void replyPairing(int id, {required bool accept}) => _send(PairReplyRequest(id, accept: accept));
+  bool replyPairing(int id, {required bool accept, String? session}) {
+    final prompt = _prompts.where((p) => p.id == id).firstOrNull;
+    if (prompt == null || session != null && prompt.session != session) return false;
+    return _execute(PairReplyRequest(id, accept: accept), session: session ?? prompt.session) != null;
+  }
 
   // ── 运行日志与诊断文件 ──
 
@@ -563,8 +760,15 @@ class AppState extends ChangeNotifier {
   /// 当前这卷运行日志的大小和行数；还没读过时为 null。
   int? runLogBytes;
   int? runLogLines;
+  String? runLogError;
   int? _runLogNext;
   Timer? _runLogTimer;
+  Timer? _runLogDeadline;
+  Timer? _runLogPage;
+  bool _watchingRunLog = false;
+  String? _runLogCursor;
+  int? _runLogRequest;
+  int _nextRunLogRequest = 1;
 
   /// 最近导出的诊断文件。
   ExportedDiagnostics? lastExport;
@@ -577,15 +781,32 @@ class AppState extends ChangeNotifier {
 
   /// 开始或停止跟着看运行日志：打开时先读最近的一段，之后每隔一会儿读新写的。
   void watchRunLog(bool on) {
+    _watchingRunLog = on;
     _runLogTimer?.cancel();
+    _runLogDeadline?.cancel();
+    _runLogPage?.cancel();
     _runLogTimer = null;
+    _runLogRequest = null;
     if (!on) return;
     _runLogNext = null;
+    _runLogCursor = null;
     _readRunLog();
     _runLogTimer = Timer.periodic(_runLogPoll, (_) => _readRunLog());
   }
 
-  void _readRunLog() => _send(ReadRunLogRequest(since: _runLogNext));
+  void _readRunLog() {
+    if (!_watchingRunLog || !online || _runLogRequest != null) return;
+    final id = _nextRunLogRequest++;
+    _runLogRequest = id;
+    if (!backend.send(ReadRunLogRequest(since: _runLogNext, cursor: _runLogCursor, requestId: id))) {
+      _runLogRequest = null;
+      return;
+    }
+    _runLogDeadline?.cancel();
+    _runLogDeadline = Timer(const Duration(seconds: 5), () {
+      if (_runLogRequest == id) _runLogRequest = null;
+    });
+  }
 
   void exportDiagnostics() => _send(const ExportDiagnosticsRequest());
 
@@ -613,6 +834,7 @@ class AppState extends ChangeNotifier {
   void clearLog() {
     if (!_send(const ClearLogRequest())) return;
     log.clear();
+    _logRevision++;
     notifyListeners();
   }
 
@@ -622,8 +844,16 @@ class AppState extends ChangeNotifier {
 
   void _onLink() {
     _link = backend.link.value;
+    _hasSnapshot = false;
+    _prompts.clear();
+    _clearCommands();
+    clearDial();
     // 后台换了一份（重启过）：运行日志从头读。
     _runLogNext = null;
+    _runLogCursor = null;
+    _runLogRequest = null;
+    _runLogDeadline?.cancel();
+    _runLogPage?.cancel();
     notifyListeners();
   }
 
@@ -632,13 +862,16 @@ class AppState extends ChangeNotifier {
       case StateNotice(:final state):
         _onState(state);
       case HistoryNotice(:final entries):
+        _logRevision++;
         log
           ..clear()
           ..addAll(entries);
       case LogNotice(:final entry):
+        _logRevision++;
         log.insert(0, entry);
         if (log.length > 500) log.removeLast();
       case PairingNotice(:final prompt):
+        if (!online || prompt.session != _daemon?.session) return;
         _prompts
           ..removeWhere((p) => p.id == prompt.id)
           ..add(prompt);
@@ -649,12 +882,12 @@ class AppState extends ChangeNotifier {
       case ShowDeviceNotice(:final fingerprint):
         openDevice(fingerprint);
         return;
-      case DialedNotice(:final address, :final invite, :final error):
+      case DialedNotice(:final address, :final invite, :final error, :final requestId):
         final d = _dial;
-        if (d != null && !d.done && d.invite == invite) {
+        if (d != null && !d.done && d.invite == invite && requestId != null && d.requestId == requestId) {
           _dialTimer?.cancel();
-          _dial = DialAttempt(address: d.address, invite: invite, done: true, error: error);
-        } else if (error != null) {
+          _dial = DialAttempt(address: d.address, invite: invite, requestId: requestId, done: true, error: error);
+        } else if (error != null && requestId == null) {
           // 没有对话框在等（例如点了局域网里发现的设备）：失败时提示一下。
           showToast(dialFailure(l10n, error, address: address, invite: invite).title);
         }
@@ -662,22 +895,55 @@ class AppState extends ChangeNotifier {
         // 后台退出了（托盘里的“退出”或安装程序升级、卸载），设置界面跟着关闭。
         _onQuit();
         return;
-      case RunLogNotice(:final lines, :final next, :final fresh, :final bytes, :final linesTotal):
-        if (fresh) runLog.clear();
-        runLog.addAll(lines);
-        if (runLog.length > _runLogKeep) runLog.removeRange(0, runLog.length - _runLogKeep);
-        _runLogNext = next;
+      case RunLogNotice(
+        :final lines,
+        :final next,
+        :final fresh,
+        :final bytes,
+        :final linesTotal,
+        :final cursor,
+        :final requestId,
+        :final more,
+        :final error,
+      ):
+        // 每个请求只接一次；切页、重连和超时以前的响应不能改写新的游标。
+        if (!_watchingRunLog || requestId == null || requestId != _runLogRequest) return;
+        _runLogRequest = null;
+        _runLogDeadline?.cancel();
+        runLogError = error;
+        if (error != null) {
+          notifyListeners();
+          return;
+        }
+        final advances = cursor != _runLogCursor || next != _runLogNext;
+        if (fresh || advances) {
+          _runLogRevision++;
+          if (fresh) runLog.clear();
+          runLog.addAll(lines);
+          if (runLog.length > _runLogKeep) runLog.removeRange(0, runLog.length - _runLogKeep);
+          _runLogNext = next;
+          _runLogCursor = cursor;
+        }
         runLogBytes = bytes;
         runLogLines = linesTotal;
-        // 没有新内容时不必重画。
-        if (!fresh && lines.isEmpty) return;
+        if (more && advances) {
+          _runLogPage?.cancel();
+          _runLogPage = Timer(const Duration(milliseconds: 16), _readRunLog);
+        }
       case DiagnosticsExportedNotice(:final path, :final bytes):
         lastExport = ExportedDiagnostics(path: path, bytes: bytes);
       case DiagnosticsSummaryNotice(:final text):
         unawaited(Clipboard.setData(ClipboardData(text: text)));
         showToast(l10n.diagCopied);
         return;
-      case WelcomeNotice():
+      case CommandResultNotice(:final session, :final id, :final ok, :final message):
+        if (session != _daemon?.session) return;
+        final command = _commands.remove(id);
+        if (command == null) return;
+        command.$2.cancel();
+        _rebuildPending();
+        if (!ok && message.isNotEmpty) showToast(message);
+      case WelcomeNotice() || UpdateHealthNotice():
         return;
     }
     notifyListeners();
@@ -691,17 +957,13 @@ class AppState extends ChangeNotifier {
         if (!before.contains(p.fingerprint)) _freshPeers[p.fingerprint] = now;
       }
     }
-    _daemon = state;
-
-    // 后台已经确认的改动不再覆盖；等太久的以后台为准。
-    _pending = now.difference(_pendingAt) > _pendingTimeout ? const SettingsPatch() : _pending.without(state.settings);
-    if (_pendingSharing == state.sharing || now.difference(_pendingSharingAt) > _pendingTimeout) {
-      _pendingSharing = null;
+    if (_daemon?.session != state.session) {
+      _prompts.clear();
+      _clearCommands();
+      clearDial();
     }
-    _pendingDevices.removeWhere(
-      (fp, pending) => now.difference(pending.$2) > _pendingTimeout || state.settings.device(fp) == pending.$1,
-    );
-    _forgotten.retainWhere((fp) => state.peers.any((p) => p.fingerprint == fp));
+    _daemon = state;
+    _hasSnapshot = true;
     _applyAppearance();
   }
 
@@ -714,6 +976,12 @@ class AppState extends ChangeNotifier {
   void dispose() {
     _dialTimer?.cancel();
     _runLogTimer?.cancel();
+    _runLogDeadline?.cancel();
+    _runLogPage?.cancel();
+    for (final (_, timer) in _commands.values) {
+      timer.cancel();
+    }
+    _commands.clear();
     WidgetsBinding.instance.removeObserver(_localeWatch);
     unawaited(_subscription.cancel());
     backend.link.removeListener(_onLink);

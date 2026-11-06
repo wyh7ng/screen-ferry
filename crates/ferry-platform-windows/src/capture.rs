@@ -23,6 +23,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use ferry_platform::{CaptureEvent, CaptureSink, Captured, Error, InputCapture, Result};
 use ferry_types::{KeyAction, KeyCode, LockKeys, MouseButton, Point};
@@ -319,6 +320,7 @@ fn with_state(f: impl FnOnce(&mut HookState) -> bool) -> bool {
 impl HookState {
     /// 处理一个鼠标事件，返回是否吞掉它。
     fn on_mouse(&mut self, msg: u32, info: &MSLLHOOKSTRUCT) -> bool {
+        let captured_at = Instant::now();
         let grabbed = self.shared.grabbed.load(Ordering::SeqCst);
         let high = (info.mouseData >> 16) as u16;
         let button = |number, pressed| {
@@ -352,7 +354,7 @@ impl HookState {
             _ => None,
         };
         if let Some(event) = event {
-            self.emit(event, grabbed);
+            self.emit(event, grabbed, captured_at);
         }
         grabbed
     }
@@ -405,6 +407,7 @@ impl HookState {
 
     /// 处理一个键盘事件，返回是否吞掉它。
     fn on_key(&mut self, info: &KBDLLHOOKSTRUCT) -> bool {
+        let captured_at = Instant::now();
         let grabbed = self.shared.grabbed.load(Ordering::SeqCst);
         let extended = info.flags.contains(LLKHF_EXTENDED);
         let Some(code) = hid_from_windows(info.vkCode as u16, info.scanCode as u16, extended)
@@ -436,14 +439,18 @@ impl HookState {
             }
             return false;
         }
-        self.emit(CaptureEvent::Key { code, action }, true);
+        self.emit(CaptureEvent::Key { code, action }, true, captured_at);
         true
     }
 
     /// 把事件交给 sink。panic 不能穿过系统回调，这里截住。
-    fn emit(&mut self, event: CaptureEvent, grabbed: bool) {
+    fn emit(&mut self, event: CaptureEvent, grabbed: bool, captured_at: Instant) {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            (self.sink)(Captured { event, grabbed })
+            (self.sink)(Captured {
+                event,
+                grabbed,
+                captured_at,
+            })
         }));
     }
 }

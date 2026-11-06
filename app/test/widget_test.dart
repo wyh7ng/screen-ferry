@@ -394,6 +394,34 @@ void main() {
     expect(find.text('与“会议室 PC”配对'), findsNothing);
   });
 
+  testWidgets('后台重启复用配对编号时旧弹窗关闭并显示新的配对码', (tester) async {
+    final backend = DemoBackend(animate: false);
+    await launch(tester, const Size(1160, 780), backend: backend);
+    final id = backend.requestPairing('旧设备');
+    await settle(tester);
+    expect(find.text('与“旧设备”配对'), findsOneWidget);
+    backend.goOffline();
+    backend.session = 'restarted';
+    backend.goOnline();
+    backend.emit(
+      PairingNotice(
+        PairingPrompt(
+          session: 'restarted',
+          id: id,
+          peerName: '新设备',
+          fingerprint: 'fresh',
+          short: 'fresh',
+          code: '123 456',
+        ),
+      ),
+    );
+    await settle(tester, steps: 12);
+    expect(find.text('与“旧设备”配对'), findsNothing);
+    expect(find.text('与“新设备”配对'), findsOneWidget);
+    backend.emit(PairingClosedNotice(id));
+    await settle(tester);
+  });
+
   testWidgets('拒绝配对会告诉后台并关闭对话框', (tester) async {
     final backend = DemoBackend(animate: false);
     await launch(tester, const Size(1160, 780), backend: backend);
@@ -451,6 +479,28 @@ void main() {
     final patch = backend.sent.whereType<UpdateSettingsRequest>().last.settings;
     expect(patch.toJson(), {'clipboard': false});
   });
+  testWidgets('文件带宽与鼠标合并按设置提交，零表示不限速', (tester) async {
+    final backend = DemoBackend(animate: false);
+    final state = await launch(tester, const Size(1160, 780), backend: backend);
+    state.go(SfPage.settings);
+    await settle(tester);
+    final rate = find.bySemanticsLabel('文件传输速度上限').last;
+    await tester.ensureVisible(rate);
+    await tester.enterText(rate, '12');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await settle(tester);
+    expect(backend.sent.whereType<UpdateSettingsRequest>().last.settings.fileRateLimitMbps, 12);
+    expect(state.settings.fileRateLimitMbps, 12);
+    await tester.enterText(rate, '0');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await settle(tester);
+    expect(state.settings.fileRateLimitMbps, 0);
+    expect(find.textContaining('0 表示不限速'), findsOneWidget);
+    await tapInView(tester, switchOf('合并连续鼠标移动'));
+    expect(backend.sent.whereType<UpdateSettingsRequest>().last.settings.coalesceMotion, isTrue);
+    expect(state.settings.coalesceMotion, isTrue);
+  });
+
   testWidgets('拖动剪贴板上限滑块，松手才把新上限发给后台', (tester) async {
     final backend = DemoBackend(animate: false);
     final state = await launch(tester, const Size(1160, 780), backend: backend);
@@ -766,6 +816,17 @@ void main() {
       expect(d.modifiers, ModifierPreset.custom);
       expect(d.customModifiers.gui, ModifierTarget.alt);
       expect(d.customModifiers.ctrl, ModifierTarget.gui, reason: '其余的从原来的对应关系开始');
+    });
+
+    testWidgets('Mac 的 Caps Lock 只能保持原功能或禁用', (tester) async {
+      await openOffice(tester);
+      await tapInView(tester, find.byTooltip('⇪ Caps Lock 在 办公室 PC 上变成'));
+      final items = tester
+          .widgetList<PopupMenuItem<ModifierTarget>>(find.byType(PopupMenuItem<ModifierTarget>))
+          .toList();
+      expect(items.where((i) => i.enabled).map((i) => i.value).toSet(), {ModifierTarget.capsLock, ModifierTarget.none});
+      await tester.tap(find.text('不发送').last);
+      await settle(tester);
     });
 
     testWidgets('光标速度可以直接填 DPI，“还原”回到和本机一样', (tester) async {
@@ -1107,11 +1168,11 @@ void main() {
       final reads = backend.sent.whereType<ReadRunLogRequest>().toList();
       expect(reads.single.since, isNull);
       expect(find.text('心跳超时：对方长时间没有响应'), findsOneWidget);
-      expect(find.text('2.0 MB · 18,241 行'), findsOneWidget);
+      expect(find.text('2.0 MB · 当前显示 ${state.runLog.length} 行'), findsOneWidget);
       expect(find.text('清空'), findsNothing, reason: '运行日志不能在这里清空');
 
       await tester.pump(const Duration(seconds: 2));
-      expect(backend.sent.whereType<ReadRunLogRequest>().last.since, 2097152, reason: '接着上次的位置读');
+      expect(backend.sent.whereType<ReadRunLogRequest>().last.cursor, 'demo-log:2097152', reason: '原样回传后台的游标');
 
       await leave(tester);
       final count = backend.sent.whereType<ReadRunLogRequest>().length;

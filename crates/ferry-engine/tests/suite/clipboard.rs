@@ -262,3 +262,546 @@ async fn raising_the_limit_takes_effect_without_reconnecting() {
     })
     .await;
 }
+
+struct PausedWriteClipboard {
+    inner: MockClipboard,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+    resume: std::sync::mpsc::Receiver<()>,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ferry_platform::Clipboard for PausedWriteClipboard {
+    fn formats(&self) -> &'static [ClipboardFormat] {
+        ferry_platform::Clipboard::formats(&self.inner)
+    }
+    fn change_count(&mut self) -> u64 {
+        ferry_platform::Clipboard::change_count(&mut self.inner)
+    }
+    fn read(&mut self) -> ferry_platform::Result<ClipboardContent> {
+        ferry_platform::Clipboard::read(&mut self.inner)
+    }
+    fn write(&mut self, content: &ClipboardContent) -> ferry_platform::Result<u64> {
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
+            if self.resume.recv_timeout(Duration::from_secs(3)).is_err() {
+                self.timed_out
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        ferry_platform::Clipboard::write(&mut self.inner, content)
+    }
+}
+
+#[tokio::test]
+async fn a_blocked_native_clipboard_write_does_not_block_input_or_timers() {
+    use ferry_engine::connect;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let rig = Rig::with(Setup {
+        start_client: false,
+        ..Setup::default()
+    })
+    .await;
+    rig.mac_clipboard.copy(text("native write is slow"));
+    let config = crate::client::paired_config(&rig, rig.addr);
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (resume, blocked) = std::sync::mpsc::channel();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let clipboard = PausedWriteClipboard {
+        inner: rig.pc_clipboard.clone(),
+        started: Some(started),
+        resume: blocked,
+        timed_out: timed_out.clone(),
+    };
+    let client = tokio::spawn(connect(
+        config,
+        rig.inject.clone(),
+        rig.pc_displays.clone(),
+        clipboard,
+        rig.pc_confirm.clone(),
+    ));
+    rig.enter().await;
+    tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !timed_out.load(Ordering::SeqCst),
+        "系统剪贴板阻塞期间运行时仍能被调度"
+    );
+    let before = rig.inject.events().len();
+    rig.push(10, 0);
+    eventually("剪贴板调用未结束时输入继续注入", || {
+        rig.inject.events().len() > before
+    })
+    .await;
+    sleep(Duration::from_millis(20)).await;
+    assert!(!timed_out.load(Ordering::SeqCst));
+    resume.send(()).unwrap();
+    eventually("工作线程完成后写入剪贴板", || {
+        rig.pc_clipboard.writes() > 0
+    })
+    .await;
+    client.abort();
+    rig.server.abort();
+}
+
+#[tokio::test]
+async fn clipboard_messages_without_negotiated_permission_close_the_data_channel() {
+    use ferry_engine::Live;
+    use ferry_net::Tls;
+    use ferry_proto::{Capabilities, Channel, ClipboardItem, ClipboardOffer, Hello, Message};
+    use ferry_types::{DeviceSettings, Side};
+    let live = Live {
+        side: Side::Right,
+        layout: Vec::new(),
+        devices: Vec::new(),
+        mouse_dpi: 1600,
+        input: Default::default(),
+        fallback: DeviceSettings {
+            clipboard: false,
+            ..DeviceSettings::default()
+        },
+    };
+    let rig = Rig::with(Setup {
+        start_client: false,
+        live: Some(live.fixed()),
+        ..Setup::default()
+    })
+    .await;
+    let _ = crate::client::paired_config(&rig, rig.addr);
+    let tls = Tls::new(&rig.pc.store.identity("pc").unwrap()).unwrap();
+    let (mut input, _) = tls.connect(rig.addr, Channel::Input).await.unwrap();
+    let caps = Capabilities::CLIPBOARD | Capabilities::FILES;
+    let welcome = ferry_net::initiate(&mut input, Hello::new(Channel::Input, caps, 0, "pc"))
+        .await
+        .unwrap();
+    assert!(!welcome.capabilities.contains(Capabilities::CLIPBOARD));
+    input
+        .send(&Message::Displays(vec![crate::support::display(
+            1920, 1080, 100,
+        )]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        input.recv().await.unwrap(),
+        Some(Message::Displays(_))
+    ));
+    sleep(Duration::from_millis(30)).await;
+    let (mut data, _) = tls.connect(rig.addr, Channel::Data).await.unwrap();
+    ferry_net::initiate(
+        &mut data,
+        Hello::new(Channel::Data, caps, welcome.session, "pc"),
+    )
+    .await
+    .unwrap();
+    data.send(&Message::ClipboardOffer(ClipboardOffer {
+        seq: 1,
+        items: vec![ClipboardItem {
+            format: ClipboardFormat::TEXT,
+            size: 5,
+        }],
+    }))
+    .await
+    .unwrap();
+    let closed = tokio::time::timeout(Duration::from_millis(500), data.recv())
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(None) | Err(_)),
+        "未授权通告不能得到拉取请求：{closed:?}"
+    );
+    assert_eq!(rig.mac_clipboard.writes(), 0);
+    rig.server.abort();
+}
+
+/// 真实 TLS 服务端，剪贴板可替换为故障注入实现。
+struct ClipboardServer {
+    device: crate::support::Device,
+    addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<ferry_engine::Result<std::convert::Infallible>>,
+}
+
+impl ClipboardServer {
+    async fn start<C: ferry_platform::Clipboard>(clipboard: C, limit: ClipLimit) -> Self {
+        use ferry_engine::{EdgeFeed, Events, Files, Live, ServerConfig, serve};
+        use ferry_platform_mock::{MockCapture, MockDisplays, MockFileCommit};
+        use std::sync::Arc;
+        let device = crate::support::Device::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig {
+            live: Live {
+                side: ferry_types::Side::Right,
+                layout: vec![],
+                devices: vec![],
+                fallback: Default::default(),
+                mouse_dpi: 1600,
+                input: Default::default(),
+            }
+            .fixed(),
+            name: "clipboard server".into(),
+            clipboard: true,
+            clipboard_limit: limit,
+            command_key: true,
+            store: device.store.clone(),
+            announce: false,
+            events: Events::none(),
+            files: Files::new(&device.store, Events::none(), Arc::new(MockFileCommit)),
+            edge: EdgeFeed::none(),
+        };
+        let task = tokio::spawn(serve(
+            listener,
+            config,
+            MockCapture::new(),
+            MockDisplays::new(vec![crate::support::display(1000, 800, 100)]),
+            clipboard,
+            crate::support::AutoConfirm::answering(true),
+        ));
+        Self { device, addr, task }
+    }
+}
+
+impl Drop for ClipboardServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct ClipboardPeer {
+    data: ferry_net::Framed<ferry_net::ClientStream>,
+    input: tokio::task::JoinHandle<()>,
+}
+
+impl ClipboardPeer {
+    async fn connect(server: &ClipboardServer) -> Self {
+        use ferry_net::Tls;
+        use ferry_proto::{Capabilities, Channel, Hello, Message};
+        use ferry_trust::{Identity, Peer};
+        let identity = Identity::generate("clipboard peer").unwrap();
+        let mut peers = server.device.store.peers().unwrap();
+        peers.add(Peer::new("clipboard peer", identity.fingerprint()));
+        server.device.store.save_peers(&peers).unwrap();
+        let tls = Tls::new(&identity).unwrap();
+        let caps = Capabilities::CLIPBOARD | Capabilities::EDGE_DROP;
+        let (mut input, _) = tls.connect(server.addr, Channel::Input).await.unwrap();
+        let welcome = ferry_net::initiate(&mut input, Hello::new(Channel::Input, caps, 0, "peer"))
+            .await
+            .unwrap();
+        input
+            .send(&Message::Displays(vec![crate::support::display(
+                1920, 1080, 100,
+            )]))
+            .await
+            .unwrap();
+        // PeerSide 在服务端注册会话之后发送，数据连接无需靠sleep猜时序。
+        loop {
+            match input.recv().await.unwrap().unwrap() {
+                Message::PeerSide { .. } => break,
+                Message::Ping { nonce } => input.send(&Message::Pong { nonce }).await.unwrap(),
+                _ => {}
+            }
+        }
+        let input = tokio::spawn(async move {
+            while let Ok(Some(message)) = input.recv().await {
+                if let Message::Ping { nonce } = message
+                    && input.send(&Message::Pong { nonce }).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let (mut data, _) = tls.connect(server.addr, Channel::Data).await.unwrap();
+        ferry_net::initiate(
+            &mut data,
+            Hello::new(Channel::Data, caps, welcome.session, "peer"),
+        )
+        .await
+        .unwrap();
+        Self { data, input }
+    }
+
+    async fn offer(&mut self) -> ferry_proto::ClipboardOffer {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(ferry_proto::Message::ClipboardOffer(offer)) =
+                    self.data.recv().await.unwrap()
+                {
+                    return offer;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn publish_text(&mut self, value: &str) {
+        use ferry_proto::{Chunk, ClipboardItem, ClipboardOffer, Message};
+        self.data
+            .send(&Message::ClipboardOffer(ClipboardOffer {
+                seq: 77,
+                items: vec![ClipboardItem {
+                    format: ClipboardFormat::TEXT,
+                    size: value.len() as u64,
+                }],
+            }))
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Message::ClipboardRequest(request)) = self.data.recv().await.unwrap() {
+                    return request;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        self.data
+            .send(&Message::Chunk(Chunk {
+                transfer: request.transfer,
+                last: true,
+                data: value.as_bytes().to_vec(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn fetch(
+        &mut self,
+        offer: &ferry_proto::ClipboardOffer,
+        format: ClipboardFormat,
+    ) -> Vec<u8> {
+        use ferry_proto::{ClipboardRequest, Message};
+        self.data
+            .send(&Message::ClipboardRequest(ClipboardRequest {
+                seq: offer.seq,
+                format,
+                transfer: 1,
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut bytes = Vec::new();
+            loop {
+                match self.data.recv().await.unwrap().unwrap() {
+                    Message::Chunk(chunk) if chunk.transfer == 1 => {
+                        bytes.extend_from_slice(&chunk.data);
+                        if chunk.last {
+                            return bytes;
+                        }
+                    }
+                    Message::Cancel(_) => panic!("有效的剪贴板通告不应被取消"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+}
+
+impl Drop for ClipboardPeer {
+    fn drop(&mut self) {
+        self.input.abort();
+    }
+}
+
+#[tokio::test]
+async fn multiple_peers_read_each_clipboard_version_only_once() {
+    let native = MockClipboard::new();
+    native.copy(rich(300_000));
+    let server = ClipboardServer::start(native.clone(), ClipLimit::default()).await;
+    let mut first = ClipboardPeer::connect(&server).await;
+    let a = first.offer().await;
+    let mut second = ClipboardPeer::connect(&server).await;
+    let b = second.offer().await;
+    assert_eq!(native.reads(), 1, "两个TLS会话共享一次原生读取/转换");
+    assert_eq!(
+        first.fetch(&a, ClipboardFormat::PNG).await,
+        fake_png(640, 480, 300_000)
+    );
+    assert_eq!(
+        second.fetch(&b, ClipboardFormat::PNG).await,
+        fake_png(640, 480, 300_000)
+    );
+    native.copy(text("next version"));
+    let a = first.offer().await;
+    let b = second.offer().await;
+    assert_eq!(native.reads(), 2, "计数改变后只重新读取一次");
+    assert_eq!(
+        first.fetch(&a, ClipboardFormat::TEXT).await,
+        b"next version"
+    );
+    assert_eq!(
+        second.fetch(&b, ClipboardFormat::TEXT).await,
+        b"next version"
+    );
+}
+
+#[tokio::test]
+async fn filtering_one_offer_does_not_remove_formats_from_the_shared_cache() {
+    let native = MockClipboard::new();
+    native.copy(rich(300_000));
+    let limit = ClipLimit::new(100 * 1024);
+    let server = ClipboardServer::start(native.clone(), limit.clone()).await;
+    let mut first = ClipboardPeer::connect(&server).await;
+    let a = first.offer().await;
+    assert!(!a.items.iter().any(|i| i.format == ClipboardFormat::PNG));
+    assert_eq!(
+        first.fetch(&a, ClipboardFormat::HTML).await,
+        "<b>会议纪要</b>".as_bytes()
+    );
+    limit.set(1024 * 1024);
+    let mut second = ClipboardPeer::connect(&server).await;
+    let b = second.offer().await;
+    assert!(b.items.iter().any(|i| i.format == ClipboardFormat::PNG));
+    assert_eq!(native.reads(), 1, "限额过滤不破坏原缓存，也不强制重新转换");
+    assert_eq!(
+        second.fetch(&b, ClipboardFormat::PNG).await,
+        fake_png(640, 480, 300_000)
+    );
+    assert!(native.content().get(ClipboardFormat::PNG).is_some());
+}
+
+struct ChangingReadClipboard {
+    inner: MockClipboard,
+    change_once: bool,
+    fail_once: bool,
+}
+
+impl ferry_platform::Clipboard for ChangingReadClipboard {
+    fn formats(&self) -> &'static [ClipboardFormat] {
+        ferry_platform::Clipboard::formats(&self.inner)
+    }
+    fn change_count(&mut self) -> u64 {
+        ferry_platform::Clipboard::change_count(&mut self.inner)
+    }
+    fn read(&mut self) -> ferry_platform::Result<ClipboardContent> {
+        let content = ferry_platform::Clipboard::read(&mut self.inner)?;
+        if std::mem::take(&mut self.fail_once) {
+            return Err(ferry_platform::Error::Failed(
+                "temporary clipboard lock".into(),
+            ));
+        }
+        if std::mem::take(&mut self.change_once) {
+            self.inner.copy(text("stable version"));
+        }
+        Ok(content)
+    }
+    fn write(&mut self, content: &ClipboardContent) -> ferry_platform::Result<u64> {
+        ferry_platform::Clipboard::write(&mut self.inner, content)
+    }
+}
+
+#[tokio::test]
+async fn a_clipboard_change_during_conversion_is_retried_before_caching() {
+    let native = MockClipboard::new();
+    native.copy(text("inconsistent old version"));
+    let server = ClipboardServer::start(
+        ChangingReadClipboard {
+            inner: native.clone(),
+            change_once: true,
+            fail_once: false,
+        },
+        ClipLimit::default(),
+    )
+    .await;
+    let mut first = ClipboardPeer::connect(&server).await;
+    let a = first.offer().await;
+    assert_eq!(
+        first.fetch(&a, ClipboardFormat::TEXT).await,
+        b"stable version"
+    );
+    let mut second = ClipboardPeer::connect(&server).await;
+    let b = second.offer().await;
+    assert_eq!(
+        second.fetch(&b, ClipboardFormat::TEXT).await,
+        b"stable version"
+    );
+    assert_eq!(native.reads(), 2, "读前后计数改变需要重读；稳定版本可复用");
+}
+
+#[tokio::test]
+async fn a_failed_first_read_is_retried_without_publishing_empty_content() {
+    let native = MockClipboard::new();
+    native.copy(text("preserve this"));
+    let server = ClipboardServer::start(
+        ChangingReadClipboard {
+            inner: native.clone(),
+            change_once: false,
+            fail_once: true,
+        },
+        ClipLimit::default(),
+    )
+    .await;
+    let mut first = ClipboardPeer::connect(&server).await;
+    let a = first.offer().await;
+    assert!(!a.items.is_empty(), "读取失败不冒充空剪贴板通告");
+    assert_eq!(
+        first.fetch(&a, ClipboardFormat::TEXT).await,
+        b"preserve this"
+    );
+    let mut second = ClipboardPeer::connect(&server).await;
+    second.offer().await;
+    assert_eq!(native.reads(), 2, "错误不缓存，成功后才共享");
+}
+
+#[tokio::test]
+async fn an_unused_image_cache_releases_its_reference_without_another_copy() {
+    use std::sync::Arc;
+    let native = MockClipboard::new();
+    let mut content = ClipboardContent::new();
+    content.insert(ClipboardFormat::PNG, fake_png(64, 64, 1024));
+    let image = content.get_shared(ClipboardFormat::PNG).unwrap();
+    native.copy(content);
+    let server = ClipboardServer::start(native.clone(), ClipLimit::default()).await;
+    let mut peer = ClipboardPeer::connect(&server).await;
+    let offer = peer.offer().await;
+    peer.fetch(&offer, ClipboardFormat::PNG).await;
+    drop(peer);
+    eventually("仅原生内容和共享缓存还持有图片", || {
+        Arc::strong_count(&image) == 3
+    })
+    .await;
+    sleep(Duration::from_millis(6100)).await;
+    eventually("五秒没有读取后释放缓存引用", || {
+        Arc::strong_count(&image) == 2
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn aggregate_cache_size_is_bounded_even_for_large_content() {
+    let native = MockClipboard::new();
+    let mut content = ClipboardContent::new();
+    content.insert(ClipboardFormat::TEXT, vec![b'x'; 64 * 1024 * 1024 + 1]);
+    native.copy(content);
+    let server = ClipboardServer::start(native.clone(), ClipLimit::default()).await;
+    let mut first = ClipboardPeer::connect(&server).await;
+    first.offer().await;
+    let mut second = ClipboardPeer::connect(&server).await;
+    second.offer().await;
+    assert_eq!(native.reads(), 2, "超过64MiB的聚合内容不能留在共享缓存");
+}
+
+#[tokio::test]
+async fn a_remote_write_invalidates_the_cached_native_content_for_other_peers() {
+    let native = MockClipboard::new();
+    native.copy(text("before remote write"));
+    let server = ClipboardServer::start(native.clone(), ClipLimit::default()).await;
+    let mut first = ClipboardPeer::connect(&server).await;
+    first.offer().await;
+    let mut second = ClipboardPeer::connect(&server).await;
+    second.offer().await;
+    assert_eq!(native.reads(), 1);
+    first.publish_text("written remotely").await;
+    eventually("收到的内容写入本机", || native.writes() == 1).await;
+    let updated = second.offer().await;
+    assert_eq!(
+        second.fetch(&updated, ClipboardFormat::TEXT).await,
+        b"written remotely"
+    );
+    assert_eq!(native.reads(), 2, "写入后新计数只读取一次，不沿用旧缓存");
+}

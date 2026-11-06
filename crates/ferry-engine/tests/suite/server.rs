@@ -325,6 +325,7 @@ async fn changing_side_mid_session_takes_effect_without_reconnecting() {
         devices: Vec::new(),
         fallback: ferry_types::DeviceSettings::default(),
         mouse_dpi: 1600,
+        input: Default::default(),
     });
     let rig = Rig::with(Setup {
         live: Some(rx),
@@ -373,6 +374,7 @@ mod several_clients {
             devices: Vec::new(),
             fallback: ferry_types::DeviceSettings::default(),
             mouse_dpi: 1600,
+            input: Default::default(),
         });
         let rig = Rig::with(Setup {
             live: Some(rx),
@@ -519,6 +521,7 @@ mod per_device {
             devices: Vec::new(),
             fallback: DeviceSettings::default(),
             mouse_dpi: 1600,
+            input: Default::default(),
         });
         let rig = Rig::with(Setup {
             live: Some(rx),
@@ -653,4 +656,344 @@ mod per_device {
             .await
             .expect("服务端 5 秒内没有收到打开设置的请求");
     }
+}
+
+#[tokio::test]
+async fn stopping_the_server_closes_incomplete_handshakes() {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+    use tokio::time::{sleep, timeout};
+    let mut rig = Rig::with(Setup {
+        start_client: false,
+        ..Setup::default()
+    })
+    .await;
+    let mut connection = TcpStream::connect(rig.addr).await.unwrap();
+    sleep(Duration::from_millis(50)).await;
+    rig.server.abort();
+    let _ = (&mut rig.server).await;
+    let mut byte = [0];
+    let closed = timeout(Duration::from_millis(500), connection.read(&mut byte))
+        .await
+        .expect("停下引擎立即取消未完成握手，不等待5秒超时");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+}
+
+#[tokio::test]
+async fn the_servers_file_policy_is_negotiated_before_the_client_connects() {
+    use ferry_engine::Live;
+    use ferry_types::DeviceSettings;
+    let live = Live {
+        side: ferry_types::Side::Right,
+        layout: Vec::new(),
+        devices: Vec::new(),
+        fallback: DeviceSettings {
+            files: false,
+            ..DeviceSettings::default()
+        },
+        mouse_dpi: 1600,
+        input: Default::default(),
+    };
+    let rig = Rig::with(Setup {
+        live: Some(live.fixed()),
+        ..Setup::default()
+    })
+    .await;
+    rig.mac_clipboard
+        .copy(ferry_types::ClipboardContent::text("clipboard allowed"));
+    rig.enter().await;
+    eventually("剪贴板继续同步", || rig.pc_clipboard.writes() > 0).await;
+    assert!(rig.mac_files.connected().is_empty());
+    assert!(rig.pc_files.connected().is_empty());
+}
+
+struct WaitingPairing {
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ferry_engine::ConfirmPairing for WaitingPairing {
+    async fn confirm(&self, _request: &ferry_engine::PairingRequest) -> bool {
+        struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = CancelOnDrop(self.cancelled.clone());
+        let _ = self.started.send(());
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn stopping_the_server_cancels_pairing_before_it_can_add_trust() {
+    use ferry_engine::{ClipLimit, EdgeFeed, Events, Live, ServerConfig, serve};
+    use ferry_net::Tls;
+    use ferry_proto::{Capabilities, Channel, Hello, Message};
+    use ferry_trust::Identity;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+    let mut rig = Rig::with(Setup {
+        start_client: false,
+        ..Setup::default()
+    })
+    .await;
+    rig.server.abort();
+    let _ = (&mut rig.server).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (started, mut waiting) = tokio::sync::mpsc::unbounded_channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let config = ServerConfig {
+        live: Live {
+            side: ferry_types::Side::Right,
+            layout: Vec::new(),
+            devices: Vec::new(),
+            fallback: ferry_types::DeviceSettings::default(),
+            mouse_dpi: 1600,
+            input: Default::default(),
+        }
+        .fixed(),
+        name: "mac".into(),
+        clipboard: true,
+        clipboard_limit: ClipLimit::default(),
+        command_key: true,
+        store: rig.mac.store.clone(),
+        announce: false,
+        events: Events::none(),
+        files: rig.mac_files.clone(),
+        edge: EdgeFeed::none(),
+    };
+    let mut server = tokio::spawn(serve(
+        listener,
+        config,
+        rig.capture.clone(),
+        rig.mac_displays.clone(),
+        rig.mac_clipboard.clone(),
+        WaitingPairing {
+            started,
+            cancelled: cancelled.clone(),
+        },
+    ));
+    let identity = Identity::generate("pending").unwrap();
+    let tls = Tls::new(&identity).unwrap();
+    let (mut pair, _) = tls.connect(addr, Channel::Pair).await.unwrap();
+    ferry_net::initiate(
+        &mut pair,
+        Hello::new(Channel::Pair, Capabilities::empty(), 0, "pending"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pair.recv().await.unwrap(),
+        Some(Message::PairCommit { .. })
+    ));
+    pair.send(&Message::PairNonce { nonce: [7; 32] })
+        .await
+        .unwrap();
+    assert!(matches!(
+        pair.recv().await.unwrap(),
+        Some(Message::PairNonce { .. })
+    ));
+    tokio::time::timeout(Duration::from_secs(1), waiting.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    let _ = (&mut server).await;
+    eventually("停下服务端取消配对确认", || {
+        cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    let ended = tokio::time::timeout(Duration::from_millis(500), pair.recv())
+        .await
+        .unwrap();
+    assert!(matches!(ended, Ok(None) | Err(_)));
+    assert!(
+        !rig.mac
+            .store
+            .peers()
+            .unwrap()
+            .contains(&identity.fingerprint())
+    );
+}
+
+#[tokio::test]
+async fn capture_overflow_stops_sharing_and_releases_control_instead_of_losing_key_up() {
+    use ferry_engine::{Event, Events};
+    let (events, mut rx) = Events::channel();
+    let mut rig = Rig::with(Setup {
+        mac_events: events,
+        ..Setup::default()
+    })
+    .await;
+    rig.enter().await;
+    rig.key(KeyCode::LEFT_SHIFT, KeyAction::Down);
+    eventually("远端按下Shift", || {
+        rig.inject.events().contains(&InputEvent::Key {
+            code: KeyCode::LEFT_SHIFT,
+            action: KeyAction::Down,
+        })
+    })
+    .await;
+    // 当前线程不yield，模拟原生捕获生产者远快于引擎。最后的Up不能被无声丢弃后继续控制。
+    for _ in 0..5000 {
+        rig.push(1, 0);
+    }
+    rig.key(KeyCode::LEFT_SHIFT, KeyAction::Up);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut rig.server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(error.to_string().contains("输入捕获队列已满"));
+    assert!(!rig.capture.is_grabbed());
+    eventually("连接关闭释放远端按键", || {
+        rig.inject.events().contains(&InputEvent::Key {
+            code: KeyCode::LEFT_SHIFT,
+            action: KeyAction::Up,
+        })
+    })
+    .await;
+    let mut overflow = false;
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Metrics {
+            peer: None,
+            metrics,
+        } = event
+        {
+            overflow |= metrics.capture.overflows > 0;
+            assert!(metrics.capture.high_water <= 4096);
+            assert_eq!(metrics.capture.oldest_us, None);
+        }
+    }
+    assert!(overflow, "记录有界队列溢出以便诊断");
+    rig.client.abort();
+}
+
+#[tokio::test]
+async fn enabling_move_coalescing_preserves_modified_movement_and_drag_paths() {
+    use ferry_engine::{InputSettings, Live};
+    let live = Live {
+        side: ferry_types::Side::Right,
+        layout: Vec::new(),
+        devices: Vec::new(),
+        fallback: ferry_types::DeviceSettings::default(),
+        mouse_dpi: 1600,
+        input: InputSettings {
+            coalesce_motion: true,
+        },
+    };
+    let rig = Rig::with(Setup {
+        live: Some(live.fixed()),
+        ..Setup::default()
+    })
+    .await;
+    rig.enter().await;
+    rig.push(200, 0);
+    eventually("移动到屏幕内部", || {
+        matches!(rig.inject.events().last(),
+        Some(InputEvent::PointerMotion { position }) if position.x > 100)
+    })
+    .await;
+    let before = rig.inject.events().len();
+    rig.key(KeyCode::LEFT_SHIFT, KeyAction::Down);
+    for _ in 0..30 {
+        rig.push(2, 1);
+    }
+    rig.key(KeyCode::LEFT_SHIFT, KeyAction::Up);
+    rig.capture.emit(CaptureEvent::Button {
+        button: MouseButton::LEFT,
+        pressed: true,
+    });
+    for _ in 0..30 {
+        rig.push(2, -1);
+    }
+    rig.capture.emit(CaptureEvent::Button {
+        button: MouseButton::LEFT,
+        pressed: false,
+    });
+    eventually("完整按键与拖拽路径到达", || {
+        rig.inject.events().len() >= before + 64
+    })
+    .await;
+    let events = rig.inject.events();
+    assert_eq!(
+        events[before..]
+            .iter()
+            .filter(|e| matches!(e, InputEvent::PointerMotion { .. }))
+            .count(),
+        60
+    );
+    rig.leave().await;
+    assert!(!rig.capture.is_grabbed(), "合并不能挡住边缘切回");
+}
+
+#[tokio::test]
+async fn input_metrics_report_local_stages_without_cross_device_timestamps() {
+    use ferry_engine::{Event, Events};
+    let (mac_events, mut mac) = Events::channel();
+    let (pc_events, mut pc) = Events::channel();
+    let rig = Rig::with(Setup {
+        mac_events,
+        pc_events,
+        ..Setup::default()
+    })
+    .await;
+    rig.enter().await;
+    rig.push(20, 0);
+    rig.key(KeyCode::LEFT_SHIFT, KeyAction::Down);
+    rig.key(KeyCode::LEFT_SHIFT, KeyAction::Up);
+    eventually("输入已经到达远端", || {
+        rig.inject.events().iter().any(|e| {
+            matches!(
+                e,
+                InputEvent::Key {
+                    code: KeyCode::LEFT_SHIFT,
+                    action: KeyAction::Up
+                }
+            )
+        })
+    })
+    .await;
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    let (mut captured, mut sent, mut injected) = (false, false, false);
+    while let Ok(event) = mac.try_recv() {
+        if let Event::Metrics { peer, metrics } = event {
+            if peer.is_none() && metrics.capture_queue.count > 0 {
+                captured = true;
+                assert_eq!(metrics.capture.oldest_us, None);
+                assert_eq!(metrics.capture.max_wait_us, metrics.capture_queue.max_us);
+            }
+            if peer.is_some() && metrics.send_queue.count > 0 {
+                sent = true;
+                assert!(metrics.send.count > 0);
+                assert!(metrics.outbound.high_water > 0);
+                assert_eq!(metrics.inject.count, 0, "发送端不能伪造对端注入时间");
+            }
+        }
+    }
+    while let Ok(event) = pc.try_recv() {
+        if let Event::Metrics {
+            peer: Some(_),
+            metrics,
+        } = event
+            && metrics.inject.count > 0
+        {
+            injected = true;
+            assert_eq!(metrics.capture_queue.count, 0);
+            assert!(metrics.scheduler.count > 0);
+        }
+    }
+    assert!((captured, sent, injected) == (true, true, true));
+    rig.client.abort();
+    rig.server.abort();
 }

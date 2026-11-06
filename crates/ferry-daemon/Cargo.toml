@@ -11,7 +11,12 @@ name = "screenferry"
 path = "src/main.rs"
 test = false
 
+[features]
+default = []
+quic-experiment = ["ferry-engine/quic-experiment"]
+
 [dependencies]
+
 ferry-core.workspace = true
 ferry-engine.workspace = true
 ferry-platform.workspace = true

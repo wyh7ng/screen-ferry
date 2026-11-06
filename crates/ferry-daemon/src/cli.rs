@@ -39,6 +39,15 @@ serve 的选项：
              不在局域网里广播本机，客户端须手动填写地址
 
 通用选项：
+  --quic-reliable-only
+             QUIC仅使用可靠流，用于和默认TCP、QUIC位置DATAGRAM对照
+  --coalesce-motion
+             serve：合并连续无按键普通鼠标移动，默认关闭，拖拽/按键/边缘仍逐条发送
+  --file-rate-limit-mbps MB/s
+             文件发送限速，0为不限；输入不受该限速控制
+  --transport tcp|quic|auto
+             默认 tcp；quic/auto 需要 quic-experiment 编译功能，仅调试实验。
+             auto 建连失败才回退 TCP；serve 实验模式也保留 TCP 监听。
   --name     显示给对方的设备名，默认取计算机名
   --no-clipboard
              不同步剪贴板。任意一端加上即关闭
@@ -62,6 +71,9 @@ pub(crate) struct Options {
     pub(crate) clipboard: bool,
     pub(crate) data_dir: Option<PathBuf>,
     pub(crate) verbose: bool,
+    pub(crate) transport: ferry_engine::Transport,
+    pub(crate) coalesce_motion: bool,
+    pub(crate) file_rate_limit_mbps: u32,
 }
 
 pub(crate) enum Mode {
@@ -124,6 +136,10 @@ pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, St
     let mut name = None;
     let mut data_dir = None;
     let mut verbose = false;
+    let mut transport = ferry_engine::Transport::Tcp;
+    let mut coalesce_motion = false;
+    let mut reliable_only = false;
+    let mut file_rate_limit_mbps = 0;
     let mut autostart = false;
 
     while let Some(arg) = args.next() {
@@ -133,6 +149,27 @@ pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, St
             "-v" | "--verbose" => verbose = true,
             "--data-dir" => data_dir = Some(PathBuf::from(value("--data-dir")?)),
             "--autostart" if command == "resident" => autostart = true,
+            "--quic-reliable-only" if runs => reliable_only = true,
+            "--coalesce-motion" if command == "serve" => coalesce_motion = true,
+            "--file-rate-limit-mbps" if runs => {
+                file_rate_limit_mbps = value("--file-rate-limit-mbps")?
+                    .parse::<u32>()
+                    .map_err(|_| "文件限速应为0到1024的整数MB/s")?;
+                if file_rate_limit_mbps > ferry_types::Config::MAX_FILE_RATE_MBPS {
+                    return Err("文件限速应为0到1024的整数MB/s".into());
+                }
+            }
+            "--transport" if runs => {
+                transport = match value("--transport")?.as_str() {
+                    "tcp" => ferry_engine::Transport::Tcp,
+                    "quic" if cfg!(feature = "quic-experiment") => ferry_engine::Transport::Quic,
+                    "auto" if cfg!(feature = "quic-experiment") => ferry_engine::Transport::Auto,
+                    "quic" | "auto" => {
+                        return Err("QUIC需要以 --features quic-experiment 构建".into());
+                    }
+                    _ => return Err("--transport 只能是 tcp、quic、auto".into()),
+                };
+            }
             "--name" if runs => name = Some(value("--name")?),
             "--no-clipboard" if runs => clipboard = false,
             "--listen" if command == "serve" => listen = resolve(&value("--listen")?)?,
@@ -153,6 +190,12 @@ pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, St
         }
     }
 
+    if reliable_only {
+        if transport == ferry_engine::Transport::Tcp {
+            return Err("--quic-reliable-only只适用于--transport quic或auto".into());
+        }
+        transport = transport.reliable_only();
+    }
     let mode = match command.as_str() {
         "resident" => Mode::Resident { autostart },
         "serve" => Mode::Serve {
@@ -181,6 +224,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, St
         clipboard,
         data_dir,
         verbose,
+        transport,
+        coalesce_motion,
+        file_rate_limit_mbps,
     }))
 }
 

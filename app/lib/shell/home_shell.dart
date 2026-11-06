@@ -45,7 +45,7 @@ class HomeShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.navigation, AppAspect.connection, AppAspect.local});
     final c = SfColors.of(context);
     // 页面区放在固定的 GlobalKey 下：窗口在侧栏与底部标签栏两种布局之间切换时，页面状态（滚动位置、筛选）不丢。
     final pages = KeyedSubtree(

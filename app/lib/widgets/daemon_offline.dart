@@ -18,7 +18,7 @@ class DaemonOffline extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context);
+    final state = AppScope.of(context, aspects: const {AppAspect.connection});
     final c = SfColors.of(context);
     final connecting = state.daemonLink == DaemonLink.connecting;
     final daemon = this.daemon;

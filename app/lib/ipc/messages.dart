@@ -3,7 +3,7 @@
 // 不认识的字段忽略，不认识的取值退回到合理的缺省值。
 
 /// 协议版本。
-const ipcVersion = 2;
+const ipcVersion = 3;
 
 typedef Json = Map<String, Object?>;
 
@@ -72,6 +72,7 @@ enum DialError { badAddress, refused, unreachable, notScreenFerry, incompatible,
 /// 后台的完整状态快照。
 class DaemonState {
   const DaemonState({
+    this.session = '',
     required this.local,
     required this.sharing,
     required this.problem,
@@ -82,9 +83,11 @@ class DaemonState {
     required this.settings,
     required this.activity,
     this.update = const UpdateInfo(),
+    this.performance = const PerformanceInfo(),
   });
 
   factory DaemonState.fromJson(Json j) => DaemonState(
+    session: _str(j['session']),
     local: Local.fromJson(j['local'] as Json? ?? const {}),
     sharing: _bool(j['sharing']),
     problem: j['problem'] is Json ? Problem.fromJson(j['problem'] as Json) : null,
@@ -95,8 +98,10 @@ class DaemonState {
     settings: DaemonSettings.fromJson(j['settings'] as Json? ?? const {}),
     activity: [for (final a in _list(j['activity'])) HourActivity.fromJson(a)],
     update: j['update'] is Json ? UpdateInfo.fromJson(j['update'] as Json) : const UpdateInfo(),
+    performance: PerformanceInfo.fromJson(j['performance'] is Json ? j['performance'] as Json : const {}),
   );
 
+  final String session;
   final Local local;
 
   /// 用户没有暂停共享。
@@ -111,6 +116,109 @@ class DaemonState {
 
   /// 版本更新。旧版后台没有，为缺省值。
   final UpdateInfo update;
+  final PerformanceInfo performance;
+}
+
+/// 最近一个测量窗口的本机阶段统计，不代表单程端到端延迟。
+class PerformanceInfo {
+  const PerformanceInfo({this.peers = const []});
+  factory PerformanceInfo.fromJson(Json j) =>
+      PerformanceInfo(peers: List.unmodifiable([for (final p in _list(j['peers'])) PeerPerformance.fromJson(p)]));
+  final List<PeerPerformance> peers;
+  Object get value => [for (final p in peers) p.value];
+}
+
+class PeerPerformance {
+  const PeerPerformance({this.fingerprint, this.measuredAt, this.metrics = const PerformanceMetrics()});
+  factory PeerPerformance.fromJson(Json j) => PeerPerformance(
+    fingerprint: j['fingerprint'] is String ? j['fingerprint'] as String : null,
+    measuredAt: _time(j['measured_at']),
+    metrics: PerformanceMetrics.fromJson(j['metrics'] is Json ? j['metrics'] as Json : const {}),
+  );
+  final String? fingerprint;
+  final DateTime? measuredAt;
+  final PerformanceMetrics metrics;
+  Object get value => [fingerprint, measuredAt, metrics.value];
+}
+
+class PerformanceMetrics {
+  const PerformanceMetrics({
+    this.windowMs = 5000,
+    this.latencies = const {},
+    this.capture = const QueueSummary(),
+    this.outbound = const QueueSummary(),
+  });
+  static const stages = ['capture_queue', 'send_queue', 'send', 'inject', 'rtt', 'scheduler'];
+  factory PerformanceMetrics.fromJson(Json j) => PerformanceMetrics(
+    windowMs: j['window_ms'] is num ? _int(j['window_ms']) : 5000,
+    latencies: Map.unmodifiable({
+      for (final key in stages) key: LatencySummary.fromJson(j[key] is Json ? j[key] as Json : const {}),
+    }),
+    capture: QueueSummary.fromJson(j['capture'] is Json ? j['capture'] as Json : const {}),
+    outbound: QueueSummary.fromJson(j['outbound'] is Json ? j['outbound'] as Json : const {}),
+  );
+  final int windowMs;
+  final Map<String, LatencySummary> latencies;
+  final QueueSummary capture;
+  final QueueSummary outbound;
+  Object get value => [
+    windowMs,
+    [for (final key in stages) (latencies[key] ?? const LatencySummary()).value],
+    capture.value,
+    outbound.value,
+  ];
+}
+
+class LatencySummary {
+  const LatencySummary({
+    this.count = 0,
+    this.p50Us = 0,
+    this.p95Us = 0,
+    this.p99Us = 0,
+    this.maxUs = 0,
+    this.over100ms = 0,
+  });
+  factory LatencySummary.fromJson(Json j) => LatencySummary(
+    count: _int(j['count']),
+    p50Us: _int(j['p50_us']),
+    p95Us: _int(j['p95_us']),
+    p99Us: _int(j['p99_us']),
+    maxUs: _int(j['max_us']),
+    over100ms: _int(j['over_100ms']),
+  );
+  final int count;
+  final int p50Us;
+  final int p95Us;
+  final int p99Us;
+  final int maxUs;
+  final int over100ms;
+  Object get value => [count, p50Us, p95Us, p99Us, maxUs, over100ms];
+}
+
+class QueueSummary {
+  const QueueSummary({
+    this.depth = 0,
+    this.highWater = 0,
+    this.oldestUs,
+    this.maxWaitUs = 0,
+    this.coalesced = 0,
+    this.overflows = 0,
+  });
+  factory QueueSummary.fromJson(Json j) => QueueSummary(
+    depth: _int(j['depth']),
+    highWater: _int(j['high_water']),
+    oldestUs: j['oldest_us'] is num ? _int(j['oldest_us']) : null,
+    maxWaitUs: _int(j['max_wait_us']),
+    coalesced: _int(j['coalesced']),
+    overflows: _int(j['overflows']),
+  );
+  final int depth;
+  final int highWater;
+  final int? oldestUs;
+  final int maxWaitUs;
+  final int coalesced;
+  final int overflows;
+  Object get value => [depth, highWater, oldestUs, maxWaitUs, coalesced, overflows];
 }
 
 /// 版本更新的进度（ADR 0014）。
@@ -545,6 +653,8 @@ class DaemonSettings {
     required this.clipboard,
     this.clipboardLimitMb = 32,
     this.mouseDpi = 1600,
+    this.fileRateLimitMbps = 0,
+    this.coalesceMotion = false,
     required this.server,
     required this.autostart,
     required this.theme,
@@ -568,6 +678,8 @@ class DaemonSettings {
     clipboard: _bool(j['clipboard']),
     clipboardLimitMb: j['clipboard_limit_mb'] is num ? _int(j['clipboard_limit_mb']) : 32,
     mouseDpi: j['mouse_dpi'] is num ? _int(j['mouse_dpi']) : 1600,
+    fileRateLimitMbps: _int(j['file_rate_limit_mbps']).clamp(0, 1024),
+    coalesceMotion: _bool(j['coalesce_motion']),
     server: _str(j['server']),
     autostart: _bool(j['autostart']),
     theme: _enum(UiTheme.values, j['theme'], UiTheme.system),
@@ -593,6 +705,8 @@ class DaemonSettings {
 
   /// 本机鼠标的 DPI。每台设备的光标速度以它为准。
   final int mouseDpi;
+  final int fileRateLimitMbps;
+  final bool coalesceMotion;
   final String server;
   final bool autostart;
   final UiTheme theme;
@@ -620,6 +734,8 @@ class DaemonSettings {
     clipboard: p.clipboard ?? clipboard,
     clipboardLimitMb: p.clipboardLimitMb ?? clipboardLimitMb,
     mouseDpi: p.mouseDpi ?? mouseDpi,
+    fileRateLimitMbps: p.fileRateLimitMbps ?? fileRateLimitMbps,
+    coalesceMotion: p.coalesceMotion ?? coalesceMotion,
     server: p.server ?? server,
     autostart: p.autostart ?? autostart,
     theme: p.theme ?? theme,
@@ -641,6 +757,8 @@ class DaemonSettings {
       clipboard: clipboard,
       clipboardLimitMb: clipboardLimitMb,
       mouseDpi: mouseDpi,
+      fileRateLimitMbps: fileRateLimitMbps,
+      coalesceMotion: coalesceMotion,
       server: server,
       autostart: autostart,
       theme: theme,
@@ -939,6 +1057,7 @@ class LogEntry {
 /// 请用户核对的配对码。
 class PairingPrompt {
   const PairingPrompt({
+    this.session = '',
     required this.id,
     required this.peerName,
     required this.fingerprint,
@@ -947,6 +1066,7 @@ class PairingPrompt {
   });
 
   factory PairingPrompt.fromJson(Json j) => PairingPrompt(
+    session: _str(j['session']),
     id: _int(j['id']),
     peerName: _str(j['peer_name']),
     fingerprint: _str(j['fingerprint']),
@@ -954,6 +1074,7 @@ class PairingPrompt {
     code: _str(j['code']),
   );
 
+  final String session;
   final int id;
   final String peerName;
   final String fingerprint;
@@ -974,6 +1095,13 @@ sealed class Notice {
   /// 不认识的 `type` 返回 null。
   static Notice? fromJson(Json j) => switch (j['type']) {
     'welcome' => WelcomeNotice(_int(j['version'])),
+    'update_health' => UpdateHealthNotice(_str(j['version'])),
+    'command_result' => CommandResultNotice(
+      session: _str(j['session']),
+      id: _int(j['id']),
+      ok: _bool(j['ok']),
+      message: _str(j['message']),
+    ),
     'state' => StateNotice(DaemonState.fromJson(j['state'] as Json? ?? const {})),
     'history' => HistoryNotice([for (final e in _list(j['entries'])) LogEntry.fromJson(e)]),
     'log' => LogNotice(LogEntry.fromJson(j['entry'] as Json? ?? const {})),
@@ -982,6 +1110,7 @@ sealed class Notice {
     'toast' => ToastNotice(_str(j['text']), phrase: Phrase.fromJson(j['phrase'])),
     'show_device' => ShowDeviceNotice(_str(j['fingerprint'])),
     'dialed' => DialedNotice(
+      requestId: j['request_id'] is num ? _int(j['request_id']) : null,
       address: _str(j['address']),
       invite: _bool(j['invite']),
       error: _enumOrNull(DialError.values, _camel(j['error'])),
@@ -990,6 +1119,10 @@ sealed class Notice {
     'run_log' => RunLogNotice(
       lines: [for (final l in _list(j['lines'])) RunLogLine.fromJson(l)],
       next: _int(j['next']),
+      cursor: j['cursor'] is String ? j['cursor'] as String : null,
+      requestId: j['request_id'] is num ? _int(j['request_id']) : null,
+      more: _bool(j['more']),
+      error: j['error'] is String ? j['error'] as String : null,
       fresh: _bool(j['fresh']),
       bytes: _int(j['bytes']),
       linesTotal: _int(j['lines_total']),
@@ -1003,6 +1136,19 @@ sealed class Notice {
 class WelcomeNotice extends Notice {
   const WelcomeNotice(this.version);
   final int version;
+}
+
+class UpdateHealthNotice extends Notice {
+  const UpdateHealthNotice(this.version);
+  final String version;
+}
+
+class CommandResultNotice extends Notice {
+  const CommandResultNotice({required this.session, required this.id, required this.ok, required this.message});
+  final String session;
+  final int id;
+  final bool ok;
+  final String message;
 }
 
 class StateNotice extends Notice {
@@ -1049,7 +1195,8 @@ class ShowDeviceNotice extends Notice {
 /// 按地址连接（[invite] 为假）或邀请的结果。[error] 为 null 表示成了：
 /// 连上了、开始核对配对码，或者对方接受了邀请、正在连过来。
 class DialedNotice extends Notice {
-  const DialedNotice({required this.address, required this.invite, this.error});
+  const DialedNotice({required this.address, required this.invite, this.error, this.requestId});
+  final int? requestId;
   final String address;
   final bool invite;
   final DialError? error;
@@ -1069,12 +1216,20 @@ class RunLogNotice extends Notice {
     required this.fresh,
     required this.bytes,
     required this.linesTotal,
+    this.cursor,
+    this.requestId,
+    this.more = false,
+    this.error,
   });
   final List<RunLogLine> lines;
   final int next;
   final bool fresh;
   final int bytes;
   final int linesTotal;
+  final String? cursor;
+  final int? requestId;
+  final bool more;
+  final String? error;
 }
 
 /// 诊断文件存好了：完整路径和大小。
@@ -1123,6 +1278,24 @@ class HelloRequest extends Request {
 
   @override
   Json toJson() => {'type': 'hello', 'token': token, 'version': version};
+}
+
+class ExecuteRequest extends Request {
+  const ExecuteRequest({required this.session, required this.id, required this.request});
+  final String session;
+  final int id;
+  final Request request;
+
+  @override
+  Json toJson() => {'type': 'execute', 'session': session, 'id': id, 'request': request.toJson()};
+}
+
+class UpdateHealthRequest extends Request {
+  const UpdateHealthRequest(this.token);
+  final String token;
+
+  @override
+  Json toJson() => {'type': 'update_health', 'token': token};
 }
 
 class SetSharingRequest extends Request {
@@ -1244,11 +1417,13 @@ class QuitRequest extends Request {
 
 /// 读运行日志：[since] 为空时取最近的一段，否则取上次 [RunLogNotice.next] 之后新写的。
 class ReadRunLogRequest extends Request {
-  const ReadRunLogRequest({this.since});
+  const ReadRunLogRequest({this.since, this.cursor, this.requestId});
   final int? since;
+  final String? cursor;
+  final int? requestId;
 
   @override
-  Json toJson() => {'type': 'read_run_log', 'since': ?since};
+  Json toJson() => {'type': 'read_run_log', 'since': ?since, 'cursor': ?cursor, 'request_id': ?requestId};
 }
 
 /// 把诊断文件存到“下载”文件夹。
@@ -1344,6 +1519,8 @@ class SettingsPatch {
     this.clipboard,
     this.clipboardLimitMb,
     this.mouseDpi,
+    this.fileRateLimitMbps,
+    this.coalesceMotion,
     this.server,
     this.autostart,
     this.theme,
@@ -1364,6 +1541,8 @@ class SettingsPatch {
   final bool? clipboard;
   final int? clipboardLimitMb;
   final int? mouseDpi;
+  final int? fileRateLimitMbps;
+  final bool? coalesceMotion;
   final String? server;
   final bool? autostart;
   final UiTheme? theme;
@@ -1380,6 +1559,8 @@ class SettingsPatch {
     'clipboard': ?clipboard,
     'clipboard_limit_mb': ?clipboardLimitMb,
     'mouse_dpi': ?mouseDpi,
+    'file_rate_limit_mbps': ?fileRateLimitMbps,
+    'coalesce_motion': ?coalesceMotion,
     'server': ?server,
     'autostart': ?autostart,
     'theme': ?theme?.name,
@@ -1398,6 +1579,8 @@ class SettingsPatch {
     clipboard: o.clipboard ?? clipboard,
     clipboardLimitMb: o.clipboardLimitMb ?? clipboardLimitMb,
     mouseDpi: o.mouseDpi ?? mouseDpi,
+    fileRateLimitMbps: o.fileRateLimitMbps ?? fileRateLimitMbps,
+    coalesceMotion: o.coalesceMotion ?? coalesceMotion,
     server: o.server ?? server,
     autostart: o.autostart ?? autostart,
     theme: o.theme ?? theme,
@@ -1420,6 +1603,8 @@ class SettingsPatch {
     clipboard: clipboard == s.clipboard ? null : clipboard,
     clipboardLimitMb: clipboardLimitMb == s.clipboardLimitMb ? null : clipboardLimitMb,
     mouseDpi: mouseDpi == s.mouseDpi ? null : mouseDpi,
+    fileRateLimitMbps: fileRateLimitMbps == s.fileRateLimitMbps ? null : fileRateLimitMbps,
+    coalesceMotion: coalesceMotion == s.coalesceMotion ? null : coalesceMotion,
     server: server == s.server ? null : server,
     autostart: autostart == s.autostart ? null : autostart,
     theme: theme == s.theme ? null : theme,
