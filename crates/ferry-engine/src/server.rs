@@ -180,6 +180,7 @@ where
     K: Clipboard,
     P: ConfirmPairing,
 {
+    transport.ensure_available()?;
     let mut server = Server::start(config, capture, displays, clipboard, confirm, transport)?;
     let addr = listener.local_addr()?;
     // 广播失败（例如网络不支持组播）不影响按地址连接。
@@ -606,6 +607,15 @@ where
         };
         self.shared.sessions().insert(id, keys);
 
+        let actual_transport = if framed.get_ref().is_quic() {
+            if caps.contains(Capabilities::QUIC_MOTION) {
+                "quic"
+            } else {
+                "quic_reliable"
+            }
+        } else {
+            "tcp"
+        };
         let (outbox, out_rx) = input_queue(OUTBOX, self.config.live.borrow().input);
         let active = watch::Sender::new(true);
         let io = tokio::spawn(run_session(
@@ -654,6 +664,15 @@ where
             addr,
             platform: Some(platform_of(remote_command)),
         });
+        self.config.events.emit(Event::InputTransport {
+            peer,
+            transport: actual_transport.into(),
+            fallback_reason: None,
+        });
+        info!(
+            input_transport = actual_transport,
+            "输入连接协议；剪贴板/文件使用TCP"
+        );
         self.publish_edges();
     }
 

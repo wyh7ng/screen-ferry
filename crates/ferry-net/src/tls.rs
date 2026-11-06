@@ -71,7 +71,13 @@ impl Tls {
             stream.get_ref().1.peer_certificates(),
         )?;
         Ok((
-            Framed::new(ServerStream::Tcp(Box::new(stream.into())), Channel::Input),
+            Framed::new(
+                ServerStream::Tcp {
+                    stream: Box::new(stream.into()),
+                    fallback_reason: None,
+                },
+                Channel::Input,
+            ),
             peer,
         ))
     }
@@ -92,7 +98,13 @@ impl Tls {
             stream.get_ref().1.peer_certificates(),
         )?;
         Ok((
-            Framed::new(ClientStream::Tcp(Box::new(stream.into())), channel),
+            Framed::new(
+                ClientStream::Tcp {
+                    stream: Box::new(stream.into()),
+                    fallback_reason: None,
+                },
+                channel,
+            ),
             peer,
         ))
     }
@@ -103,24 +115,33 @@ impl Tls {
         channel: Channel,
         transport: crate::Transport,
     ) -> Result<(Framed<ClientStream>, Fingerprint)> {
+        transport.ensure_available()?;
         let transport = if matches!(channel, Channel::Data | Channel::File) {
             crate::Transport::Tcp
         } else {
             transport
         };
+        #[cfg(feature = "quic-experiment")]
+        let mut fallback = false;
+        #[cfg(not(feature = "quic-experiment"))]
+        let fallback = false;
         if transport != crate::Transport::Tcp {
             #[cfg(feature = "quic-experiment")]
             match self.quic.connect(addr, channel).await {
                 Ok(connected) => return Ok(connected),
                 Err(error) if !transport.falls_back() => return Err(error),
-                Err(_) => {}
+                Err(_) => fallback = true,
             }
             #[cfg(not(feature = "quic-experiment"))]
             if !transport.falls_back() {
                 return Err(std::io::Error::other("需要quic-experiment编译feature").into());
             }
         }
-        self.connect(addr, channel).await
+        let (mut stream, peer) = self.connect(addr, channel).await?;
+        if fallback {
+            stream.get_mut().set_fallback_reason("quic_unreachable");
+        }
+        Ok((stream, peer))
     }
 
     #[cfg(feature = "quic-experiment")]

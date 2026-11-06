@@ -203,6 +203,7 @@ class AppState extends ChangeNotifier {
         local?.port,
         local?.invitePort,
         system,
+        quicAvailable,
       ],
       AppAspect.connection: [
         _link,
@@ -216,6 +217,8 @@ class AppState extends ChangeNotifier {
         p?.name,
         p?.short,
         p?.addr,
+        inputTransport,
+        inputFallbackReason,
         problem?.kind,
         problem?.message,
         problem?.port,
@@ -235,6 +238,8 @@ class AppState extends ChangeNotifier {
               p.platform,
               p.addr,
               p.version,
+              p.inputTransport,
+              p.fallbackReason,
             ],
         ],
         [
@@ -251,6 +256,7 @@ class AppState extends ChangeNotifier {
         s.mouseDpi,
         s.fileRateLimitMbps,
         s.coalesceMotion,
+        s.inputTransport,
         s.server,
         s.autostart,
         s.theme,
@@ -397,6 +403,9 @@ class AppState extends ChangeNotifier {
   /// macOS：本机开着“自然滚动”。
   bool get naturalScrolling => _daemon?.local.naturalScrolling ?? false;
   String get version => _daemon?.local.version ?? '';
+  bool get quicAvailable => _daemon?.local.quicAvailable ?? false;
+  InputTransport? get inputTransport => connected ? _daemon?.link.inputTransport : null;
+  String? get inputFallbackReason => connected ? _daemon?.link.fallbackReason : null;
 
   // ── 版本更新 ──
 

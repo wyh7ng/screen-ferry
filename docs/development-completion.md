@@ -70,3 +70,8 @@
 
 
 完成状态：本清单内开发项全部完成，改动保留在 `codex/reliability-fixes`，尚未提交、推送或发布。最新CLI开发产物在 `target/development/`，仅生成未运行。完整Flutter安装包不属于本次源码开发交付；现有Xcode/Windows原生构建环境要求仍按README，未以旧GUI混用新后台。
+
+
+## 安装后追加修复
+
+ADR0018扩展原先仅CLI的QUIC路径：Actions安装版可从设置选择输入传输，显示实际协商结果及回退原因，schema8旧配置默认TCP；已有应用不会自动切换。DMG制作移除签名后FinderInfo写入并验证最终只读映像中的应用。最新证据见repair-validation对应章节，首批与第二批的历史测试计数保留。

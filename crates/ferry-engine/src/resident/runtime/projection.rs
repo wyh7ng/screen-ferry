@@ -39,6 +39,7 @@ impl<H: Host> Runtime<H> {
                 peers: self.performance.values().cloned().collect(),
             },
             local: Local {
+                quic_available: crate::Transport::quic_available(),
                 name: self.name.clone(),
                 fingerprint: self.fingerprint.to_hex(),
                 short: self.fingerprint.short(),
@@ -56,6 +57,8 @@ impl<H: Host> Runtime<H> {
             sharing: !self.paused,
             problem: self.problem.clone(),
             link: Link {
+                input_transport: focus.and_then(|link| link.input_transport.clone()),
+                fallback_reason: focus.and_then(|link| link.fallback_reason.clone()),
                 status: self.status,
                 peer: focus.map(|l| l.peer.clone()),
                 since: focus.map(|l| l.since),
@@ -72,6 +75,16 @@ impl<H: Host> Runtime<H> {
                 .peers
                 .iter()
                 .map(|p| PeerInfo {
+                    input_transport: self
+                        .links
+                        .iter()
+                        .find(|link| link.fingerprint == p.fingerprint)
+                        .and_then(|link| link.input_transport.clone()),
+                    fallback_reason: self
+                        .links
+                        .iter()
+                        .find(|link| link.fingerprint == p.fingerprint)
+                        .and_then(|link| link.fallback_reason.clone()),
                     name: p.name.clone(),
                     fingerprint: p.fingerprint.to_hex(),
                     short: p.fingerprint.short(),
@@ -109,6 +122,7 @@ impl<H: Host> Runtime<H> {
                 })
                 .collect(),
             settings: Settings {
+                input_transport: self.config.input_transport,
                 name: self.config.name.clone(),
                 side: self.config.side,
                 layout: self.config.layout.clone(),

@@ -127,7 +127,7 @@ macOS 上钥匙串里有 Developer ID 证书时自动签名（也可以用 `SCRE
 
 ### QUIC 输入实验（可选）
 
-默认构建与常驻应用继续使用 TCP。开发者可用 `cargo build -p ferry-daemon --features quic-experiment` 构建实验后台，再以 `serve/connect --transport quic` 运行；`--transport auto` 在建立连接失败时回退 TCP。`--quic-reliable-only` 可关闭位置数据报作对照。剪贴板和文件仍走 TCP。
+已有设置默认保持 TCP。Actions 开发安装包包含 QUIC 支持，两端设置可选择 TCP、自动（优先 QUIC，失败回退 TCP）、QUIC（允许位置数据报）或纯可靠 QUIC。总览和设备页显示实际输入协议及回退原因；剪贴板和文件仍走 TCP。本地打包使用 `cargo xtask bundle --quic-experiment`（macOS 可加 `--universal --dmg`），未编译该功能的版本只提供 TCP。CLI 的 `--transport quic|auto`、`--quic-reliable-only` 继续可用。
 协议、配对、顺序屏障和命令示例见 [ADR 0017](docs/adr/0017-quic-input-experiment.md)。这是开发实验，尚无真实局域网延迟收益结论。
 
 ## 开发

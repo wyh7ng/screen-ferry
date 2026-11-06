@@ -81,7 +81,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 ; 防火墙：允许本程序在专用网络和域网络上接受连接（键鼠、剪贴板、邀请、局域网发现），先删后加，重装不会重复。
-; 公用网络不放行，连到公用网络时 Windows 会照常询问。
+; 应用入站规则不限定协议，包含TCP 24810/24811与QUIC UDP 24810。公用网络不放行。
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#AppName}"""; Flags: runhidden waituntilterminated; StatusMsg: "{cm:FirewallStatus}"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#AppName}"" dir=in action=allow program=""{app}\{#AppExe}"" enable=yes profile=private,domain"; Flags: runhidden waituntilterminated
 ; 安装前正在运行的：装完马上以原来的用户身份重新启动，不弹出设置界面。

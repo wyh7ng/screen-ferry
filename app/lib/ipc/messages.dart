@@ -37,6 +37,9 @@ String _snake(Enum v) => v.name.replaceAllMapped(RegExp('[A-Z]'), (m) => '_${m[0
 
 enum Role { server, client }
 
+/// 仅键鼠输入连接；剪贴板和文件仍使用 TCP。
+enum InputTransport { tcp, auto, quic, quicReliable }
+
 enum ScreenSide { left, right, top, bottom }
 
 /// 设置界面的配色，取值与 Flutter 的 ThemeMode 同名。
@@ -343,6 +346,7 @@ class Local {
     this.invitePort,
     this.system = '',
     this.verboseSince,
+    this.quicAvailable = false,
   });
 
   factory Local.fromJson(Json j) => Local(
@@ -362,6 +366,7 @@ class Local {
     invitePort: j['invite_port'] is num ? _int(j['invite_port']) : null,
     system: _str(j['system']),
     verboseSince: j['verbose_since'] is num ? DateTime.fromMillisecondsSinceEpoch(_int(j['verbose_since'])) : null,
+    quicAvailable: _bool(j['quic_available']),
   );
 
   final String name;
@@ -391,6 +396,7 @@ class Local {
 
   /// 详细记录从什么时候开着；关着时为 null。
   final DateTime? verboseSince;
+  final bool quicAvailable;
 }
 
 class Problem {
@@ -440,9 +446,13 @@ class Link {
     required this.since,
     required this.cursorOnPeer,
     required this.rttMs,
+    this.inputTransport,
+    this.fallbackReason,
   });
 
   factory Link.fromJson(Json j) => Link(
+    inputTransport: _enumOrNull(InputTransport.values, _camel(j['input_transport'])),
+    fallbackReason: j['fallback_reason'] is String ? j['fallback_reason'] as String : null,
     status: _enum(LinkStatus.values, j['status'], LinkStatus.starting),
     peer: j['peer'] is Json ? PeerRef.fromJson(j['peer'] as Json) : null,
     since: _time(j['since']),
@@ -453,6 +463,8 @@ class Link {
     ],
   );
 
+  final InputTransport? inputTransport;
+  final String? fallbackReason;
   final LinkStatus status;
   final PeerRef? peer;
   final DateTime? since;
@@ -548,6 +560,8 @@ class PeerInfo {
     this.platform = '',
     this.addr = '',
     this.version = '',
+    this.inputTransport,
+    this.fallbackReason,
   });
 
   factory PeerInfo.fromJson(Json j) => PeerInfo(
@@ -562,6 +576,8 @@ class PeerInfo {
     platform: _str(j['platform']),
     addr: _str(j['addr']),
     version: _str(j['version']),
+    inputTransport: _enumOrNull(InputTransport.values, _camel(j['input_transport'])),
+    fallbackReason: j['fallback_reason'] is String ? j['fallback_reason'] as String : null,
   );
 
   /// 它自己报的名字。
@@ -590,6 +606,8 @@ class PeerInfo {
 
   /// 它的 ScreenFerry 版本；本次运行还没连上过、或者它的版本太旧不说时为空。
   final String version;
+  final InputTransport? inputTransport;
+  final String? fallbackReason;
 
   /// 显示给用户的名字：起过名字就用起的。
   String get displayName => alias.trim().isEmpty ? name : alias.trim();
@@ -655,6 +673,7 @@ class DaemonSettings {
     this.mouseDpi = 1600,
     this.fileRateLimitMbps = 0,
     this.coalesceMotion = false,
+    this.inputTransport = InputTransport.tcp,
     required this.server,
     required this.autostart,
     required this.theme,
@@ -680,6 +699,7 @@ class DaemonSettings {
     mouseDpi: j['mouse_dpi'] is num ? _int(j['mouse_dpi']) : 1600,
     fileRateLimitMbps: _int(j['file_rate_limit_mbps']).clamp(0, 1024),
     coalesceMotion: _bool(j['coalesce_motion']),
+    inputTransport: _enum(InputTransport.values, _camel(j['input_transport']), InputTransport.tcp),
     server: _str(j['server']),
     autostart: _bool(j['autostart']),
     theme: _enum(UiTheme.values, j['theme'], UiTheme.system),
@@ -707,6 +727,7 @@ class DaemonSettings {
   final int mouseDpi;
   final int fileRateLimitMbps;
   final bool coalesceMotion;
+  final InputTransport inputTransport;
   final String server;
   final bool autostart;
   final UiTheme theme;
@@ -736,6 +757,7 @@ class DaemonSettings {
     mouseDpi: p.mouseDpi ?? mouseDpi,
     fileRateLimitMbps: p.fileRateLimitMbps ?? fileRateLimitMbps,
     coalesceMotion: p.coalesceMotion ?? coalesceMotion,
+    inputTransport: p.inputTransport ?? inputTransport,
     server: p.server ?? server,
     autostart: p.autostart ?? autostart,
     theme: p.theme ?? theme,
@@ -759,6 +781,7 @@ class DaemonSettings {
       mouseDpi: mouseDpi,
       fileRateLimitMbps: fileRateLimitMbps,
       coalesceMotion: coalesceMotion,
+      inputTransport: inputTransport,
       server: server,
       autostart: autostart,
       theme: theme,
@@ -1521,6 +1544,7 @@ class SettingsPatch {
     this.mouseDpi,
     this.fileRateLimitMbps,
     this.coalesceMotion,
+    this.inputTransport,
     this.server,
     this.autostart,
     this.theme,
@@ -1543,6 +1567,7 @@ class SettingsPatch {
   final int? mouseDpi;
   final int? fileRateLimitMbps;
   final bool? coalesceMotion;
+  final InputTransport? inputTransport;
   final String? server;
   final bool? autostart;
   final UiTheme? theme;
@@ -1561,6 +1586,7 @@ class SettingsPatch {
     'mouse_dpi': ?mouseDpi,
     'file_rate_limit_mbps': ?fileRateLimitMbps,
     'coalesce_motion': ?coalesceMotion,
+    'input_transport': ?inputTransport == null ? null : _snake(inputTransport!),
     'server': ?server,
     'autostart': ?autostart,
     'theme': ?theme?.name,
@@ -1581,6 +1607,7 @@ class SettingsPatch {
     mouseDpi: o.mouseDpi ?? mouseDpi,
     fileRateLimitMbps: o.fileRateLimitMbps ?? fileRateLimitMbps,
     coalesceMotion: o.coalesceMotion ?? coalesceMotion,
+    inputTransport: o.inputTransport ?? inputTransport,
     server: o.server ?? server,
     autostart: o.autostart ?? autostart,
     theme: o.theme ?? theme,
@@ -1605,6 +1632,7 @@ class SettingsPatch {
     mouseDpi: mouseDpi == s.mouseDpi ? null : mouseDpi,
     fileRateLimitMbps: fileRateLimitMbps == s.fileRateLimitMbps ? null : fileRateLimitMbps,
     coalesceMotion: coalesceMotion == s.coalesceMotion ? null : coalesceMotion,
+    inputTransport: inputTransport == s.inputTransport ? null : inputTransport,
     server: server == s.server ? null : server,
     autostart: autostart == s.autostart ? null : autostart,
     theme: theme == s.theme ? null : theme,

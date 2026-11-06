@@ -49,6 +49,12 @@ pub enum Event {
         peer: Option<Fingerprint>,
         metrics: Box<crate::metrics::InputMetrics>,
     },
+    /// 已认证输入会话的实际协议；配对/偏好不构成协商结果。
+    InputTransport {
+        peer: Fingerprint,
+        transport: String,
+        fallback_reason: Option<String>,
+    },
     /// 与 `peer` 的一次往返延迟。
     Rtt { peer: Fingerprint, rtt: Duration },
     /// 光标是否在本机。不在时它在 `peer` 上；回到本机时 `peer` 是它刚离开的那台。

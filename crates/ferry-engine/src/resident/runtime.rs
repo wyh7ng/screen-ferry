@@ -39,7 +39,7 @@ use super::record::{Activity, Log, Rtt, now_ms};
 use super::ui::UiEvent;
 use super::update::{Outcome, UpdateEvent, Updates};
 use super::{Command, Host, Summary};
-use crate::client::{ClientCommand, ClientConfig, ServerAddr, connect};
+use crate::client::{ClientCommand, ClientConfig, ServerAddr, connect_with_transport};
 use crate::clipboard::ClipLimit;
 use crate::edge_drop::EdgeDrop;
 use crate::error::{Error, Result};
@@ -47,7 +47,7 @@ use crate::events::{DialError, Event, Events, FoundServer, TransferState, Transf
 use crate::files::Files;
 use crate::invite::{INVITE_PORT, invite};
 use crate::link::DEFAULT_PORT;
-use crate::server::{Live, ServerConfig, serve};
+use crate::server::{Live, ServerConfig, serve_with_transport};
 
 /// 缺少权限时多久再试一次：用户在系统设置里勾上之后很快就能用。
 const RETRY_PERMISSION: Duration = Duration::from_secs(2);
@@ -102,6 +102,8 @@ struct Pending {
 
 /// 一台连着的设备。
 struct LinkInfo {
+    input_transport: Option<String>,
+    fallback_reason: Option<String>,
     fingerprint: Fingerprint,
     peer: PeerRef,
     /// 连上的时刻（Unix 毫秒）。
@@ -379,6 +381,8 @@ impl<H: Host> Runtime<H> {
     }
 
     fn spawn_server(&mut self, confirm: UiConfirm) -> Result<()> {
+        let transport = crate::Transport::from(self.config.input_transport);
+        transport.ensure_available()?;
         self.host.check_permissions(Role::Server)?;
         let capture = self.host.capture()?;
         let (live_tx, live_rx) = watch::channel(self.live());
@@ -398,7 +402,10 @@ impl<H: Host> Runtime<H> {
         let port = self.host.listen_port();
         let handle = tokio::spawn(async move {
             let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
-            serve(listener, config, capture, displays, clipboard, confirm).await
+            serve_with_transport(
+                listener, config, capture, displays, clipboard, confirm, transport,
+            )
+            .await
         });
         self.engine = Some(EngineTask {
             handle,
@@ -409,6 +416,8 @@ impl<H: Host> Runtime<H> {
     }
 
     fn spawn_client(&mut self, confirm: UiConfirm) -> Result<()> {
+        let transport = crate::Transport::from(self.config.input_transport);
+        transport.ensure_available()?;
         self.host.check_permissions(Role::Client)?;
         let inject = self.host.inject()?;
         let address = self.config.server.trim().to_owned();
@@ -438,7 +447,7 @@ impl<H: Host> Runtime<H> {
                         .ok_or_else(|| Error::BadAddress(address))?,
                 );
             }
-            connect(config, inject, displays, clipboard, confirm).await
+            connect_with_transport(config, inject, displays, clipboard, confirm, transport).await
         });
         self.engine = Some(EngineTask {
             handle,
@@ -712,6 +721,8 @@ impl<H: Host> Runtime<H> {
                 self.performance.remove(&fingerprint.to_hex());
                 self.links.retain(|l| l.fingerprint != fingerprint);
                 self.links.push(LinkInfo {
+                    input_transport: None,
+                    fallback_reason: None,
                     fingerprint,
                     peer: PeerRef {
                         name: name.clone(),
@@ -738,7 +749,38 @@ impl<H: Host> Runtime<H> {
                     LogIcon::Link,
                     phrase,
                     format!("已连接 {}", mark::device(&name)),
-                    format!("TLS 1.3 · {}", addr.ip()),
+                    format!("{}", addr.ip()),
+                );
+            }
+            Event::InputTransport {
+                peer,
+                transport,
+                fallback_reason,
+            } => {
+                let Some(link) = self.links.iter_mut().find(|link| link.fingerprint == peer) else {
+                    return;
+                };
+                link.input_transport = Some(transport.clone());
+                link.fallback_reason = fallback_reason.clone();
+                let name = self.peer_name(&peer);
+                let label = match transport.as_str() {
+                    "quic" => "QUIC（允许位置数据报）",
+                    "quic_reliable" => "QUIC（可靠流）",
+                    _ => "TCP + TLS 1.3",
+                };
+                let mut detail = format!("输入 {label} · 剪贴板/文件 TCP + TLS 1.3");
+                if let Some(reason) = &fallback_reason {
+                    detail.push_str(&format!(" · 回退原因 {reason}"));
+                }
+                self.log(
+                    LogKind::Link,
+                    LogIcon::Link,
+                    Phrase::new("input_transport")
+                        .arg("name", &name)
+                        .arg("transport", &transport)
+                        .arg("fallback_reason", fallback_reason.as_deref().unwrap_or("")),
+                    format!("{} 的输入连接", mark::device(&name)),
+                    detail,
                 );
             }
             Event::Disconnected { peer, reason } => {

@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../l10n/l10n.dart';
 import '../state/app_scope.dart';
 import '../state/app_state.dart';
+import '../state/transport_text.dart';
 import '../theme/tokens.dart';
 import '../widgets/address_dialog.dart';
 import '../widgets/name_editor.dart';
@@ -85,7 +86,7 @@ class DevicesPage extends StatelessWidget {
         SectionTitle(context.l10n.devicesPaired, note: context.l10n.devicesCount(state.peers.length)),
         _CardWall(
           // 服务端的卡片多一行“在本机哪一侧”。
-          height: state.isServer ? 240 : 220,
+          height: state.isServer ? 264 : 244,
           empty: _Empty(
             icon: Icons.link_rounded,
             title: context.l10n.devicesNonePaired,
@@ -368,6 +369,15 @@ class _PairedCardState extends State<_PairedCard> {
                     ),
                   ),
                 ],
+              ),
+            ],
+            if (d.online) ...[
+              const SizedBox(height: 4),
+              Text(
+                '${context.l10n.inputTransportActual} · ${actualTransport(context.l10n, d.inputTransport)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12, color: c.muted),
               ),
             ],
             const Spacer(),

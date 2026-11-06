@@ -42,6 +42,7 @@ pub(crate) fn parse(path: &Path, data: &[u8]) -> Result<Parsed> {
     // 版本 4 → 5：只新增了 `language`（缺省跟随系统），读进来即等价。
     // 版本 5 → 6：只新增了 `auto_update`（缺省开着），读进来即等价。
     // 版本 6 → 7：只新增 file_rate_limit_mbps=0、coalesce_motion=false，保持原行为。
+    // 版本 7 → 8：新增 input_transport=tcp，保留已有连接方式。
     let legacy_swap_cmd_ctrl = if config.schema_version < 4 {
         toml::from_str::<Legacy>(text)
             .map_err(|e| format(e.to_string()))?

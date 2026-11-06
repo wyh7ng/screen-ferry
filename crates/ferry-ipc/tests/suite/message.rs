@@ -70,6 +70,7 @@ fn requests() -> Vec<Request> {
         Request::SetSharing { on: false },
         Request::UpdateSettings {
             settings: SettingsPatch {
+                input_transport: Some(ferry_types::InputTransport::Auto),
                 side: Some(Side::Left),
                 autostart: Some(true),
                 theme: Some(Theme::Light),
@@ -168,6 +169,7 @@ fn state() -> State {
     State {
         session: "sample-session".into(),
         local: Local {
+            quic_available: true,
             name: "Mac Studio".into(),
             fingerprint: FP_MAC.into(),
             short: "7AB0-5CB2-38FB-D603".into(),
@@ -185,6 +187,8 @@ fn state() -> State {
         sharing: true,
         problem: None,
         link: Link {
+            input_transport: Some("quic".into()),
+            fallback_reason: None,
             status: LinkStatus::Connected,
             peer: Some(PeerRef {
                 name: "办公室 PC".into(),
@@ -213,6 +217,8 @@ fn state() -> State {
             at: 1_793_480_100_000,
         }),
         peers: vec![PeerInfo {
+            input_transport: Some("quic".into()),
+            fallback_reason: None,
             name: "办公室 PC".into(),
             fingerprint: FP_PC.into(),
             short: "3F9A-12C4-77E0-B1D2".into(),
@@ -234,6 +240,7 @@ fn state() -> State {
         }],
         performance: Default::default(),
         settings: Settings {
+            input_transport: ferry_types::InputTransport::Auto,
             name: String::new(),
             side: Side::Right,
             layout: vec![Placement {
@@ -304,6 +311,8 @@ fn notices() -> Vec<Notice> {
             port: None,
         }),
         link: Link {
+            input_transport: None,
+            fallback_reason: None,
             status: LinkStatus::Stopped,
             peer: None,
             since: None,
@@ -485,4 +494,29 @@ fn samples_shared_with_the_settings_ui_are_up_to_date() {
         "{} 已过期：运行 UPDATE_IPC_SAMPLES=1 cargo test -p ferry-ipc 重新生成，再更新 app/ 中的 Dart 类型",
         path.display()
     );
+}
+
+#[test]
+fn older_state_defaults_to_tcp_preference_without_inventing_an_actual_transport() {
+    let mut legacy = serde_json::to_value(state()).unwrap();
+    legacy["local"]
+        .as_object_mut()
+        .unwrap()
+        .remove("quic_available");
+    legacy["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("input_transport");
+    for key in ["input_transport", "fallback_reason"] {
+        legacy["link"].as_object_mut().unwrap().remove(key);
+        legacy["peers"][0].as_object_mut().unwrap().remove(key);
+    }
+    let restored: State = serde_json::from_value(legacy).unwrap();
+    assert!(!restored.local.quic_available);
+    assert_eq!(
+        restored.settings.input_transport,
+        ferry_types::InputTransport::Tcp
+    );
+    assert_eq!(restored.link.input_transport, None);
+    assert_eq!(restored.peers[0].input_transport, None);
 }

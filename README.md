@@ -127,7 +127,7 @@ On macOS the app is signed with a Developer ID certificate from the keychain whe
 
 ### Optional QUIC input experiment
 
-Default builds and the resident application continue to use TCP. Developers can build with `cargo build -p ferry-daemon --features quic-experiment`, then run `serve/connect --transport quic`; `--transport auto` falls back to TCP when establishing the connection fails. Add `--quic-reliable-only` to compare reliable streams without motion datagrams. Clipboard and file transfers still use TCP.
+Existing settings keep TCP by default. The Actions development packages include QUIC support: choose TCP, Automatic (prefer QUIC with TCP fallback), QUIC with optional motion datagrams, or reliable-only QUIC in Settings on both computers. The overview and device pages show the actual input protocol and any fallback reason; clipboard and files still use TCP. For local packaging use `cargo xtask bundle --quic-experiment` (add `--universal --dmg` on macOS); builds without that feature expose TCP only. CLI `--transport quic|auto` and `--quic-reliable-only` remain available.
 See [ADR 0017](docs/adr/0017-quic-input-experiment.md) for pairing, ordering barriers and command examples. This is a development experiment with no demonstrated latency benefit on a real LAN.
 
 ## Development

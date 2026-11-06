@@ -68,6 +68,7 @@ async fn automatic_transport_falls_back_only_before_a_tcp_session_is_started() {
         .await
         .unwrap();
     assert!(!stream.get_ref().is_quic());
+    assert_eq!(stream.get_ref().fallback_reason(), Some("quic_unreachable"));
     ferry_net::initiate(
         &mut stream,
         Hello::new(Channel::Input, Capabilities::empty(), 0, "client"),

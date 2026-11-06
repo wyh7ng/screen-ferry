@@ -1649,5 +1649,44 @@
         "type": "String"
       }
     }
+  },
+  "settingsInputTransport": "键鼠输入传输",
+  "settingsInputTransportHint": "更改后会重新连接设备。选择只影响键鼠输入；剪贴板和文件始终使用 TCP。",
+  "inputTransportTcp": "TCP（默认）",
+  "inputTransportAuto": "自动：优先 QUIC",
+  "inputTransportQuic": "QUIC 位置数据报（实验）",
+  "inputTransportQuicReliable": "QUIC 纯可靠（实验）",
+  "inputTransportExperimentHint": "QUIC 仍为实验功能，不保证降低延迟。由被控端发起连接：自动模式失败时回退 TCP，显式 QUIC 模式不回退。控制端启用 QUIC 后仍接受 TCP 客户端；请在两端设置，并查看实际连接协议。",
+  "inputTransportUnavailable": "当前后台未包含 QUIC 支持，可继续使用 TCP。",
+  "inputTransportActual": "实际输入链路",
+  "inputTransportUnknown": "未知",
+  "inputTransportQuicActual": "QUIC（允许位置数据报）",
+  "inputTransportReliableActual": "QUIC · 纯可靠",
+  "inputTransportFallbackUnreachable": "QUIC 未能建立连接，当前已回退 TCP。请检查两端 QUIC 支持和 UDP 网络连通性。",
+  "inputTransportFallbackUnavailable": "此端未提供 QUIC，当前已回退 TCP。",
+  "inputTransportFallbackUnknown": "QUIC 未启用，后台报告已回退 TCP。",
+  "performanceWindowAge": "采样窗口 {seconds} 秒 · {age}",
+  "performanceTimeUnknown": "采样时间未知",
+  "@performanceWindowAge": {
+    "placeholders": {
+      "seconds": {
+        "type": "String"
+      },
+      "age": {
+        "type": "String"
+      }
+    }
+  },
+  "inputTransportLog": "与 {name} 的输入链路：{transport}",
+  "inputTransportDataTcp": "剪贴板和文件使用 TCP · TLS 1.3",
+  "@inputTransportLog": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "transport": {
+        "type": "String"
+      }
+    }
   }
 }

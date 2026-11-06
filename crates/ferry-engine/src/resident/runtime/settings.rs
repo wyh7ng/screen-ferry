@@ -37,9 +37,23 @@ impl<H: Host> Runtime<H> {
     }
 
     pub(super) async fn update_settings(&mut self, patch: SettingsPatch) {
+        if let Some(transport) = patch.input_transport
+            && let Err(error) = crate::Transport::from(transport).ensure_available()
+        {
+            self.command_error = Some(error.to_string());
+            self.toast(
+                Phrase::new("error").arg("message", &error),
+                error.to_string(),
+            );
+            return;
+        }
         let mut next = self.config.clone();
         // 需要重新握手才能生效的设置。
         let mut restart = false;
+        if let Some(transport) = patch.input_transport {
+            restart |= transport != next.input_transport;
+            next.input_transport = transport;
+        }
         if let Some(name) = patch.name {
             restart |= name != next.name;
             next.name = name;

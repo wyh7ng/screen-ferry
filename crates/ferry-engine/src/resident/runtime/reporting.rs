@@ -158,6 +158,12 @@ impl<H: Host> Runtime<H> {
             if !peer.addr.is_empty() {
                 row.push_str(&format!(" · {}", peer.addr));
             }
+            if let Some(transport) = &peer.input_transport {
+                row.push_str(&format!(" · 输入 {transport}"));
+            }
+            if let Some(reason) = &peer.fallback_reason {
+                row.push_str(&format!(" · 回退 {reason}"));
+            }
             if let Some(side) = peer.side {
                 row.push_str(&format!(" · 在本机{}", side_label(side)));
             }
@@ -178,9 +184,11 @@ impl<H: Host> Runtime<H> {
             on(state.settings.autostart)
         );
         let settings = format!(
-            "{settings} · 文件上限 {} MB/s（0 不限）· 合并移动 {}",
+            "{settings} · 文件上限 {} MB/s（0 不限）· 合并移动 {} · 输入偏好 {} · QUIC可用 {} · 剪贴板/文件 TCP+TLS1.3",
             state.settings.file_rate_limit_mbps,
-            on(state.settings.coalesce_motion)
+            on(state.settings.coalesce_motion),
+            state.settings.input_transport.as_str(),
+            on(state.local.quic_available)
         );
         let verbose = match state.local.verbose_since {
             Some(since) => format!("开着，已有 {} 分钟", (now_ms() - since) / 60_000),

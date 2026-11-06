@@ -192,6 +192,7 @@ void main() {
           autoUpdate: false,
           clipboardLimitMb: 16,
           mouseDpi: 800,
+          inputTransport: InputTransport.auto,
         ),
       ),
       const UpdateSettingsRequest(

@@ -69,7 +69,7 @@ jobs:
           if ($hash -ne '8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0') { throw "Inno Setup 安装程序的校验和不对：$hash" }
           Start-Process $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$dir" -Wait
           "ISCC=$(Join-Path $dir 'ISCC.exe')" >> $env:GITHUB_ENV
-      - run: cargo xtask bundle
+      - run: cargo xtask bundle --quic-experiment
       - name: 取提交号的前 7 位
         id: commit
         shell: bash
@@ -107,7 +107,7 @@ jobs:
           "$RUNNER_TEMP/dmgbuild/bin/pip" install --quiet dmgbuild==1.6.5
           echo "SCREENFERRY_DMGBUILD=$RUNNER_TEMP/dmgbuild/bin/dmgbuild" >> "$GITHUB_ENV"
       - name: 打包通用应用与安装盘（临时签名）
-        run: cargo xtask bundle --universal --dmg
+        run: cargo xtask bundle --universal --dmg --quic-experiment
       - name: 验证后台与设置界面的通用架构
         run: |
           bundle="target/bundle/macos/ScreenFerry.app/Contents"

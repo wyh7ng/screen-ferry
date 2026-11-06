@@ -13,6 +13,7 @@ import '../state/key_names.dart';
 import '../theme/tokens.dart';
 import '../widgets/address_dialog.dart';
 import '../widgets/controls.dart';
+import '../widgets/input_transport_status.dart';
 import '../widgets/dpi_field.dart';
 import '../widgets/group.dart';
 import '../widgets/key_map_dialog.dart';
@@ -354,6 +355,10 @@ class _Header extends StatelessWidget {
                       ),
                   ],
                 ),
+                if (peer.online) ...[
+                  const SizedBox(height: 10),
+                  InputTransportStatus(transport: peer.inputTransport, fallbackReason: peer.fallbackReason),
+                ],
               ],
             ),
           ),

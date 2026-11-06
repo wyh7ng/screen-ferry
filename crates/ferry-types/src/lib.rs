@@ -20,7 +20,9 @@ mod scene;
 mod transfer;
 
 pub use clipboard::{ClipboardContent, ClipboardFormat};
-pub use config::{Config, Lang, Language, Placement, Role, Theme, uses_command_key};
+pub use config::{
+    Config, InputTransport, Lang, Language, Placement, Role, Theme, uses_command_key,
+};
 pub use device::{
     DeviceSettings, KeyMapping, ModifierMap, ModifierPreset, ModifierTarget, ScrollSpeed,
 };

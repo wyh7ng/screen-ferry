@@ -65,3 +65,27 @@ async fn a_plain_tcp_client_is_turned_away() {
 
     assert!(matches!(server.await.unwrap(), Err(Error::Io(_))));
 }
+
+#[tokio::test]
+async fn missing_quic_feature_never_silently_turns_auto_into_tcp() {
+    if ferry_net::Transport::quic_available() {
+        return;
+    }
+    let tls = Tls::new(&Identity::generate("unavailable").unwrap()).unwrap();
+    for transport in [
+        ferry_net::Transport::Auto,
+        ferry_net::Transport::Quic,
+        ferry_net::Transport::QuicReliable,
+    ] {
+        let error = match tls
+            .connect_with("127.0.0.1:9".parse().unwrap(), Channel::Input, transport)
+            .await
+        {
+            Ok(_) => panic!("unsupported transport connected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::Io(ref error) if error.kind() == std::io::ErrorKind::Unsupported)
+        );
+    }
+}

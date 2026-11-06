@@ -207,3 +207,10 @@ update    { status(idle|checking|up_to_date|available|downloading|ready|installi
 `state.performance.peers[]`为`{ fingerprint: string|null, measured_at: Unix毫秒, metrics }`，null指本机捕获阶段。`metrics.window_ms`给出采样窗口；`capture_queue/send_queue/send/inject/rtt/scheduler`均为`{count,p50_us,p95_us,p99_us,max_us,over_100ms}`，单位微秒，分位数是固定直方图近似，count=0不解释为0ms。`capture/outbound`为`{depth,high_water,oldest_us,max_wait_us,coalesced,overflows}`；oldest_us为null表示不能测量当前最老事件，max_wait_us是该窗已消费事件最大等待。仅本机时钟差值，不是跨机单程时间。
 
 `read_run_log`新增`cursor:string|null`、`request_id:u64|null`，保留`since`兼容。新界面优先原样回传opaque cursor，不自行解析；后端回相同request_id。`run_log.cursor`用于下一页，`more=true`表示当前还有可读取的分页；`fresh=true`替换旧行。`error`非空时保留旧行与游标，释放在途状态稍后重试；界面拒绝不匹配当前request_id的迟到响应。换页/断线时取消观察不会让旧响应覆盖新一轮。
+
+
+## 9. 安装版输入传输
+
+配置schema8：`settings.input_transport`及patch的同名可选字段取`tcp|auto|quic|quic_reliable`，旧配置缺省tcp。修改协议重启输入引擎，并通过原Execute/CommandResult确认或回滚。
+`local.quic_available`表示本构建是否包含QUIC，缺省false；无此能力设置非tcp会明确失败，auto也不静默冒充可用。
+`link.input_transport`及`peers[].input_transport`为实际输入连接协议`tcp|quic|quic_reliable`或null；null表示未建立/旧后台未知。`fallback_reason`为null或稳定代码`quic_unreachable`，只在实际回退的客户端可确认该原因；服务端不猜对端偏好。断线清空实际状态，偏好仍保留。QUIC是允许普通位置数据报，按键/拖拽/最终位置补偿仍可靠，数据和文件始终TCP。新日志phrase `input_transport`参数为name/transport/fallback_reason。

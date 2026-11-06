@@ -17,6 +17,7 @@ class DemoBackend implements Backend {
     String? platform,
     this.animate = true,
     this.startOnline = true,
+    this.quicAvailable = true,
     bool paired = true,
     this._problem,
     ClipboardSync? clipboard,
@@ -74,6 +75,7 @@ class DemoBackend implements Backend {
   final String platform;
   final bool animate;
   final bool startOnline;
+  final bool quicAvailable;
 
   /// 收到的命令，测试里检查用。
   final sent = <Request>[];
@@ -227,6 +229,12 @@ class DemoBackend implements Backend {
         );
         emit(ToastNotice(on ? '已继续共享' : '已暂停共享', phrase: phrase));
       case UpdateSettingsRequest(:final settings):
+        if (!quicAvailable && settings.inputTransport != null && settings.inputTransport != InputTransport.tcp) {
+          if (envelope != null) {
+            emit(CommandResultNotice(session: session, id: envelope.id, ok: false, message: 'QUIC unavailable'));
+          }
+          return true;
+        }
         final before = Arrangement.of(_peers, _settings);
         _settings = _settings.apply(settings);
         _logLayout(before, Arrangement.of(_peers, _settings));
@@ -484,6 +492,7 @@ class DemoBackend implements Backend {
         invitePort: role == Role.server ? null : 24811,
         system: platform == 'macos' ? 'macOS 15.6 · arm64' : 'Windows 11（10.0.26100.4652）· x64',
         verboseSince: _verboseSince,
+        quicAvailable: quicAvailable,
       ),
       sharing: _sharing,
       problem: _problem,
@@ -502,6 +511,7 @@ class DemoBackend implements Backend {
         since: linkPeer != null ? _since : null,
         cursorOnPeer: linkPeer != null && _cursor == linkPeer.fingerprint,
         rttMs: linkPeer != null ? List.of(_rtt) : const [],
+        inputTransport: linkPeer != null ? InputTransport.tcp : null,
       ),
       // 和后台一样，按对方现在的名字显示最近一次同步。
       clipboard: switch (_clip) {
@@ -531,6 +541,7 @@ class DemoBackend implements Backend {
             // 演示里对方总是和本机不同的系统。
             platform: platform == 'macos' ? 'windows' : 'macos',
             version: p.online ? '0.1.0' : '',
+            inputTransport: p.online ? InputTransport.tcp : null,
             addr: switch ((p.online || p.lastSeen != null, role)) {
               (false, _) => '',
               (true, Role.server) => '192.168.2.${18 + _peers.indexOf(p)}',

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use ferry_types::{DeviceSettings, Language, Placement, Role, Side, Theme};
+use ferry_types::{DeviceSettings, InputTransport, Language, Placement, Role, Side, Theme};
 use serde::{Deserialize, Serialize};
 
 /// 协议版本。不兼容的改动才递增。
@@ -358,6 +358,9 @@ pub struct UpdateRelease {
 /// 本机。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Local {
+    /// 本次构建是否包含QUIC；旧后台缺少字段视为false。
+    #[serde(default)]
+    pub quic_available: bool,
     pub name: String,
     /// 完整指纹，64 位十六进制。
     pub fingerprint: String,
@@ -413,6 +416,12 @@ pub enum ProblemKind {
 /// 与对方的连接。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Link {
+    /// 已连接输入通道的实际协商结果；未知/未连接为null。不是用户偏好。
+    #[serde(default)]
+    pub input_transport: Option<String>,
+    /// 自动模式回退的稳定原因码；未回退/对端选择原因未知为null。
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
     pub status: LinkStatus,
     /// 已连接时是对方，其余时候为 `null`。
     pub peer: Option<PeerRef>,
@@ -496,6 +505,10 @@ fn default_true() -> bool {
 /// 一台已配对的设备。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
+    #[serde(default)]
+    pub input_transport: Option<String>,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
     pub name: String,
     pub fingerprint: String,
     pub short: String,
@@ -536,6 +549,8 @@ pub struct FoundDevice {
 /// 用户可以修改的设置。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default)]
+    pub input_transport: InputTransport,
     pub name: String,
     /// 没有在 `layout` 里单独安排的设备放在本机哪一侧。
     pub side: Side,
@@ -577,6 +592,8 @@ pub struct Settings {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SettingsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_transport: Option<InputTransport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// 改变本机的角色：控制别的电脑，还是被控制。会断开现有的连接、重新开始。

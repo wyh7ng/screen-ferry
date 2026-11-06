@@ -12,7 +12,10 @@ class PerformanceCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context, aspects: const {AppAspect.performance, AppAspect.devices, AppAspect.local});
+    final state = AppScope.of(
+      context,
+      aspects: const {AppAspect.performance, AppAspect.devices, AppAspect.local, AppAspect.clock},
+    );
     final l = context.l10n;
     final c = SfColors.of(context);
     final peers = state.performance.peers;
@@ -33,6 +36,14 @@ class PerformanceCard extends StatelessWidget {
             Text(
               peer.fingerprint == null ? l.performanceLocal : state.displayNameOf(peer.fingerprint!, l.peerFallback),
               style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              l.performanceWindowAge(
+                (peer.metrics.windowMs / 1000).toStringAsFixed(1),
+                peer.measuredAt == null ? l.performanceTimeUnknown : timeAgo(l, peer.measuredAt!),
+              ),
+              style: TextStyle(fontSize: 12, color: c.muted),
             ),
             const SizedBox(height: 10),
             SingleChildScrollView(

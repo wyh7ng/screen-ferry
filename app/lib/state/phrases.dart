@@ -3,6 +3,7 @@
 
 import '../l10n/l10n.dart';
 import 'app_state.dart';
+import 'transport_text.dart';
 
 /// 活动记录的标题和说明。[mac]：本机是不是 Mac，快捷键按它的叫法写。
 (String, String)? logLine(AppLocalizations l, Phrase p, {required bool mac}) {
@@ -14,7 +15,11 @@ import 'app_state.dart';
       l.phListening,
       p.flag('announced') ? l.phListeningAnnounced(p.arg('port')) : l.phListeningQuiet(p.arg('port')),
     ),
-    'connected' => (l.phConnected(name), 'TLS 1.3 · ${p.arg('ip')}'),
+    'connected' => (l.phConnected(name), p.arg('ip')),
+    'input_transport' => (
+      l.inputTransportLog(name, actualTransport(l, reportedTransport(p.arg('transport')))),
+      [l.inputTransportDataTcp, ?transportFallback(l, p.arg('fallback_reason'))].join(' · '),
+    ),
     'disconnected' => (l.phDisconnected(name), p.args['reason'] ?? l.phPeerClosed),
     'peer_opened_settings' => (l.phPeerOpenedSettings(name), l.phShowingItsSettings),
     'cursor_to_peer' => (l.phCursorToPeer(name), l.phAcrossEdge(p.arg('side'))),

@@ -3601,6 +3601,120 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'日志暂时无法读取，将自动重试。'**
   String get runLogReadFailed;
+
+  /// No description provided for @settingsInputTransport.
+  ///
+  /// In zh, this message translates to:
+  /// **'键鼠输入传输'**
+  String get settingsInputTransport;
+
+  /// No description provided for @settingsInputTransportHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'更改后会重新连接设备。选择只影响键鼠输入；剪贴板和文件始终使用 TCP。'**
+  String get settingsInputTransportHint;
+
+  /// No description provided for @inputTransportTcp.
+  ///
+  /// In zh, this message translates to:
+  /// **'TCP（默认）'**
+  String get inputTransportTcp;
+
+  /// No description provided for @inputTransportAuto.
+  ///
+  /// In zh, this message translates to:
+  /// **'自动：优先 QUIC'**
+  String get inputTransportAuto;
+
+  /// No description provided for @inputTransportQuic.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC 位置数据报（实验）'**
+  String get inputTransportQuic;
+
+  /// No description provided for @inputTransportQuicReliable.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC 纯可靠（实验）'**
+  String get inputTransportQuicReliable;
+
+  /// No description provided for @inputTransportExperimentHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC 仍为实验功能，不保证降低延迟。由被控端发起连接：自动模式失败时回退 TCP，显式 QUIC 模式不回退。控制端启用 QUIC 后仍接受 TCP 客户端；请在两端设置，并查看实际连接协议。'**
+  String get inputTransportExperimentHint;
+
+  /// No description provided for @inputTransportUnavailable.
+  ///
+  /// In zh, this message translates to:
+  /// **'当前后台未包含 QUIC 支持，可继续使用 TCP。'**
+  String get inputTransportUnavailable;
+
+  /// No description provided for @inputTransportActual.
+  ///
+  /// In zh, this message translates to:
+  /// **'实际输入链路'**
+  String get inputTransportActual;
+
+  /// No description provided for @inputTransportUnknown.
+  ///
+  /// In zh, this message translates to:
+  /// **'未知'**
+  String get inputTransportUnknown;
+
+  /// No description provided for @inputTransportQuicActual.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC（允许位置数据报）'**
+  String get inputTransportQuicActual;
+
+  /// No description provided for @inputTransportReliableActual.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC · 纯可靠'**
+  String get inputTransportReliableActual;
+
+  /// No description provided for @inputTransportFallbackUnreachable.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC 未能建立连接，当前已回退 TCP。请检查两端 QUIC 支持和 UDP 网络连通性。'**
+  String get inputTransportFallbackUnreachable;
+
+  /// No description provided for @inputTransportFallbackUnavailable.
+  ///
+  /// In zh, this message translates to:
+  /// **'此端未提供 QUIC，当前已回退 TCP。'**
+  String get inputTransportFallbackUnavailable;
+
+  /// No description provided for @inputTransportFallbackUnknown.
+  ///
+  /// In zh, this message translates to:
+  /// **'QUIC 未启用，后台报告已回退 TCP。'**
+  String get inputTransportFallbackUnknown;
+
+  /// No description provided for @performanceWindowAge.
+  ///
+  /// In zh, this message translates to:
+  /// **'采样窗口 {seconds} 秒 · {age}'**
+  String performanceWindowAge(String seconds, String age);
+
+  /// No description provided for @performanceTimeUnknown.
+  ///
+  /// In zh, this message translates to:
+  /// **'采样时间未知'**
+  String get performanceTimeUnknown;
+
+  /// No description provided for @inputTransportLog.
+  ///
+  /// In zh, this message translates to:
+  /// **'与 {name} 的输入链路：{transport}'**
+  String inputTransportLog(String name, String transport);
+
+  /// No description provided for @inputTransportDataTcp.
+  ///
+  /// In zh, this message translates to:
+  /// **'剪贴板和文件使用 TCP · TLS 1.3'**
+  String get inputTransportDataTcp;
 }
 
 class _AppLocalizationsDelegate extends LocalizationsDelegate<AppLocalizations> {

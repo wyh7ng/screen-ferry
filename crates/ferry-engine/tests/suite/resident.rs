@@ -1486,3 +1486,201 @@ async fn quitting_after_ui_churn_notifies_every_remaining_ui() {
         .unwrap();
     assert!(!endpoint.exists());
 }
+
+#[tokio::test]
+async fn installed_daemon_reports_quic_availability_and_preserves_tcp_for_existing_users() {
+    let daemon = Daemon::start(MockHost::default()).await;
+    let mut ui = daemon.ui().await;
+    let state = ui
+        .state_where("传输能力", |state| {
+            state.link.status == LinkStatus::Waiting
+        })
+        .await;
+    assert_eq!(
+        state.local.quic_available,
+        cfg!(feature = "quic-experiment")
+    );
+    assert_eq!(
+        state.settings.input_transport,
+        ferry_types::InputTransport::Tcp
+    );
+    assert_eq!(
+        state.link.input_transport, None,
+        "未连接时不能把偏好说成实际协议"
+    );
+    daemon.task.abort();
+}
+
+#[tokio::test]
+async fn installed_transport_change_is_saved_and_restarts_or_explicitly_rejected() {
+    use ferry_types::InputTransport;
+    let daemon = Daemon::start(MockHost::default()).await;
+    let mut ui = daemon.ui().await;
+    let before = ui
+        .state_where("启动", |state| state.link.status == LinkStatus::Waiting)
+        .await;
+    ui.send(Request::Execute {
+        session: before.session.clone(),
+        id: 510,
+        request: Box::new(Request::UpdateSettings {
+            settings: SettingsPatch {
+                input_transport: Some(InputTransport::QuicReliable),
+                ..SettingsPatch::default()
+            },
+        }),
+    })
+    .await;
+    let (ok, message) = ui
+        .wait("切换输入协议的结果", |notice| match notice {
+            Notice::CommandResult {
+                id: 510,
+                ok,
+                message,
+                ..
+            } => Some((*ok, message.clone())),
+            _ => None,
+        })
+        .await;
+    if cfg!(feature = "quic-experiment") {
+        assert!(ok, "{message}");
+        let after = ui
+            .state_where("新协议监听已启动", |state| {
+                state.settings.input_transport == InputTransport::QuicReliable
+                    && state.link.status == LinkStatus::Waiting
+            })
+            .await;
+        assert_ne!(
+            after.local.port, before.local.port,
+            "使用port0的引擎已重新绑定监听端口"
+        );
+        assert_eq!(
+            daemon.device.store.config().unwrap().input_transport,
+            InputTransport::QuicReliable
+        );
+        let tls = ferry_net::Tls::new(&ferry_trust::Identity::generate("transport probe").unwrap())
+            .unwrap();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], after.local.port.unwrap()));
+        let (mut stream, _) = tls
+            .connect_with(addr, ferry_proto::Channel::Pair, ferry_net::Transport::Quic)
+            .await
+            .unwrap();
+        let welcome = ferry_net::initiate(
+            &mut stream,
+            ferry_proto::Hello::new(
+                ferry_proto::Channel::Pair,
+                ferry_proto::Capabilities::QUIC_MOTION,
+                0,
+                "transport probe",
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(stream.get_ref().is_quic(), "安装模式真正启动UDP/QUIC监听");
+        assert!(
+            !welcome
+                .capabilities
+                .contains(ferry_proto::Capabilities::QUIC_MOTION),
+            "可靠模式不协商DATAGRAM"
+        );
+    } else {
+        assert!(!ok);
+        assert!(message.contains("QUIC"));
+        assert_eq!(
+            daemon.device.store.config().unwrap().input_transport,
+            InputTransport::Tcp
+        );
+    }
+    daemon.task.abort();
+}
+
+#[tokio::test]
+async fn installed_client_reports_actual_tcp_and_auto_fallback_separately_from_preference() {
+    use ferry_types::InputTransport;
+    let server = Daemon::start(MockHost::default()).await;
+    let mut server_ui = server.ui().await;
+    let listening = server_ui
+        .state_where("TCP服务端", |state| state.local.port.is_some())
+        .await;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], listening.local.port.unwrap()));
+    let client = Daemon::start(MockHost::default()).await;
+    let mut client_ui = client.ui().await;
+    let _ = client_ui
+        .state_where("客户端初始", |state| state.local.port.is_some())
+        .await;
+    let server_fp = server
+        .device
+        .store
+        .identity("server")
+        .unwrap()
+        .fingerprint();
+    let client_fp = client
+        .device
+        .store
+        .identity("client")
+        .unwrap()
+        .fingerprint();
+    for (store, fingerprint, name) in [
+        (&server.device.store, client_fp, "client"),
+        (&client.device.store, server_fp, "server"),
+    ] {
+        let mut peers = ferry_trust::PeerList::new();
+        peers.add(ferry_trust::Peer {
+            name: name.into(),
+            fingerprint,
+            addr: None,
+        });
+        store.save_peers(&peers).unwrap();
+    }
+    let preference = if cfg!(feature = "quic-experiment") {
+        InputTransport::Auto
+    } else {
+        InputTransport::Tcp
+    };
+    client_ui
+        .send(Request::UpdateSettings {
+            settings: SettingsPatch {
+                role: Some(Role::Client),
+                server: Some(addr.to_string()),
+                input_transport: Some(preference),
+                ..SettingsPatch::default()
+            },
+        })
+        .await;
+    let connected = client_ui
+        .state_where("实际TCP协议可见", |state| {
+            state.link.input_transport.as_deref() == Some("tcp")
+        })
+        .await;
+    assert_eq!(connected.settings.input_transport, preference);
+    assert_eq!(
+        connected.link.fallback_reason.as_deref(),
+        cfg!(feature = "quic-experiment").then_some("quic_unreachable")
+    );
+    let peer = connected.peers.iter().find(|peer| peer.online).unwrap();
+    assert_eq!(peer.input_transport.as_deref(), Some("tcp"));
+    assert_eq!(peer.fallback_reason, connected.link.fallback_reason);
+    let server_state = server_ui
+        .state_where("服务端实际TCP协议", |state| {
+            state.link.input_transport.as_deref() == Some("tcp")
+        })
+        .await;
+    assert_eq!(
+        server_state.link.fallback_reason, None,
+        "服务端不能猜对方为何选择TCP"
+    );
+    client_ui.send(Request::SetSharing { on: false }).await;
+    let paused = client_ui
+        .state_where("断开清空协议", |state| {
+            state.link.status == LinkStatus::Paused
+        })
+        .await;
+    assert_eq!(paused.link.input_transport, None);
+    assert!(
+        paused
+            .peers
+            .iter()
+            .all(|peer| peer.input_transport.is_none() && peer.fallback_reason.is_none())
+    );
+    client.task.abort();
+    server.task.abort();
+}

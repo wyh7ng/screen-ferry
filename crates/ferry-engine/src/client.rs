@@ -146,6 +146,7 @@ where
     K: Clipboard,
     P: ConfirmPairing,
 {
+    transport.ensure_available()?;
     displays.displays()?;
     let finder = match config.server {
         ServerAddr::Fixed(addr) => Finder::Fixed(addr),
@@ -661,6 +662,22 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             fingerprint: server,
             addr,
             platform,
+        });
+        let actual_transport = if framed.get_ref().is_quic() {
+            if negotiated.contains(Capabilities::QUIC_MOTION) {
+                "quic"
+            } else {
+                "quic_reliable"
+            }
+        } else {
+            "tcp"
+        };
+        let fallback_reason = framed.get_ref().fallback_reason().map(str::to_owned);
+        info!(input_transport = actual_transport, fallback_reason = ?fallback_reason, "输入连接协议；剪贴板/文件使用TCP");
+        self.events.emit(Event::InputTransport {
+            peer: server,
+            transport: actual_transport.into(),
+            fallback_reason,
         });
         // 连接期间排队的按地址请求仍需处理并报告结果，不能在握手后静默丢弃。
         let shown = match device.alias.trim() {

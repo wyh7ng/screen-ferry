@@ -28,6 +28,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         }
     }
 
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.io
+    }
+
     pub fn get_ref(&self) -> &S {
         &self.io
     }

@@ -93,6 +93,28 @@ impl Lang {
     }
 }
 
+/// 输入连接的传输偏好。数据/文件连接仍固定使用TCP。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputTransport {
+    #[default]
+    Tcp,
+    Auto,
+    Quic,
+    QuicReliable,
+}
+
+impl InputTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Auto => "auto",
+            Self::Quic => "quic",
+            Self::QuicReliable => "quic_reliable",
+        }
+    }
+}
+
 /// `config.toml`。缺少的字段取缺省值，不认识的字段忽略。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -116,6 +138,8 @@ pub struct Config {
     pub file_rate_limit_mbps: u32,
     /// 合并发送队列中连续普通鼠标移动；不影响按键、拖拽和切屏顺序。
     pub coalesce_motion: bool,
+    /// 输入连接偏好，旧配置保持TCP；切换需要重新连接。
+    pub input_transport: InputTransport,
     /// 客户端：服务端地址，空为在局域网里寻找。
     pub server: String,
     /// 设置界面的配色。
@@ -146,7 +170,8 @@ impl Config {
     /// - 5：新增 `language`（缺省 `system`，跟随系统；以前总是中文）。
     /// - 6：新增 `auto_update`（缺省开着）。
     /// - 7：新增文件发送速度上限（0，不限速）与鼠标移动合并（关闭）。
-    pub const SCHEMA_VERSION: u32 = 7;
+    /// - 8：新增输入传输偏好（tcp），旧版保持TCP而不自动迁移。
+    pub const SCHEMA_VERSION: u32 = 8;
 
     /// 强调色预设数量；未知序号统一回退到蓝色。
     pub const ACCENT_COUNT: u8 = 5;
@@ -230,6 +255,7 @@ impl Default for Config {
             clipboard_limit_mb: 32,
             file_rate_limit_mbps: 0,
             coalesce_motion: false,
+            input_transport: InputTransport::Tcp,
             server: String::new(),
             theme: Theme::System,
             accent: 0,

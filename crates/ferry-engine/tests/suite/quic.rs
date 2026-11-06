@@ -27,6 +27,7 @@ async fn quic_engine_case(transport: Transport) {
     rig.server.abort();
     let _ = (&mut rig.server).await;
     rig.server = start_server(&rig, transport).await;
+    let (transport_events, mut transport_rx) = Events::channel();
     let config = ClientConfig {
         server: ServerAddr::Fixed(rig.addr),
         name: "pc".into(),
@@ -34,7 +35,7 @@ async fn quic_engine_case(transport: Transport) {
         clipboard_limit: ClipLimit::default(),
         command_key: false,
         store: rig.pc.store.clone(),
-        events: Events::none(),
+        events: transport_events,
         files: rig.pc_files.clone(),
         edge: EdgeFeed::none(),
         devices: Vec::new(),
@@ -53,6 +54,29 @@ async fn quic_engine_case(transport: Transport) {
         }
     });
     rig.enter().await;
+    let actual = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(ferry_engine::Event::InputTransport {
+                transport,
+                fallback_reason,
+                ..
+            }) = transport_rx.recv().await
+            {
+                return (transport, fallback_reason);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        actual.0,
+        if transport == Transport::QuicReliable {
+            "quic_reliable"
+        } else {
+            "quic"
+        }
+    );
+    assert_eq!(actual.1, None);
     assert_eq!(rig.mac_confirm.requests().len(), 1);
     assert_eq!(rig.pc_confirm.requests().len(), 1);
     rig.push(100, 0);
@@ -221,6 +245,14 @@ async fn start_server(
     rig: &Rig,
     transport: Transport,
 ) -> tokio::task::JoinHandle<ferry_engine::Error> {
+    start_server_with_events(rig, transport, Events::none()).await
+}
+
+async fn start_server_with_events(
+    rig: &Rig,
+    transport: Transport,
+    events: Events,
+) -> tokio::task::JoinHandle<ferry_engine::Error> {
     let listener = tokio::net::TcpListener::bind(rig.addr).await.unwrap();
     let config = ServerConfig {
         live: Live {
@@ -238,7 +270,7 @@ async fn start_server(
         command_key: true,
         store: rig.mac.store.clone(),
         announce: false,
-        events: Events::none(),
+        events,
         files: rig.mac_files.clone(),
         edge: EdgeFeed::none(),
     };
@@ -284,4 +316,90 @@ async fn experimental_server_rejects_data_channels_on_quic_even_for_trusted_peer
         matches!(result, Err(ferry_net::Error::Rejected(reject)) if reject.reason == RejectReason::UNKNOWN_SESSION)
     );
     rig.server.abort();
+}
+
+#[tokio::test]
+async fn quic_control_modes_accept_trusted_tcp_clients_and_report_the_actual_transport() {
+    use ferry_engine::Event;
+    use ferry_types::ClipboardContent;
+
+    for mode in [Transport::Quic, Transport::QuicReliable] {
+        let mut rig = Rig::with(Setup {
+            start_client: false,
+            ..Setup::default()
+        })
+        .await;
+        rig.server.abort();
+        let _ = (&mut rig.server).await;
+        let mut config = crate::client::paired_config(&rig, rig.addr);
+        let (server_events, mut server_rx) = Events::channel();
+        let (client_events, mut client_rx) = Events::channel();
+        config.events = client_events;
+        rig.mac_clipboard.copy(ClipboardContent::text(
+            "TCP clipboard on QUIC-capable server",
+        ));
+        rig.server = start_server_with_events(&rig, mode, server_events).await;
+        rig.client = tokio::spawn({
+            let inject = rig.inject.clone();
+            let displays = rig.pc_displays.clone();
+            let clipboard = rig.pc_clipboard.clone();
+            let confirm = rig.pc_confirm.clone();
+            async move {
+                connect_with_transport(config, inject, displays, clipboard, confirm, Transport::Tcp)
+                    .await
+                    .unwrap_err()
+            }
+        });
+        rig.enter().await;
+        for events in [&mut server_rx, &mut client_rx] {
+            let (actual, fallback) = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await {
+                        Some(Event::InputTransport {
+                            transport,
+                            fallback_reason,
+                            ..
+                        }) => break (transport, fallback_reason),
+                        Some(_) => {}
+                        None => panic!("transport events closed before the result"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                actual, "tcp",
+                "控制端设置为{mode:?}时仍报告客户端实际选择的TCP"
+            );
+            assert_eq!(
+                fallback, None,
+                "客户端主动选择TCP，双方都不能说成QUIC失败回退"
+            );
+        }
+        assert!(rig.mac_confirm.requests().is_empty());
+        assert!(rig.pc_confirm.requests().is_empty());
+        eventually("TCP剪贴板正常同步", || {
+            rig.pc_clipboard.content().as_text() == Some("TCP clipboard on QUIC-capable server")
+        })
+        .await;
+        eventually("TCP数据通道支持文件传输", || {
+            !rig.mac_files.connected().is_empty()
+        })
+        .await;
+        let source = rig.mac.store.root().join("compatibility.txt");
+        std::fs::write(&source, b"data and files remain on TCP").unwrap();
+        let peer = rig.pc.store.identity("pc").unwrap().fingerprint();
+        rig.mac_files.send(peer, vec![source]).await.unwrap();
+        let destination = rig.pc.store.downloads_dir().join("compatibility.txt");
+        eventually("TCP文件连接完整提交", || {
+            std::fs::read(&destination).ok().as_deref()
+                == Some(b"data and files remain on TCP".as_slice())
+        })
+        .await;
+        rig.leave().await;
+        rig.client.abort();
+        rig.server.abort();
+        let _ = (&mut rig.client).await;
+        let _ = (&mut rig.server).await;
+    }
 }

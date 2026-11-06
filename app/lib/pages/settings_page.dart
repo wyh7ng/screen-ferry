@@ -6,6 +6,7 @@ import '../l10n/l10n.dart';
 
 import '../state/app_scope.dart';
 import '../state/app_state.dart';
+import '../state/transport_text.dart';
 import '../theme/tokens.dart';
 import '../widgets/controls.dart';
 import '../widgets/dpi_field.dart';
@@ -148,6 +149,24 @@ class SettingsPage extends StatelessWidget {
         SectionTitle(l.settingsResponsiveness),
         SfGroup(
           children: [
+            SfRow(
+              icon: Icons.alt_route_rounded,
+              title: l.settingsInputTransport,
+              subtitle: l.settingsInputTransportHint,
+              trailing: _TransportMenu(
+                value: s.inputTransport,
+                enabled: state.online,
+                quicAvailable: state.quicAvailable,
+                onChanged: (value) => state.updateSettings(SettingsPatch(inputTransport: value)),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
+              child: Text(
+                state.quicAvailable ? l.inputTransportExperimentHint : l.inputTransportUnavailable,
+                style: TextStyle(fontSize: 13, color: c.muted, height: 1.5),
+              ),
+            ),
             SfRow(
               icon: Icons.speed_rounded,
               title: l.settingsFileRate,
@@ -307,3 +326,56 @@ String _accentName(AppLocalizations l, AccentChoice choice) => switch (choice.na
   'pink' => l.accentPink,
   _ => l.accentBlue,
 };
+
+class _TransportMenu extends StatelessWidget {
+  const _TransportMenu({
+    required this.value,
+    required this.enabled,
+    required this.quicAvailable,
+    required this.onChanged,
+  });
+  final InputTransport value;
+  final bool enabled;
+  final bool quicAvailable;
+  final ValueChanged<InputTransport> onChanged;
+  @override
+  Widget build(BuildContext context) {
+    final l = context.l10n;
+    final c = SfColors.of(context);
+    return PopupMenuButton<InputTransport>(
+      key: const ValueKey('input-transport-menu'),
+      tooltip: l.settingsInputTransport,
+      enabled: enabled,
+      initialValue: value,
+      onSelected: onChanged,
+      itemBuilder: (_) => [
+        for (final transport in InputTransport.values)
+          PopupMenuItem(
+            value: transport,
+            enabled: transport == InputTransport.tcp || quicAvailable,
+            child: Text(transportChoice(l, transport)),
+          ),
+      ],
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: ShapeDecoration(color: c.card2, shape: continuous(12)),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 230),
+              child: Text(
+                transportChoice(l, value),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontWeight: FontWeight.w600, color: enabled ? c.fg : c.muted),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Icon(Icons.expand_more_rounded, size: 18, color: c.muted),
+          ],
+        ),
+      ),
+    );
+  }
+}

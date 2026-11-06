@@ -109,7 +109,7 @@ fn config_defaults_until_saved_then_round_trips() {
     store.save_config(&config).unwrap();
     let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
     assert!(
-        text.starts_with("schema_version = 7\n"),
+        text.starts_with("schema_version = 8\n"),
         "第一行必须是 schema_version：{text}"
     );
     assert_eq!(store.config().unwrap(), config);
@@ -133,10 +133,15 @@ fn config_tolerates_missing_and_unknown_fields() {
 fn config_from_a_newer_version_is_refused() {
     let dir = TempDir::new();
     let store = Store::open(dir.path()).unwrap();
-    fs::write(dir.path().join("config.toml"), "schema_version = 8\n").unwrap();
+    let future = ferry_types::Config::SCHEMA_VERSION + 1;
+    fs::write(
+        dir.path().join("config.toml"),
+        format!("schema_version = {future}\n"),
+    )
+    .unwrap();
     assert!(matches!(
         store.config(),
-        Err(Error::TooNew { found: 8, .. })
+        Err(Error::TooNew { found, .. }) if found == future
     ));
 }
 
@@ -177,7 +182,7 @@ fn a_version_1_config_reads_as_version_2_with_an_empty_layout() {
     };
     store.save_config(&config).unwrap();
     let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
-    assert!(text.starts_with("schema_version = 7\n"), "{text}");
+    assert!(text.starts_with("schema_version = 8\n"), "{text}");
     assert!(text.contains("[[layout]]"), "{text}");
     assert_eq!(store.config().unwrap(), config);
 }
@@ -280,7 +285,7 @@ fn a_version_3_config_with_the_swap_off_makes_every_paired_device_plain() {
     // 写回之后是版本 4，旧字段不再出现，读回来一样。
     store.save_config(&config).unwrap();
     let text = fs::read_to_string(dir.path().join("config.toml")).unwrap();
-    assert!(text.starts_with("schema_version = 7\n"), "{text}");
+    assert!(text.starts_with("schema_version = 8\n"), "{text}");
     assert!(!text.contains("swap_cmd_ctrl"), "{text}");
     assert!(text.contains("[[devices]]"), "{text}");
     assert_eq!(store.config().unwrap(), config);
@@ -409,4 +414,41 @@ mouse_dpi = 2400
     assert_eq!(config.mouse_dpi, 2400);
     assert_eq!(config.file_rate_limit_mbps, 0);
     assert!(!config.coalesce_motion);
+}
+
+#[test]
+fn schema_seven_migrates_to_tcp_and_all_transport_preferences_roundtrip() {
+    use ferry_types::{Config, InputTransport};
+    let dir = TempDir::new();
+    let store = Store::open(dir.path()).unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "schema_version = 7\ncoalesce_motion = true\n",
+    )
+    .unwrap();
+    let config = store.config().unwrap();
+    assert_eq!(config.schema_version, 8);
+    assert_eq!(config.input_transport, InputTransport::Tcp);
+    assert!(config.coalesce_motion);
+    for input_transport in [
+        InputTransport::Tcp,
+        InputTransport::Auto,
+        InputTransport::Quic,
+        InputTransport::QuicReliable,
+    ] {
+        let config = Config {
+            input_transport,
+            ..config.clone()
+        };
+        store.save_config(&config).unwrap();
+        assert_eq!(store.config().unwrap().input_transport, input_transport);
+        assert!(
+            fs::read_to_string(dir.path().join("config.toml"))
+                .unwrap()
+                .contains(&format!(
+                    "input_transport = \"{}\"",
+                    input_transport.as_str()
+                ))
+        );
+    }
 }

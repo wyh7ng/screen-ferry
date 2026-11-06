@@ -11,6 +11,7 @@ import '../theme/tokens.dart';
 import '../widgets/bars.dart';
 import '../widgets/bloom.dart';
 import '../widgets/controls.dart';
+import '../widgets/input_transport_status.dart';
 import '../widgets/page_scaffold.dart';
 import '../widgets/pressable.dart';
 import '../widgets/status_banners.dart';
@@ -174,6 +175,10 @@ class _HeroCard extends StatelessWidget {
                   (l.overviewEncryption, 'TLS 1.3'),
                 ],
         ),
+        if (state.connected) ...[
+          const SizedBox(height: 12),
+          InputTransportStatus(transport: state.inputTransport, fallbackReason: state.inputFallbackReason),
+        ],
       ],
     );
 

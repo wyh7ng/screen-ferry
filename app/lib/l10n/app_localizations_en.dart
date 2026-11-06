@@ -2141,4 +2141,68 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get runLogReadFailed => 'The log is temporarily unavailable. Retrying automatically.';
+
+  @override
+  String get settingsInputTransport => 'Keyboard and mouse transport';
+
+  @override
+  String get settingsInputTransportHint =>
+      'Changing this reconnects devices. The choice only affects keyboard and mouse input; clipboard and files always use TCP.';
+
+  @override
+  String get inputTransportTcp => 'TCP (default)';
+
+  @override
+  String get inputTransportAuto => 'Auto: prefer QUIC';
+
+  @override
+  String get inputTransportQuic => 'QUIC motion datagrams (experimental)';
+
+  @override
+  String get inputTransportQuicReliable => 'QUIC reliable only (experimental)';
+
+  @override
+  String get inputTransportExperimentHint =>
+      'QUIC is experimental and may not reduce latency. The controlled computer initiates the connection: Automatic can fall back to TCP; explicit QUIC does not. A controlling computer with QUIC enabled still accepts TCP clients. Configure both computers and check the actual connection protocol.';
+
+  @override
+  String get inputTransportUnavailable => 'This background service does not include QUIC support. TCP is available.';
+
+  @override
+  String get inputTransportActual => 'Actual input connection';
+
+  @override
+  String get inputTransportUnknown => 'Unknown';
+
+  @override
+  String get inputTransportQuicActual => 'QUIC (motion datagrams allowed)';
+
+  @override
+  String get inputTransportReliableActual => 'QUIC · reliable only';
+
+  @override
+  String get inputTransportFallbackUnreachable =>
+      'QUIC could not connect, so input is using TCP. Check QUIC support on both computers and UDP connectivity.';
+
+  @override
+  String get inputTransportFallbackUnavailable => 'QUIC is unavailable on this computer; input has fallen back to TCP.';
+
+  @override
+  String get inputTransportFallbackUnknown => 'QUIC is inactive; the background service reports a fallback to TCP.';
+
+  @override
+  String performanceWindowAge(String seconds, String age) {
+    return 'Sample window $seconds s · $age';
+  }
+
+  @override
+  String get performanceTimeUnknown => 'Sample time unknown';
+
+  @override
+  String inputTransportLog(String name, String transport) {
+    return 'Input connection with $name: $transport';
+  }
+
+  @override
+  String get inputTransportDataTcp => 'Clipboard and files use TCP · TLS 1.3';
 }

@@ -125,3 +125,14 @@ macOS 原子提交已执行并发碰撞与目录测试；Windows 同类测试及
 本轮完成：输入阶段指标与队列背压/可选合并、全局文件预算与提交恢复/回执清理、剪贴板共享缓存、日志有界后台写入与分页游标、UI分域刷新、后台职责拆分、QUIC可靠与DATAGRAM实验及回退。新配置schema7默认不限速/不合并，默认与常驻传输TCP；界面和后台仍需同构建IPC3。物理网络尾延迟收益、Windows原生执行、完整应用包/更新/休眠等不从这些检查推断。
 
 检查日志在 `/tmp/screen-ferry-final-*.log`。最新开发二进制与来源摘要保存在 `target/development/`；不与先前首批验收包混淆。
+
+
+## 安装版传输选择与DMG修复（2026-11-06）
+
+用户安装5c4ccf6后发现当前输入仍TCP：该包未编译QUIC feature且原常驻入口固定TCP，属于原CLI-only设计，不是自动回退。现补schema8 input_transport四模式、设置界面、resident入口、构建能力与实际协议/回退状态，Actions开发包带quic-experiment。原配置默认TCP，当前已安装应用未修改或切换。
+
+DMG确认hide_extensions使dmgbuild在签名后写入FinderInfo。移除该设置，并在制盘后只读挂载、外层/helper严格验证、卸载；错误删除无效产物。用旧版本干净ZIP副本重新制盘回归成功，坏盘与非映像两种负向场景均拒绝且清理，无需修改用户安装应用。
+
+本地整合：默认Rust445通过、全feature455通过，均3环境依赖跳过；Flutter139通过；默认/全featureClippy、Windows全feature交叉Clippy、结构lint与cargo-deny通过。配置升级的“未来版本拒绝”测试改为SCHEMA_VERSION+1，避免每次升级遗漏硬编码测试号。新增控制端兼容TCP的语义回归已通过：QUIC/纯可靠QUIC控制端均可接受已配对TCP客户端，双方实际=tcp且无虚构回退原因，剪贴板与文件完整提交；该项在455项整合检查后单独运行通过。
+
+延迟排查：90秒同步网关/Windows ICMP时应用RTT最高9.712ms；90秒纯被动出现110.984ms；再90秒同步ICMP最高12.089ms。三段本机调度最大均约3–4ms，两段Ping无丢包。现有证据不能确认Wi-Fi省电、远端调度、重传或队列中的单一根因，也不证明QUIC改善。具体本机观察文件保存在workspace外，不上传用户网络/运行数据到仓库。

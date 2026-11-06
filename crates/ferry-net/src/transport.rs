@@ -19,7 +19,32 @@ pub enum Transport {
     AutoReliable,
 }
 
+impl From<ferry_types::InputTransport> for Transport {
+    fn from(value: ferry_types::InputTransport) -> Self {
+        match value {
+            ferry_types::InputTransport::Tcp => Self::Tcp,
+            ferry_types::InputTransport::Auto => Self::Auto,
+            ferry_types::InputTransport::Quic => Self::Quic,
+            ferry_types::InputTransport::QuicReliable => Self::QuicReliable,
+        }
+    }
+}
+
 impl Transport {
+    pub const fn quic_available() -> bool {
+        cfg!(feature = "quic-experiment")
+    }
+    pub fn ensure_available(self) -> io::Result<()> {
+        if self != Self::Tcp && !Self::quic_available() {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "此版本未包含QUIC，请安装支持QUIC的版本或选择TCP",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn falls_back(self) -> bool {
         matches!(self, Self::Auto | Self::AutoReliable)
     }
@@ -44,15 +69,37 @@ impl Transport {
 }
 
 pub enum TransportStream {
-    Tcp(Box<tokio_rustls::TlsStream<TcpStream>>),
+    Tcp {
+        stream: Box<tokio_rustls::TlsStream<TcpStream>>,
+        fallback_reason: Option<String>,
+    },
     #[cfg(feature = "quic-experiment")]
     Quic(Box<crate::quic::QuicStream>),
 }
 
 impl TransportStream {
+    /// 稳定原因码，不包含IP、证书、用户名等内容。
+    pub fn fallback_reason(&self) -> Option<&str> {
+        match self {
+            Self::Tcp {
+                fallback_reason, ..
+            } => fallback_reason.as_deref(),
+            #[cfg(feature = "quic-experiment")]
+            Self::Quic(_) => None,
+        }
+    }
+    pub(crate) fn set_fallback_reason(&mut self, reason: &'static str) {
+        match self {
+            Self::Tcp {
+                fallback_reason, ..
+            } => *fallback_reason = Some(reason.into()),
+            #[cfg(feature = "quic-experiment")]
+            Self::Quic(_) => {}
+        }
+    }
     pub fn is_quic(&self) -> bool {
         match self {
-            Self::Tcp(_) => false,
+            Self::Tcp { .. } => false,
             #[cfg(feature = "quic-experiment")]
             Self::Quic(_) => true,
         }
@@ -60,7 +107,7 @@ impl TransportStream {
 
     pub fn datagrams(&self) -> Option<Datagrams> {
         match self {
-            Self::Tcp(_) => None,
+            Self::Tcp { .. } => None,
             #[cfg(feature = "quic-experiment")]
             Self::Quic(stream) => Some(Datagrams(stream.connection.clone())),
         }
@@ -74,7 +121,7 @@ impl AsyncRead for TransportStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            Self::Tcp { stream, .. } => Pin::new(stream.as_mut()).poll_read(cx, buf),
             #[cfg(feature = "quic-experiment")]
             Self::Quic(stream) => Pin::new(&mut stream.recv).poll_read(cx, buf),
         }
@@ -88,21 +135,21 @@ impl AsyncWrite for TransportStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            Self::Tcp { stream, .. } => Pin::new(stream.as_mut()).poll_write(cx, buf),
             #[cfg(feature = "quic-experiment")]
             Self::Quic(stream) => AsyncWrite::poll_write(Pin::new(&mut stream.send), cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            Self::Tcp { stream, .. } => Pin::new(stream.as_mut()).poll_flush(cx),
             #[cfg(feature = "quic-experiment")]
             Self::Quic(stream) => AsyncWrite::poll_flush(Pin::new(&mut stream.send), cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
-            Self::Tcp(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+            Self::Tcp { stream, .. } => Pin::new(stream.as_mut()).poll_shutdown(cx),
             #[cfg(feature = "quic-experiment")]
             Self::Quic(stream) => AsyncWrite::poll_shutdown(Pin::new(&mut stream.send), cx),
         }

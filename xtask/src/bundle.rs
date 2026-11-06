@@ -25,6 +25,9 @@
 //!   “应用程序”。窗口背景是 `assets/dmg/background.png`（和 @2x），布局由 dmgbuild 写进盘里，
 //!   不用打开访达；需要 `dmgbuild`（`pip install dmgbuild`，或用环境变量 `SCREENFERRY_DMGBUILD` 指定）。
 //!   有开发者证书时给盘签名；同时开着 `--notarize` 时盘也交公证、装订票据。
+//! - `--dmg-from <已签名.app> --dmg-output <输出.dmg>`：仅把已有应用重新制盘并验证，
+//!   不重新编译、重签或修改源应用，可用于没有完整 Xcode 的打包回归。
+//! - `--quic-experiment`：后台显式启用可选 QUIC 实验 feature，默认构建不启用。
 //!
 //! 更新包和安装盘的名字里带架构：通用版是 `macos-universal`，否则是本机的 `macos-arm64` 或 `macos-x86_64`。
 //!
@@ -45,6 +48,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod dmg;
+
 type Result<T = ()> = std::result::Result<T, String>;
 
 /// 设置界面在应用里的位置。和外层同名，程序坞、切换器里显示的都是软件名。
@@ -58,6 +63,7 @@ struct Options {
     universal: bool,
     notarize: bool,
     dmg: bool,
+    quic_experiment: bool,
 }
 
 pub(crate) fn run(args: &[String]) -> Result {
@@ -66,13 +72,49 @@ pub(crate) fn run(args: &[String]) -> Result {
         .ok_or("找不到仓库根目录")?
         .to_path_buf();
     let mut options = Options::default();
-    for arg in args {
+    let mut dmg_from = None;
+    let mut dmg_output = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--universal" => options.universal = true,
             "--notarize" => options.notarize = true,
             "--dmg" => options.dmg = true,
+            "--quic-experiment" => options.quic_experiment = true,
+            "--help" | "-h" => {
+                println!(
+                    "cargo xtask bundle [--universal] [--notarize] [--dmg] [--quic-experiment]\n\
+                    cargo xtask bundle --dmg-from <已签名.app> --dmg-output <新输出.dmg>\n\
+                    已有应用制盘模式不编译、不重签、不修改源应用，输出路径必须不存在。"
+                );
+                return Ok(());
+            }
+            "--dmg-from" => {
+                dmg_from = Some(PathBuf::from(args.next().ok_or("--dmg-from 需要应用路径")?))
+            }
+            "--dmg-output" => {
+                dmg_output = Some(PathBuf::from(
+                    args.next().ok_or("--dmg-output 需要输出路径")?,
+                ))
+            }
             other => return Err(format!("不认识的选项 {other}")),
         }
+    }
+    if dmg_from.is_some() || dmg_output.is_some() {
+        if std::env::consts::OS != "macos"
+            || options.universal
+            || options.notarize
+            || options.dmg
+            || options.quic_experiment
+        {
+            return Err(
+                "--dmg-from/--dmg-output 仅用于 macOS 已签名应用制盘，不能和其他打包选项混用"
+                    .into(),
+            );
+        }
+        let app = dmg_from.ok_or("缺少 --dmg-from <应用.app>")?;
+        let output = dmg_output.ok_or("缺少 --dmg-output <输出.dmg>")?;
+        return dmg_from_bundle(&root, &app, &output);
     }
     match std::env::consts::OS {
         "macos" => macos(&root, &options),
@@ -84,14 +126,14 @@ pub(crate) fn run(args: &[String]) -> Result {
 /// 设置界面（Flutter）依赖的 Visual C++ 运行库，放在它旁边，没装过运行库的电脑也能打开。
 const VC_RUNTIME: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
 
-fn windows(root: &Path, _options: &Options) -> Result {
+fn windows(root: &Path, options: &Options) -> Result {
     let version = workspace_version(root)?;
     // 先找齐工具，免得编译完才发现缺东西。
     let iscc = find_iscc()?;
     let runtime = vc_runtime_dir()?;
 
     step("编译后台（release）");
-    cargo(root, &["build", "--release", "-p", "ferry-daemon"])?;
+    build_daemon(root, options, None)?;
 
     step("编译设置界面（flutter build windows --release）");
     let app_dir = root.join("app");
@@ -266,10 +308,10 @@ fn macos(root: &Path, options: &Options) -> Result {
     };
 
     let daemon = if options.universal {
-        universal_daemon(&root)?
+        universal_daemon(&root, options)?
     } else {
         step("编译后台（release）");
-        cargo(&root, &["build", "--release", "-p", "ferry-daemon"])?;
+        build_daemon(&root, options, None)?;
         root.join("target/release/screenferry")
     };
 
@@ -429,7 +471,7 @@ fn macos(root: &Path, options: &Options) -> Result {
 }
 
 /// 后台的通用版：分别编译 arm64 和 x86_64，再用 lipo 合成一个。
-fn universal_daemon(root: &Path) -> Result<PathBuf> {
+fn universal_daemon(root: &Path, options: &Options) -> Result<PathBuf> {
     const TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
     let installed = Command::new("rustup")
         .args(["target", "list", "--installed"])
@@ -449,17 +491,7 @@ fn universal_daemon(root: &Path) -> Result<PathBuf> {
     let mut parts = Vec::new();
     for target in TARGETS {
         step(&format!("编译后台（release，{target}）"));
-        cargo(
-            root,
-            &[
-                "build",
-                "--release",
-                "-p",
-                "ferry-daemon",
-                "--target",
-                target,
-            ],
-        )?;
+        build_daemon(root, options, Some(target))?;
         parts.push(root.join(format!("target/{target}/release/screenferry")));
     }
     step("合成通用版（lipo）");
@@ -578,6 +610,7 @@ fn find_dmgbuild() -> Result<String> {
 
 /// 做安装盘：应用、指向“应用程序”的替身、背景图、卷图标，窗口布局写进盘里。
 fn make_dmg(root: &Path, tool: &str, bundle: &Path, dmg: &Path) -> Result {
+    dmg::verify_app(root, bundle)?;
     step("做安装盘（dmgbuild）");
     if dmg.exists() {
         fs::remove_file(dmg).map_err(|e| io(dmg, e))?;
@@ -590,6 +623,7 @@ fn make_dmg(root: &Path, tool: &str, bundle: &Path, dmg: &Path) -> Result {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("应用的名字不是 UTF-8")?;
+    let name = serde_json::to_string(name).map_err(|e| e.to_string())?;
     let (width, height) = DMG_WINDOW;
     let settings = format!(
         "# 由 cargo xtask bundle --dmg 生成，每次打包都会重写。\n\
@@ -602,8 +636,7 @@ fn make_dmg(root: &Path, tool: &str, bundle: &Path, dmg: &Path) -> Result {
          window_rect = ((200, 120), ({width}, {height}))\n\
          icon_size = 128\n\
          text_size = 13\n\
-         icon_locations = {{\"{name}\": {app_at:?}, \"Applications\": {apps_at:?}}}\n\
-         hide_extensions = [\"{name}\"]\n\
+         icon_locations = {{{name}: {app_at:?}, \"Applications\": {apps_at:?}}}\n\
          show_status_bar = False\n\
          show_toolbar = False\n\
          show_pathbar = False\n\
@@ -615,8 +648,11 @@ fn make_dmg(root: &Path, tool: &str, bundle: &Path, dmg: &Path) -> Result {
         apps_at = DMG_APPLICATIONS_AT,
     );
     let path = root.join("target/bundle/macos/dmg-settings.py");
+    fs::create_dir_all(path.parent().ok_or("找不到 DMG 设置目录")?).map_err(|e| io(&path, e))?;
     write(&path, settings.as_bytes())?;
-    run_in(
+    // 不能设置 hide_extensions：dmgbuild 会对已签名的 .app 运行 SetFile -a E，
+    // 添加 com.apple.FinderInfo 后 codesign --strict 即失败。
+    let built = run_in(
         root,
         tool,
         &[
@@ -625,7 +661,46 @@ fn make_dmg(root: &Path, tool: &str, bundle: &Path, dmg: &Path) -> Result {
             "ScreenFerry",
             dmg.to_str().ok_or("路径不是 UTF-8")?,
         ],
-    )
+    );
+    let checked = built
+        .and_then(|()| dmg::verify_image(root, dmg, bundle.file_name().ok_or("应用没有名字")?));
+    if checked.is_err() {
+        // 不让失败产物继续被 CI/release 收集。验证器负责先卸载自己的只读挂载。
+        if let Err(e) = fs::remove_file(dmg)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "{}；无法删除无效安装盘：{}",
+                checked.unwrap_err(),
+                io(dmg, e)
+            ));
+        }
+    }
+    checked
+}
+
+fn dmg_from_bundle(root: &Path, bundle: &Path, output: &Path) -> Result {
+    let bundle = bundle.canonicalize().map_err(|e| io(bundle, e))?;
+    if bundle.extension().is_none_or(|ext| ext != "app") || !bundle.is_dir() {
+        return Err("--dmg-from 必须指向已签名的 .app 目录".into());
+    }
+    if output.extension().is_none_or(|ext| ext != "dmg") {
+        return Err("--dmg-output 必须是 .dmg 文件".into());
+    }
+    if fs::symlink_metadata(output).is_ok() {
+        return Err("--dmg-output 必须是尚不存在的新文件，不能覆盖已有安装盘".into());
+    }
+    let output = std::path::absolute(output).map_err(|e| io(output, e))?;
+    let parent = output.parent().ok_or("输出路径没有目录")?;
+    fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+    let parent = parent.canonicalize().map_err(|e| io(parent, e))?;
+    if parent.starts_with(&bundle) {
+        return Err("安装盘不能写进源应用目录".into());
+    }
+    let output = parent.join(output.file_name().ok_or("输出路径没有文件名")?);
+    make_dmg(root, &find_dmgbuild()?, &bundle, &output)?;
+    println!("\n✓ 已验证安装盘：{}", output.display());
+    Ok(())
 }
 
 /// 访达和程序坞按路径缓存应用图标，原地重新打包后还显示旧图标。碰一下修改时间、重新登记，
@@ -694,6 +769,17 @@ fn cargo(root: &Path, args: &[&str]) -> Result {
         .success()
         .then_some(())
         .ok_or_else(|| format!("cargo {} 失败", args.join(" ")))
+}
+
+fn build_daemon(root: &Path, options: &Options, target: Option<&str>) -> Result {
+    let mut args = vec!["build", "--release", "-p", "ferry-daemon"];
+    if let Some(target) = target {
+        args.extend(["--target", target]);
+    }
+    if options.quic_experiment {
+        args.extend(["--features", "quic-experiment"]);
+    }
+    cargo(root, &args)
 }
 
 fn run_in(dir: &Path, program: &str, args: &[&str]) -> Result {

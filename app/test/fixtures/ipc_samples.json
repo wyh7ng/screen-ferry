@@ -50,6 +50,8 @@
         ],
         "link": {
           "cursor_on_peer": true,
+          "fallback_reason": null,
+          "input_transport": "quic",
           "peer": {
             "addr": "192.168.2.18",
             "fingerprint": "3f9a12c477e0b1d2aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55",
@@ -76,6 +78,7 @@
           "natural_scrolling": true,
           "platform": "macos",
           "port": 24810,
+          "quic_available": true,
           "role": "server",
           "short": "7AB0-5CB2-38FB-D603",
           "system": "macOS 15.6 · arm64",
@@ -87,7 +90,9 @@
             "addr": "192.168.2.18",
             "alias": "书房的电脑",
             "cursor": true,
+            "fallback_reason": null,
             "fingerprint": "3f9a12c477e0b1d2aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55",
+            "input_transport": "quic",
             "last_seen": null,
             "name": "办公室 PC",
             "online": true,
@@ -142,6 +147,7 @@
             }
           ],
           "file_rate_limit_mbps": 0,
+          "input_transport": "auto",
           "language": "en",
           "layout": [
             {
@@ -200,6 +206,8 @@
         ],
         "link": {
           "cursor_on_peer": false,
+          "fallback_reason": null,
+          "input_transport": null,
           "peer": null,
           "rtt_ms": [],
           "since": null,
@@ -217,6 +225,7 @@
           "natural_scrolling": true,
           "platform": "macos",
           "port": 24810,
+          "quic_available": true,
           "role": "server",
           "short": "7AB0-5CB2-38FB-D603",
           "system": "macOS 15.6 · arm64",
@@ -228,7 +237,9 @@
             "addr": "192.168.2.18",
             "alias": "书房的电脑",
             "cursor": true,
+            "fallback_reason": null,
             "fingerprint": "3f9a12c477e0b1d2aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55",
+            "input_transport": "quic",
             "last_seen": null,
             "name": "办公室 PC",
             "online": true,
@@ -286,6 +297,7 @@
             }
           ],
           "file_rate_limit_mbps": 0,
+          "input_transport": "auto",
           "language": "en",
           "layout": [
             {
@@ -462,6 +474,7 @@
         "auto_update": false,
         "autostart": true,
         "clipboard_limit_mb": 16,
+        "input_transport": "auto",
         "language": "zh",
         "mouse_dpi": 800,
         "side": "left",

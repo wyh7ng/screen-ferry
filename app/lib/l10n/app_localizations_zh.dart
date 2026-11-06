@@ -2064,4 +2064,66 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get runLogReadFailed => '日志暂时无法读取，将自动重试。';
+
+  @override
+  String get settingsInputTransport => '键鼠输入传输';
+
+  @override
+  String get settingsInputTransportHint => '更改后会重新连接设备。选择只影响键鼠输入；剪贴板和文件始终使用 TCP。';
+
+  @override
+  String get inputTransportTcp => 'TCP（默认）';
+
+  @override
+  String get inputTransportAuto => '自动：优先 QUIC';
+
+  @override
+  String get inputTransportQuic => 'QUIC 位置数据报（实验）';
+
+  @override
+  String get inputTransportQuicReliable => 'QUIC 纯可靠（实验）';
+
+  @override
+  String get inputTransportExperimentHint =>
+      'QUIC 仍为实验功能，不保证降低延迟。由被控端发起连接：自动模式失败时回退 TCP，显式 QUIC 模式不回退。控制端启用 QUIC 后仍接受 TCP 客户端；请在两端设置，并查看实际连接协议。';
+
+  @override
+  String get inputTransportUnavailable => '当前后台未包含 QUIC 支持，可继续使用 TCP。';
+
+  @override
+  String get inputTransportActual => '实际输入链路';
+
+  @override
+  String get inputTransportUnknown => '未知';
+
+  @override
+  String get inputTransportQuicActual => 'QUIC（允许位置数据报）';
+
+  @override
+  String get inputTransportReliableActual => 'QUIC · 纯可靠';
+
+  @override
+  String get inputTransportFallbackUnreachable => 'QUIC 未能建立连接，当前已回退 TCP。请检查两端 QUIC 支持和 UDP 网络连通性。';
+
+  @override
+  String get inputTransportFallbackUnavailable => '此端未提供 QUIC，当前已回退 TCP。';
+
+  @override
+  String get inputTransportFallbackUnknown => 'QUIC 未启用，后台报告已回退 TCP。';
+
+  @override
+  String performanceWindowAge(String seconds, String age) {
+    return '采样窗口 $seconds 秒 · $age';
+  }
+
+  @override
+  String get performanceTimeUnknown => '采样时间未知';
+
+  @override
+  String inputTransportLog(String name, String transport) {
+    return '与 $name 的输入链路：$transport';
+  }
+
+  @override
+  String get inputTransportDataTcp => '剪贴板和文件使用 TCP · TLS 1.3';
 }
