@@ -74,6 +74,8 @@ Windows 安装包：
 - 装进 Program Files，并在防火墙中放行专用网络和域网络。
 - 更新时弹一次管理员确认后静默安装。另一台电脑正控制这台时，要用这台自己的键鼠点确认。卸载在“设置 → 应用”，配置和配对记录保留。
 
+开发构建可在本仓库 **Actions → CI → 对应运行 → Artifacts** 下载：`ScreenFerry-windows-setup-<提交号>` 和 `ScreenFerry-macos-universal-dev-<提交号>`（包含 Apple 芯片与 Intel 通用版 ZIP、DMG）。推送和 PR 会自动构建，也可以点 **Run workflow** 手动触发；产物保留 14 天。Mac 开发应用采用临时签名（ad-hoc），未经 Apple 公证：移入“应用程序”后，首次打开若被系统拦截，请在本机“系统设置 → 隐私与安全性”中允许打开，再授予辅助功能权限。替换构建后可能需要重新授权。
+
 ## 使用
 
 1. 两台电脑都打开 ScreenFerry。默认 Mac 控制、Windows 被控制，可以在“设置 → 这台电脑”里改。两台是同一种系统时，把没接键鼠的那台改成“被控制”。

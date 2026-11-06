@@ -4,13 +4,15 @@
 //!
 //! 供上层 crate 的场景测试使用。层级：L2。
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod autostart;
 mod capture;
 mod clipboard;
 mod display;
 mod event_loop;
+// Windows 场景测试也必须使用真实文件 ID；FFI 仅限此模块的句柄身份读取。
+#[allow(unsafe_code)]
 mod file_commit;
 mod inject;
 mod keymap;

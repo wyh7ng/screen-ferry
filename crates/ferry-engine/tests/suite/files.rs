@@ -286,7 +286,12 @@ fn has_payload(path: &Path) -> bool {
 
 #[tokio::test]
 async fn simultaneous_same_names_keep_every_file() {
-    let rig = Rig::start().await;
+    let (events, received_updates) = collect();
+    let rig = Rig::with(Setup {
+        mac_events: events,
+        ..Setup::default()
+    })
+    .await;
     let source = TempDir::new();
     let a = source.path().join("a/report.txt");
     let b = source.path().join("b/report.txt");
@@ -298,7 +303,22 @@ async fn simultaneous_same_names_keep_every_file() {
     );
     assert_ne!(first, second);
     eventually("两份同名文件都留下", || {
-        received(&rig.mac).join("report (2).txt").exists()
+        let updates = received_updates.lock().unwrap();
+        let failed: Vec<_> = updates
+            .iter()
+            .filter(|update| {
+                matches!(
+                    update.state,
+                    TransferState::Failed { .. } | TransferState::Cancelled { .. }
+                )
+            })
+            .collect();
+        assert!(failed.is_empty(), "并行同名接收失败：{failed:?}");
+        [first, second].iter().all(|id| {
+            updates.iter().any(|update| {
+                update.id == *id && matches!(update.state, TransferState::Done { .. })
+            })
+        })
     })
     .await;
     let mut contents = [

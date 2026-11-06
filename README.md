@@ -74,6 +74,8 @@ About the Windows installer:
 - It installs into Program Files and allows ScreenFerry through the firewall on private and domain networks.
 - Updates install silently after one administrator prompt. While another computer controls this one, use this computer's own keyboard and mouse to approve it. Uninstall from Settings → Apps; your settings and pairings are kept.
 
+Development builds are available from this repository’s **Actions → CI → run → Artifacts**: `ScreenFerry-windows-setup-<commit>` and `ScreenFerry-macos-universal-dev-<commit>` (ZIP and DMG for Apple silicon and Intel). Pushes and pull requests build them automatically; **Run workflow** also starts a build. Artifacts are kept for 14 days. The Mac development app uses an ad-hoc signature without Apple notarization: after moving it into Applications, approve it locally in System Settings → Privacy & Security if macOS blocks the first launch, then grant Accessibility permission. A replacement build may require granting that permission again.
+
 ## Usage
 
 1. Open ScreenFerry on both computers. By default a Mac controls and a Windows PC is controlled; change this in Settings → This Computer. When both computers run the same system, set the one without the keyboard and mouse to Be Controlled.

@@ -225,12 +225,11 @@ async fn interrupted_cross_volume_copy_reuses_its_recorded_private_container() {
     );
 }
 
-#[tokio::test]
-async fn receipt_cleanup_is_bounded_and_preserves_partial_and_unresolved_intents() {
+#[test]
+fn receipt_cleanup_is_bounded_and_preserves_partial_and_unresolved_intents() {
     let device = Device::new();
     let files = Files::new(&device.store, Events::none(), Arc::new(MockFileCommit));
-    // 等启动清理结束后准备人工缓存，避免两次清理互相抢占。
-    tokio::task::yield_now().await;
+    // 在进入运行时前构造，确保没有启动清理和这次显式清理争抢人工缓存。
     let peer = "ab".repeat(32);
     let root = device.store.partial_dir().join(&peer);
     let now = std::time::SystemTime::now()
@@ -252,14 +251,11 @@ async fn receipt_cleanup_is_bounded_and_preserves_partial_and_unresolved_intents
         }
     }
     // 1028可清理候选含一份过期项，只留1024份；另两份有partial/intent，均不能误删。
-    let mut removed = 0;
-    for _ in 0..20 {
-        removed += files.prune_receipts().await.unwrap();
-        if removed != 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let removed = runtime.block_on(files.prune_receipts()).unwrap();
     assert_eq!(removed, 4);
     for n in [1u32, 2] {
         let mut bytes = [0u8; 16];

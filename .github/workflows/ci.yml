@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -77,6 +78,52 @@ jobs:
         with:
           name: ScreenFerry-windows-setup-${{ steps.commit.outputs.short }}
           path: target/bundle/windows/*-setup.exe
+          retention-days: 14
+          if-no-files-found: error
+
+  macos-bundle:
+    # 普通 CI 的开发包：通用架构、临时签名，无需 Apple 证书或公证密钥。
+    name: macOS 通用开发包
+    runs-on: macos-latest
+    env:
+      SCREENFERRY_SIGN_IDENTITY: "-"
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装工具链与两个 macOS 目标
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.8
+          channel: stable
+      - name: 使用通用 Flutter 构建并确认 Xcode
+        run: |
+          flutter config --no-enable-macos-arm64-only
+          xcodebuild -version
+      - name: 安装 dmgbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dmgbuild"
+          "$RUNNER_TEMP/dmgbuild/bin/pip" install --quiet dmgbuild==1.6.5
+          echo "SCREENFERRY_DMGBUILD=$RUNNER_TEMP/dmgbuild/bin/dmgbuild" >> "$GITHUB_ENV"
+      - name: 打包通用应用与安装盘（临时签名）
+        run: cargo xtask bundle --universal --dmg
+      - name: 验证后台与设置界面的通用架构
+        run: |
+          bundle="target/bundle/macos/ScreenFerry.app/Contents"
+          helper="$bundle/Helpers/ScreenFerry.app/Contents"
+          for binary in "$bundle/MacOS/screenferry" "$helper/MacOS/ScreenFerry" "$helper/Frameworks/App.framework/App" "$helper/Frameworks/FlutterMacOS.framework/FlutterMacOS"; do
+            lipo -verify_arch arm64 x86_64 "$binary"
+          done
+      - name: 取提交号的前 7 位
+        id: commit
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenFerry-macos-universal-dev-${{ steps.commit.outputs.short }}
+          path: |
+            target/bundle/macos/*-macos-universal.zip
+            target/bundle/macos/*-macos-universal.dmg
           retention-days: 14
           if-no-files-found: error
 

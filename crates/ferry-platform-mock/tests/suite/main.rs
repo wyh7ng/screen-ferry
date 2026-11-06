@@ -4,3 +4,4 @@
 
 mod autostart;
 mod event_loop;
+mod file_commit;

@@ -453,6 +453,7 @@ version = "0.1.0"
 dependencies = [
  "ferry-platform",
  "ferry-types",
+ "windows",
 ]
 
 [[package]]
