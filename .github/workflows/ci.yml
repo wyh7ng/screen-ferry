@@ -113,7 +113,8 @@ jobs:
           bundle="target/bundle/macos/ScreenFerry.app/Contents"
           helper="$bundle/Helpers/ScreenFerry.app/Contents"
           for binary in "$bundle/MacOS/screenferry" "$helper/MacOS/ScreenFerry" "$helper/Frameworks/App.framework/App" "$helper/Frameworks/FlutterMacOS.framework/FlutterMacOS"; do
-            lipo -verify_arch arm64 x86_64 "$binary"
+            lipo "$binary" -archs
+            lipo "$binary" -verify_arch arm64 x86_64
           done
       - name: 取提交号的前 7 位
         id: commit
