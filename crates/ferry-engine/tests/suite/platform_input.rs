@@ -246,7 +246,14 @@ impl Rig {
             AutoConfirm::answering(true),
         ));
         eventually("平台工作线程会话建立", || {
-            !inject.inner.cursor_hidden().is_empty()
+            // 客户端已执行初始化隐藏，不代表控制端已消费Arrival::Session并登记邻居。
+            // 后面的测试只发送一次触边事件，必须等两端就绪，不能让该事件被当作无邻居丢弃。
+            server_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, Event::Connected { .. }))
+                && !inject.inner.cursor_hidden().is_empty()
         })
         .await;
         Self {
