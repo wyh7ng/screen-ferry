@@ -185,7 +185,7 @@ abstract class AppLocalizations {
   /// No description provided for @statusSharingRtt.
   ///
   /// In zh, this message translates to:
-  /// **'共享中 · {ms} ms'**
+  /// **'应用往返 · {ms} ms'**
   String statusSharingRtt(String ms);
 
   /// No description provided for @statusPaused.
@@ -2003,13 +2003,13 @@ abstract class AppLocalizations {
   /// No description provided for @overviewRtt.
   ///
   /// In zh, this message translates to:
-  /// **'往返延迟'**
+  /// **'应用往返'**
   String get overviewRtt;
 
   /// No description provided for @overviewPeak.
   ///
   /// In zh, this message translates to:
-  /// **'峰值 {ms}'**
+  /// **'历史峰值 {ms} ms'**
   String overviewPeak(String ms);
 
   /// No description provided for @overviewRttEmpty.
@@ -2021,7 +2021,7 @@ abstract class AppLocalizations {
   /// No description provided for @overviewRttAverage.
   ///
   /// In zh, this message translates to:
-  /// **'最近 {n} 秒平均 {ms} ms'**
+  /// **'最近 {n} 个采样窗口均值 {ms} ms'**
   String overviewRttAverage(int n, String ms);
 
   /// No description provided for @overviewClipboard.
@@ -3467,7 +3467,7 @@ abstract class AppLocalizations {
   /// No description provided for @performanceHint.
   ///
   /// In zh, this message translates to:
-  /// **'近 5 秒的本机处理阶段，分位数为近似值，最大值为实测。RTT 是网络往返时间，不是端到端输入延迟；无样本显示 —。'**
+  /// **'以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 包含两端处理、排队和网络传输，不是端到端输入延迟。无样本显示 —。'**
   String get performanceHint;
 
   /// No description provided for @performanceEmpty.
@@ -3521,7 +3521,7 @@ abstract class AppLocalizations {
   /// No description provided for @performanceRtt.
   ///
   /// In zh, this message translates to:
-  /// **'网络 RTT'**
+  /// **'应用心跳 RTT'**
   String get performanceRtt;
 
   /// No description provided for @performanceScheduler.
@@ -3581,7 +3581,7 @@ abstract class AppLocalizations {
   /// No description provided for @performanceLocal.
   ///
   /// In zh, this message translates to:
-  /// **'本机'**
+  /// **'本机引擎'**
   String get performanceLocal;
 
   /// No description provided for @performanceUnits.
@@ -3715,6 +3715,42 @@ abstract class AppLocalizations {
   /// In zh, this message translates to:
   /// **'剪贴板和文件使用 TCP · TLS 1.3'**
   String get inputTransportDataTcp;
+
+  /// No description provided for @overviewRttLatest.
+  ///
+  /// In zh, this message translates to:
+  /// **'最近窗口均值 · {age}'**
+  String overviewRttLatest(String age);
+
+  /// No description provided for @overviewRttHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'应用心跳往返，包含两端处理和排队。历史峰值不代表当前延迟。'**
+  String get overviewRttHint;
+
+  /// No description provided for @performanceDisplayQuery.
+  ///
+  /// In zh, this message translates to:
+  /// **'显示器查询'**
+  String get performanceDisplayQuery;
+
+  /// No description provided for @performanceCursorSwitch.
+  ///
+  /// In zh, this message translates to:
+  /// **'光标切换'**
+  String get performanceCursorSwitch;
+
+  /// No description provided for @performanceHeartbeatSend.
+  ///
+  /// In zh, this message translates to:
+  /// **'心跳写入等待'**
+  String get performanceHeartbeatSend;
+
+  /// No description provided for @performanceBackgroundHint.
+  ///
+  /// In zh, this message translates to:
+  /// **'显示器查询在后台执行，耗时较长不代表输入线程被阻塞。心跳写入完成也不代表对方已收到。'**
+  String get performanceBackgroundHint;
 }
 
 class _AppLocalizationsDelegate extends LocalizationsDelegate<AppLocalizations> {

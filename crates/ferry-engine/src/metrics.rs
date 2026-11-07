@@ -1,6 +1,9 @@
 //! 输入链路的本机单调时钟统计。固定大小直方图，不记录按键或逐事件日志。
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+use ferry_trust::Fingerprint;
 
 /// 一段时间内的延迟分布。百分位为固定直方图桶上界（约 12.5% 分辨率），最大值精确。
 /// 所有时间都是本机测量的微秒，不能用两台设备的时刻相减。
@@ -43,6 +46,12 @@ pub struct InputMetrics {
     pub rtt: LatencySummary,
     /// 定时任务相对于预定唤醒时刻的迟到量。
     pub scheduler: LatencySummary,
+    /// 后台显示器查询执行耗时，不代表核心运行时被阻塞。
+    pub display_query: LatencySummary,
+    /// 切屏时同步平台操作（抓取、归还、隐藏、锁定键同步）的耗时。
+    pub cursor_switch: LatencySummary,
+    /// Ping/Pong 编码、写入及 flush 的等待；不代表对端已收到。
+    pub heartbeat_send: LatencySummary,
     pub capture: QueueSummary,
     pub outbound: QueueSummary,
 }
@@ -142,6 +151,9 @@ pub(crate) struct MetricsWindow {
     pub inject: LatencyHistogram,
     pub rtt: LatencyHistogram,
     pub scheduler: LatencyHistogram,
+    pub display_query: LatencyHistogram,
+    pub cursor_switch: LatencyHistogram,
+    pub heartbeat_send: LatencyHistogram,
 }
 
 impl Default for MetricsWindow {
@@ -154,11 +166,26 @@ impl Default for MetricsWindow {
             inject: Default::default(),
             rtt: Default::default(),
             scheduler: Default::default(),
+            display_query: Default::default(),
+            cursor_switch: Default::default(),
+            heartbeat_send: Default::default(),
         }
     }
 }
 
 impl MetricsWindow {
+    pub fn record_display_query(&mut self, elapsed: Duration) {
+        self.display_query.record(elapsed);
+    }
+
+    pub fn record_cursor_switch(&mut self, elapsed: Duration) {
+        self.cursor_switch.record(elapsed);
+    }
+
+    pub fn record_heartbeat_send(&mut self, elapsed: Duration) {
+        self.heartbeat_send.record(elapsed);
+    }
+
     pub fn take(&mut self, mut capture: QueueSummary, mut outbound: QueueSummary) -> InputMetrics {
         let now = Instant::now();
         let capture_queue = self.capture.take();
@@ -177,8 +204,163 @@ impl MetricsWindow {
             inject: self.inject.take(),
             rtt: self.rtt.take(),
             scheduler: self.scheduler.take(),
+            display_query: self.display_query.take(),
+            cursor_switch: self.cursor_switch.take(),
+            heartbeat_send: self.heartbeat_send.take(),
             capture,
             outbound,
         }
     }
+}
+
+/// 一个已收集的性能窗口；只含时长、计数和来源，不含输入内容。
+#[derive(Clone, Debug)]
+pub struct RecordedMetrics {
+    pub peer: Option<Fingerprint>,
+    pub metrics: InputMetrics,
+}
+
+/// 一次 >100ms 窗口及其前后上下文。最多前2、触发1、后2个同源窗口。
+#[derive(Clone, Debug)]
+pub struct MetricIncident {
+    pub peer: Option<Fingerprint>,
+    pub triggered_at: Instant,
+    stages: Vec<&'static str>,
+    windows: Vec<InputMetrics>,
+    following: usize,
+}
+
+impl MetricIncident {
+    pub fn windows(&self) -> &[InputMetrics] {
+        &self.windows
+    }
+
+    /// 触发窗口里超过阈值的阶段名，只描述观测，不推断原因。
+    pub fn stages(&self) -> &[&'static str] {
+        &self.stages
+    }
+}
+
+/// 有界的诊断上下文。常规窗口保留60秒，每来源最多12个，全局最多128个；
+/// 另外保留最近4次尖峰，每次最多5个窗口，直到来源移除、清空或被新尖峰挤出。
+/// 同源尖峰的后续2个窗口内再次触发只并入当前上下文，不延长容量。
+/// 调用者应在引擎换代时clear、连接换代时remove_peer，不能跨会话拼接。
+#[derive(Clone, Default)]
+pub struct MetricsHistory {
+    recent: VecDeque<RecordedMetrics>,
+    incidents: VecDeque<MetricIncident>,
+}
+
+impl MetricsHistory {
+    const AGE: Duration = Duration::from_secs(60);
+    const PER_SOURCE: usize = 12;
+    const TOTAL: usize = 128;
+    const INCIDENTS: usize = 4;
+
+    /// 收集时间缺失、未来或同来源逆序/重复的窗口不进入诊断历史。
+    pub fn record(&mut self, peer: Option<Fingerprint>, metrics: InputMetrics) {
+        let now = Instant::now();
+        self.recent.retain(|entry| fresh(&entry.metrics, now));
+        let Some(at) = metrics.collected_at.filter(|at| *at <= now) else {
+            return;
+        };
+        if now.duration_since(at) > Self::AGE
+            || self.recent.iter().rev().any(|entry| {
+                entry.peer == peer && entry.metrics.collected_at.is_some_and(|old| old >= at)
+            })
+        {
+            return;
+        }
+        let mut continuing = false;
+        for incident in &mut self.incidents {
+            if incident.peer == peer && incident.following > 0 {
+                incident.windows.push(metrics.clone());
+                incident.following -= 1;
+                continuing = true;
+            }
+        }
+        let stages = spike_stages(&metrics);
+        if !continuing && !stages.is_empty() {
+            let mut before: Vec<_> = self
+                .recent
+                .iter()
+                .rev()
+                .filter(|entry| entry.peer == peer)
+                .take(2)
+                .map(|entry| entry.metrics.clone())
+                .collect();
+            before.reverse();
+            before.push(metrics.clone());
+            self.incidents.push_back(MetricIncident {
+                peer,
+                triggered_at: at,
+                stages,
+                windows: before,
+                following: 2,
+            });
+            while self.incidents.len() > Self::INCIDENTS {
+                self.incidents.pop_front();
+            }
+        }
+        while self
+            .recent
+            .iter()
+            .filter(|entry| entry.peer == peer)
+            .count()
+            >= Self::PER_SOURCE
+        {
+            if let Some(index) = self.recent.iter().position(|entry| entry.peer == peer) {
+                self.recent.remove(index);
+            }
+        }
+        self.recent.push_back(RecordedMetrics { peer, metrics });
+        while self.recent.len() > Self::TOTAL {
+            self.recent.pop_front();
+        }
+    }
+
+    /// 使用采样截止的单调时刻筛选；导出时不因长时间没有新事件而显示过期常规窗口。
+    pub fn recent(&self, now: Instant) -> impl Iterator<Item = &RecordedMetrics> {
+        self.recent
+            .iter()
+            .filter(move |entry| fresh(&entry.metrics, now))
+    }
+
+    pub fn incidents(&self) -> impl Iterator<Item = &MetricIncident> {
+        self.incidents.iter()
+    }
+
+    pub fn remove_peer(&mut self, peer: Option<Fingerprint>) {
+        self.recent.retain(|entry| entry.peer != peer);
+        self.incidents.retain(|entry| entry.peer != peer);
+    }
+
+    pub fn clear(&mut self) {
+        self.recent.clear();
+        self.incidents.clear();
+    }
+}
+
+fn fresh(metrics: &InputMetrics, now: Instant) -> bool {
+    metrics.collected_at.is_some_and(|at| {
+        now.checked_duration_since(at)
+            .is_some_and(|age| age <= MetricsHistory::AGE)
+    })
+}
+
+fn spike_stages(metrics: &InputMetrics) -> Vec<&'static str> {
+    [
+        ("capture_queue", &metrics.capture_queue),
+        ("send_queue", &metrics.send_queue),
+        ("send", &metrics.send),
+        ("inject", &metrics.inject),
+        ("rtt", &metrics.rtt),
+        ("scheduler", &metrics.scheduler),
+        ("display_query", &metrics.display_query),
+        ("cursor_switch", &metrics.cursor_switch),
+        ("heartbeat_send", &metrics.heartbeat_send),
+    ]
+    .into_iter()
+    .filter_map(|(name, stage)| (stage.over_100ms > 0).then_some(name))
+    .collect()
 }

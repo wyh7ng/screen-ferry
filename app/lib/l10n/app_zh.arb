@@ -15,7 +15,7 @@
   "statusDaemonNotRunning": "后台未运行",
   "statusDaemonLost": "与后台断开",
   "statusSharing": "共享中",
-  "statusSharingRtt": "共享中 · {ms} ms",
+  "statusSharingRtt": "应用往返 · {ms} ms",
   "@statusSharingRtt": {
     "placeholders": {
       "ms": {
@@ -734,8 +734,8 @@
   "overviewFingerprint": "指纹",
   "overviewPause": "暂停共享",
   "overviewResume": "继续共享",
-  "overviewRtt": "往返延迟",
-  "overviewPeak": "峰值 {ms}",
+  "overviewRtt": "应用往返",
+  "overviewPeak": "历史峰值 {ms} ms",
   "@overviewPeak": {
     "placeholders": {
       "ms": {
@@ -744,7 +744,7 @@
     }
   },
   "overviewRttEmpty": "连上对方后显示",
-  "overviewRttAverage": "最近 {n} 秒平均 {ms} ms",
+  "overviewRttAverage": "最近 {n} 个采样窗口均值 {ms} ms",
   "@overviewRttAverage": {
     "placeholders": {
       "n": {
@@ -1617,7 +1617,7 @@
   "settingsCoalesceMotion": "合并连续鼠标移动",
   "settingsCoalesceMotionHint": "适合高回报率鼠标或网络繁忙时，减少待发送的移动事件；按键、点击和滚轮保持顺序。需要逐个保留移动采样时关闭。",
   "performanceTitle": "性能统计",
-  "performanceHint": "近 5 秒的本机处理阶段，分位数为近似值，最大值为实测。RTT 是网络往返时间，不是端到端输入延迟；无样本显示 —。",
+  "performanceHint": "以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 包含两端处理、排队和网络传输，不是端到端输入延迟。无样本显示 —。",
   "performanceEmpty": "连接设备并操作键鼠后显示统计。",
   "performanceStage": "阶段",
   "performanceCount": "样本",
@@ -1626,7 +1626,7 @@
   "performanceSendQueue": "发送队列等待",
   "performanceSend": "发送耗时",
   "performanceInject": "注入耗时",
-  "performanceRtt": "网络 RTT",
+  "performanceRtt": "应用心跳 RTT",
   "performanceScheduler": "调度延迟",
   "performanceCapture": "捕获队列",
   "performanceOutbound": "发送队列",
@@ -1636,7 +1636,7 @@
   "performanceMaxWait": "窗口最大等待",
   "performanceCoalesced": "已合并",
   "performanceOverflows": "已溢出",
-  "performanceLocal": "本机",
+  "performanceLocal": "本机引擎",
   "performanceUnits": "耗时单位：ms；超过 100 ms 一列为次数。",
   "logRunVisible": "{size} · 当前显示 {count} 行",
   "runLogReadFailed": "日志暂时无法读取，将自动重试。",
@@ -1685,6 +1685,19 @@
         "type": "String"
       },
       "transport": {
+        "type": "String"
+      }
+    }
+  },
+  "overviewRttLatest": "最近窗口均值 · {age}",
+  "overviewRttHint": "应用心跳往返，包含两端处理和排队。历史峰值不代表当前延迟。",
+  "performanceDisplayQuery": "显示器查询",
+  "performanceCursorSwitch": "光标切换",
+  "performanceHeartbeatSend": "心跳写入等待",
+  "performanceBackgroundHint": "显示器查询在后台执行，耗时较长不代表输入线程被阻塞。心跳写入完成也不代表对方已收到。",
+  "@overviewRttLatest": {
+    "placeholders": {
+      "age": {
         "type": "String"
       }
     }

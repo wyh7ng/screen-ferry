@@ -25,14 +25,15 @@ impl<H: Host> Runtime<H> {
             self.toast(Phrase::new("error"), "后台任务较多，请稍后再试");
             return false;
         }
-        let (state, host, config, store) = (
+        let (state, host, config, store, history) = (
             self.snapshot(),
             self.host.clone(),
             self.config.clone(),
             self.store.clone(),
+            self.performance_history.clone(),
         );
         self.workers.spawn_blocking(move || {
-            let text = Self::diagnostics(state, &*host, &config, &store, summary);
+            let text = Self::diagnostics(state, &*host, &config, &store, &history, summary);
             let result = if summary {
                 Ok((None, text))
             } else {
@@ -83,6 +84,7 @@ impl<H: Host> Runtime<H> {
         host: &H,
         config: &Config,
         store: &Store,
+        history: &crate::MetricsHistory,
         summary: bool,
     ) -> String {
         let home = ferry_store::home_dir();
@@ -214,9 +216,23 @@ impl<H: Host> Runtime<H> {
             (
                 "阶段统计",
                 format!(
-                    "本机单调时钟；近似分位数；不是端到端延迟\n{}",
+                    "本机单调时钟；近似分位数；RTT为应用心跳往返，含两端处理和排队，不是端到端输入延迟\n{}",
                     serde_json::to_string(&state.performance).unwrap_or_default()
                 ),
+            ),
+            (
+                "尖峰上下文",
+                if summary {
+                    format!(
+                        "已保留 {} 次 >100ms 事件上下文；每次最多5个窗口，完整数据请导出诊断文件。慢后台查询不代表输入被阻塞。",
+                        history.incidents().count()
+                    )
+                } else {
+                    format!(
+                        "按来源收集前2、触发1、后2个窗口；重叠触发合并；慢后台查询不代表输入被阻塞。连接或引擎换代后清空对应来源。\n{}",
+                        super::super::performance::history(history)
+                    )
+                },
             ),
         ];
         // 局域网里发现、还没配对的设备也可能出现在日志里。

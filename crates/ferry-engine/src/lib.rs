@@ -10,6 +10,7 @@
 
 mod client;
 mod clipboard;
+mod display_query;
 mod edge_drop;
 mod error;
 mod events;
@@ -38,7 +39,10 @@ pub use input_queue::{
 };
 pub use invite::{INVITE_PORT, invite};
 pub use link::DEFAULT_PORT;
-pub use metrics::{InputMetrics, LatencyHistogram, LatencySummary, QueueSummary};
+pub use metrics::{
+    InputMetrics, LatencyHistogram, LatencySummary, MetricIncident, MetricsHistory, QueueSummary,
+    RecordedMetrics,
+};
 pub use pairing::{ConfirmPairing, PairingRequest};
 pub use server::{Live, ServerConfig, serve, serve_with_transport};
 

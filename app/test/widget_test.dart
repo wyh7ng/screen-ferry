@@ -113,14 +113,14 @@ void main() {
       final state = await launch(tester, size);
       expect(find.text('仪表盘'), findsWidgets);
       await visitAll(tester, state);
-      expect(find.text('往返延迟'), findsOneWidget);
+      expect(find.text('应用往返'), findsOneWidget);
     });
 
     testWidgets('$name下所有页面用英文也能正常显示', (tester) async {
       final state = await launch(tester, size, system: const Locale('en', 'US'));
       expect(find.text('Dashboard'), findsWidgets);
       await visitAll(tester, state);
-      expect(find.text('Round-Trip Time'), findsOneWidget);
+      expect(find.text('Application RTT'), findsOneWidget);
     });
   }
 
@@ -440,19 +440,19 @@ void main() {
     expect(find.text('后台没有运行'), findsOneWidget);
     expect(find.text('请先启动 ScreenFerry，连上后会自动显示。'), findsOneWidget);
     expect(navItem('设备'), findsOneWidget);
-    expect(find.text('往返延迟'), findsNothing);
+    expect(find.text('应用往返'), findsNothing);
     expect(state.online, isFalse);
   });
 
   testWidgets('与后台断开后保留数据、提示重连，并禁用会发命令的控件', (tester) async {
     final backend = DemoBackend(animate: false);
     final state = await launch(tester, const Size(1160, 780), backend: backend);
-    expect(find.text('往返延迟'), findsOneWidget);
+    expect(find.text('应用往返'), findsOneWidget);
 
     backend.goOffline();
     await settle(tester);
     expect(find.text('与后台的连接已断开，正在重连…'), findsOneWidget);
-    expect(find.text('往返延迟'), findsOneWidget, reason: '保留最后的数据');
+    expect(find.text('应用往返'), findsOneWidget, reason: '保留最后的数据');
 
     final sentBefore = backend.sent.length;
     await tester.tap(find.text('剪贴板同步'));

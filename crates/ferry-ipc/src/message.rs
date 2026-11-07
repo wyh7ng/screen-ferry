@@ -265,6 +265,9 @@ pub struct InputMetrics {
     pub inject: LatencySummary,
     pub rtt: LatencySummary,
     pub scheduler: LatencySummary,
+    pub display_query: LatencySummary,
+    pub cursor_switch: LatencySummary,
+    pub heartbeat_send: LatencySummary,
     pub capture: QueueSummary,
     pub outbound: QueueSummary,
 }
@@ -428,8 +431,11 @@ pub struct Link {
     /// 连上的时刻（Unix 毫秒）。
     pub since: Option<i64>,
     pub cursor_on_peer: bool,
-    /// 最近至多 32 秒、每秒一个的平均往返延迟（毫秒），先旧后新。
+    /// 最近至多32个非空结算窗口的应用往返平均值（毫秒），先旧后新。
     pub rtt_ms: Vec<f64>,
+    /// 最新已结算平均中最后一个样本被后台观察到的时刻（Unix毫秒）；不是报文到达时间。
+    #[serde(default)]
+    pub rtt_measured_at: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

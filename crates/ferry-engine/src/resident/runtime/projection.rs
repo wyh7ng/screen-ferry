@@ -64,6 +64,7 @@ impl<H: Host> Runtime<H> {
                 since: focus.map(|l| l.since),
                 cursor_on_peer: self.cursor.is_some(),
                 rtt_ms: focus.map_or_else(Vec::new, |l| l.rtt.history()),
+                rtt_measured_at: focus.and_then(|l| l.rtt.measured_at()),
             },
             clipboard: self.clipboard.clone().map(|mut c| {
                 if let Some(peer) = &self.clipboard_peer {

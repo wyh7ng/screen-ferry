@@ -38,6 +38,9 @@ class MetricsBackend extends DemoBackend {
                       'max_us': 5555,
                       'over_100ms': 0,
                     },
+                    'display_query': {'count': 5, 'max_us': 120123, 'over_100ms': 1},
+                    'cursor_switch': {'count': 2, 'max_us': 864},
+                    'heartbeat_send': {'count': 8, 'max_us': 287},
                     'capture': {'depth': 0, 'high_water': 12, 'oldest_us': null, 'coalesced': 50},
                   },
                 },
@@ -71,6 +74,13 @@ void main() {
       expect(find.text('—'), findsWidgets, reason: '无注入等样本不显示0ms');
       expect(find.text('最老等待 —'), findsNWidgets(2));
       expect(find.textContaining('不是端到端输入延迟'), findsOneWidget);
+      expect(find.text('显示器查询'), findsOneWidget);
+      expect(find.text('光标切换'), findsOneWidget);
+      expect(find.text('心跳写入等待'), findsOneWidget);
+      expect(find.text('120.12'), findsOneWidget);
+      expect(find.text('0.86'), findsOneWidget);
+      expect(find.text('0.29'), findsOneWidget);
+      expect(find.textContaining('不代表输入线程被阻塞'), findsOneWidget);
       expect(tester.takeException(), isNull);
     });
   }

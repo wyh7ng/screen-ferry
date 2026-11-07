@@ -1380,6 +1380,31 @@ async fn peer_performance_is_removed_on_disconnect_and_restarts_with_a_new_windo
     .expect("真实心跳必须产生非空的性能窗口");
     assert!(first.metrics.rtt.count > 0);
     assert!(first.metrics.window_ms > 0);
+    ui.send(Request::ExportDiagnostics).await;
+    let path = ui
+        .wait("性能上下文导出", |notice| match notice {
+            Notice::DiagnosticsExported { path, .. } => Some(PathBuf::from(path)),
+            _ => None,
+        })
+        .await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let history: serde_json::Value = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|value| value.get("recent_total_limit").is_some())
+        .expect("导出包含有界性能历史");
+    let recent = history["recent"].as_array().unwrap();
+    assert!(
+        recent
+            .iter()
+            .any(|entry| entry["fingerprint"] == fingerprint)
+    );
+    assert!(
+        recent
+            .iter()
+            .all(|entry| entry["metrics"].get("heartbeat_send").is_some())
+    );
+    std::fs::remove_file(path).unwrap();
     client.abort();
     let _ = client.await;
     ui.wait("断开快照移除旧指标", |notice| match notice {
@@ -1401,6 +1426,40 @@ async fn peer_performance_is_removed_on_disconnect_and_restarts_with_a_new_windo
         _ => None,
     })
     .await;
+    ui.send(Request::ExportDiagnostics).await;
+    let path = ui
+        .wait("断开后上下文导出", |notice| match notice {
+            Notice::DiagnosticsExported { path, .. } => Some(PathBuf::from(path)),
+            _ => None,
+        })
+        .await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let history: serde_json::Value = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|value| value.get("recent_total_limit").is_some())
+        .unwrap();
+    assert!(
+        history["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["fingerprint"] != fingerprint)
+    );
+    assert!(
+        history["incidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| {
+                entry["windows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|window| window["fingerprint"] != fingerprint)
+            })
+    );
+    std::fs::remove_file(path).unwrap();
     let client = spawn();
     let reconnected = ui
         .wait("重连首个快照没有旧窗口", |notice| match notice {

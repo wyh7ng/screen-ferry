@@ -112,10 +112,12 @@ class _StatusFooter extends StatelessWidget {
   final bool collapsed;
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context, aspects: const {AppAspect.connection, AppAspect.rtt});
+    final state = AppScope.of(context, aspects: const {AppAspect.connection, AppAspect.rtt, AppAspect.clock});
     final c = SfColors.of(context);
     return Tooltip(
-      message: _footer(state),
+      message: state.latestRtt == null
+          ? _footer(state)
+          : '${_footer(state)}\n${state.l10n.overviewRttLatest(state.rttMeasuredAt == null ? state.l10n.performanceTimeUnknown : timeAgo(state.l10n, state.rttMeasuredAt!))}\n${state.l10n.overviewRttHint}',
       child: AnimatedContainer(
         duration: Motion.medium,
         curve: Motion.ease,

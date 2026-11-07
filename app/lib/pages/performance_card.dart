@@ -26,6 +26,8 @@ class PerformanceCard extends StatelessWidget {
           CardHeader(icon: Icons.query_stats_rounded, title: l.performanceTitle),
           const SizedBox(height: 10),
           Text(l.performanceHint, style: TextStyle(color: c.muted, height: 1.5)),
+          const SizedBox(height: 6),
+          Text(l.performanceBackgroundHint, style: TextStyle(color: c.muted, height: 1.5)),
           if (peers.isEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 14),
@@ -76,6 +78,9 @@ class _LatencyTable extends StatelessWidget {
       l.performanceInject,
       l.performanceRtt,
       l.performanceScheduler,
+      l.performanceDisplayQuery,
+      l.performanceCursorSwitch,
+      l.performanceHeartbeatSend,
     ];
     Widget cell(String text, {bool title = false}) => Padding(
       padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 6),

@@ -56,7 +56,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String statusSharingRtt(String ms) {
-    return '共享中 · $ms ms';
+    return '应用往返 · $ms ms';
   }
 
   @override
@@ -1085,11 +1085,11 @@ class AppLocalizationsZh extends AppLocalizations {
   String get overviewResume => '继续共享';
 
   @override
-  String get overviewRtt => '往返延迟';
+  String get overviewRtt => '应用往返';
 
   @override
   String overviewPeak(String ms) {
-    return '峰值 $ms';
+    return '历史峰值 $ms ms';
   }
 
   @override
@@ -1097,7 +1097,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String overviewRttAverage(int n, String ms) {
-    return '最近 $n 秒平均 $ms ms';
+    return '最近 $n 个采样窗口均值 $ms ms';
   }
 
   @override
@@ -1995,7 +1995,8 @@ class AppLocalizationsZh extends AppLocalizations {
   String get performanceTitle => '性能统计';
 
   @override
-  String get performanceHint => '近 5 秒的本机处理阶段，分位数为近似值，最大值为实测。RTT 是网络往返时间，不是端到端输入延迟；无样本显示 —。';
+  String get performanceHint =>
+      '以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 包含两端处理、排队和网络传输，不是端到端输入延迟。无样本显示 —。';
 
   @override
   String get performanceEmpty => '连接设备并操作键鼠后显示统计。';
@@ -2022,7 +2023,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get performanceInject => '注入耗时';
 
   @override
-  String get performanceRtt => '网络 RTT';
+  String get performanceRtt => '应用心跳 RTT';
 
   @override
   String get performanceScheduler => '调度延迟';
@@ -2052,7 +2053,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get performanceOverflows => '已溢出';
 
   @override
-  String get performanceLocal => '本机';
+  String get performanceLocal => '本机引擎';
 
   @override
   String get performanceUnits => '耗时单位：ms；超过 100 ms 一列为次数。';
@@ -2126,4 +2127,24 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get inputTransportDataTcp => '剪贴板和文件使用 TCP · TLS 1.3';
+
+  @override
+  String overviewRttLatest(String age) {
+    return '最近窗口均值 · $age';
+  }
+
+  @override
+  String get overviewRttHint => '应用心跳往返，包含两端处理和排队。历史峰值不代表当前延迟。';
+
+  @override
+  String get performanceDisplayQuery => '显示器查询';
+
+  @override
+  String get performanceCursorSwitch => '光标切换';
+
+  @override
+  String get performanceHeartbeatSend => '心跳写入等待';
+
+  @override
+  String get performanceBackgroundHint => '显示器查询在后台执行，耗时较长不代表输入线程被阻塞。心跳写入完成也不代表对方已收到。';
 }

@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import '../l10n/l10n.dart';
 import '../theme/tokens.dart';
 
-/// 往返延迟柱状图：最新的一根最亮，其余淡一些。
+/// 应用往返采样窗口均值的柱状图：最新的一根最亮，其余淡一些。
 class LatencyBars extends StatelessWidget {
   const LatencyBars({super.key, required this.values, required this.active});
 

@@ -1,7 +1,7 @@
 //! 给设置界面看的记录：日志、每小时的活动、往返延迟。都只保存在内存里，后台重启即清空。
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferry_ipc::{HourActivity, LogEntry, LogIcon, LogKind, Phrase};
 
@@ -9,8 +9,8 @@ use ferry_ipc::{HourActivity, LogEntry, LogIcon, LogKind, Phrase};
 const LOG_CAPACITY: usize = 200;
 /// 活动统计保留的小时数。
 const ACTIVITY_HOURS: i64 = 48;
-/// 往返延迟保留的秒数。
-const RTT_SECONDS: usize = 32;
+/// 往返延迟保留的非空结算窗口数。
+const RTT_WINDOWS: usize = 32;
 
 /// 当前时刻（Unix 毫秒）。
 pub(crate) fn now_ms() -> i64 {
@@ -96,18 +96,21 @@ impl Activity {
     }
 }
 
-/// 往返延迟：每秒取一次平均，保留最近 32 秒。
+/// 往返延迟：每秒结算收到的样本均值，保留最近32个非空窗口。
 #[derive(Default)]
 pub(crate) struct Rtt {
     history: VecDeque<f64>,
     total: Duration,
     count: u32,
+    observed_at: Option<Instant>,
+    measured_at: Option<i64>,
 }
 
 impl Rtt {
     pub(crate) fn record(&mut self, rtt: Duration) {
         self.total += rtt;
         self.count += 1;
+        self.observed_at = Some(Instant::now());
     }
 
     /// 结束这一秒。这一秒有测量时返回 `true`。
@@ -117,7 +120,10 @@ impl Rtt {
         }
         let avg = self.total.as_secs_f64() * 1000.0 / f64::from(self.count);
         self.history.push_back((avg * 100.0).round() / 100.0);
-        while self.history.len() > RTT_SECONDS {
+        self.measured_at = self.observed_at.map(|at| {
+            now_ms().saturating_sub(i64::try_from(at.elapsed().as_millis()).unwrap_or(i64::MAX))
+        });
+        while self.history.len() > RTT_WINDOWS {
             self.history.pop_front();
         }
         self.total = Duration::ZERO;
@@ -127,5 +133,9 @@ impl Rtt {
 
     pub(crate) fn history(&self) -> Vec<f64> {
         self.history.iter().copied().collect()
+    }
+
+    pub(crate) fn measured_at(&self) -> Option<i64> {
+        self.measured_at
     }
 }

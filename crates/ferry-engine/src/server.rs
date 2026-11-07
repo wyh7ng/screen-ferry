@@ -48,6 +48,7 @@ use crate::heartbeat::{self, Heartbeat};
 use crate::input_queue::{InputReceiver, InputSender, InputSettings, input_queue};
 use crate::link::{
     DISPLAY_CHECK, HANDSHAKE_TIMEOUT, capabilities, frame_of, platform_of, primary_scale, send,
+    send_heartbeat,
 };
 use crate::metrics::{self, MetricsWindow, QueueSummary};
 use crate::pairing::{self, ConfirmPairing, Outcome};
@@ -148,7 +149,7 @@ pub async fn serve<C, D, K, P>(
 ) -> Result<Infallible>
 where
     C: InputCapture,
-    D: Displays,
+    D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
 {
@@ -176,12 +177,13 @@ pub async fn serve_with_transport<C, D, K, P>(
 ) -> Result<Infallible>
 where
     C: InputCapture,
-    D: Displays,
+    D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
 {
     transport.ensure_available()?;
-    let mut server = Server::start(config, capture, displays, clipboard, confirm, transport)?;
+    let mut server =
+        Server::start(config, capture, displays, clipboard, confirm, transport).await?;
     let addr = listener.local_addr()?;
     // 广播失败（例如网络不支持组播）不影响按地址连接。
     let advertiser = if server.config.announce {
@@ -306,12 +308,12 @@ struct Session {
     sync: Option<ClipboardTask>,
 }
 
-struct Server<C, D, K, P> {
+struct Server<C, K, P> {
     config: ServerConfig,
     shared: Arc<Shared<P>>,
     arrivals: mpsc::Receiver<Arrival>,
     capture: C,
-    displays: D,
+    displays: crate::display_query::DisplayQuery,
     clipboard: SharedClipboard<K>,
     events: mpsc::Receiver<Captured>,
     capture_stats: Arc<CaptureStats>,
@@ -330,23 +332,28 @@ struct Server<C, D, K, P> {
     hint_target: Option<Fingerprint>,
 }
 
-impl<C, D, K, P> Server<C, D, K, P>
+impl<C, K, P> Server<C, K, P>
 where
     C: InputCapture,
-    D: Displays,
     K: Clipboard,
     P: ConfirmPairing,
 {
-    fn start(
+    async fn start(
         config: ServerConfig,
         mut capture: C,
-        displays: D,
+        displays: impl Displays + 'static,
         clipboard: K,
         confirm: P,
         transport: ferry_net::Transport,
     ) -> Result<Self> {
         let identity = config.store.identity(&config.name)?;
         let tls = Tls::new(&identity)?;
+        let mut displays = crate::display_query::DisplayQuery::new(displays).await?;
+        let queried = displays.fresh().await?;
+        let mut metrics = MetricsWindow::default();
+        metrics.record_display_query(queried.elapsed);
+        let local = queried.displays?;
+        let rect = bounds(&local).ok_or(Error::NoDisplays("本机"))?;
         let (tx, events) = mpsc::channel(CAPTURE_CAPACITY);
         let capture_stats = Arc::new(CaptureStats::default());
         let stats = capture_stats.clone();
@@ -368,8 +375,6 @@ where
                 }
             }
         }))?;
-        let local = displays.displays()?;
-        let rect = bounds(&local).ok_or(Error::NoDisplays("本机"))?;
         let (arrivals_tx, arrivals) = mpsc::channel(64);
         let shared = Arc::new(Shared {
             capabilities: capabilities(config.clipboard, true, config.command_key),
@@ -396,7 +401,7 @@ where
             clipboard: SharedClipboard::new(clipboard)?,
             events,
             capture_stats,
-            metrics: MetricsWindow::default(),
+            metrics,
             local,
             neighbors: Neighbors::new(rect),
             sessions: HashMap::new(),
@@ -452,7 +457,7 @@ where
         if transport != ferry_net::Transport::Tcp && !transport.falls_back() {
             return Err(std::io::Error::other("需要quic-experiment编译feature").into());
         }
-        let mut screens = interval(DISPLAY_CHECK);
+        let mut screens = interval_at(tokio::time::Instant::now() + DISPLAY_CHECK, DISPLAY_CHECK);
         screens.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut hints = self.config.edge.hints();
         // 设置的发送方已经不在（命令行模式）时，不再等它的变化。
@@ -526,7 +531,14 @@ where
                         self.route_hint(hint);
                     }
                 }
-                _ = screens.tick() => self.refresh_local(),
+                _ = screens.tick() => self.displays.request()?,
+                queried = self.displays.completed() => {
+                    let queried = queried?;
+                    self.metrics.record_display_query(queried.elapsed);
+                    if let Ok(now) = queried.displays {
+                        self.refresh_local(now);
+                    }
+                }
             }
             for id in std::mem::take(&mut self.broken) {
                 self.end(id, Some("对方长时间收不动，已断开".into()));
@@ -549,7 +561,9 @@ where
 
     fn stop_overloaded_capture(&mut self) {
         if let Some((_, at)) = self.neighbors.abort() {
+            let started = Instant::now();
             let _ = self.capture.release(at);
+            self.metrics.record_cursor_switch(started.elapsed());
         }
         self.sessions.clear();
         self.shared.sessions().clear();
@@ -758,7 +772,10 @@ where
         }
         if let Some(at) = self.neighbors.remove(id) {
             self.pressed.clear_keys();
-            match self.capture.release(at) {
+            let started = Instant::now();
+            let result = self.capture.release(at);
+            self.metrics.record_cursor_switch(started.elapsed());
+            match result {
                 Ok(()) => info!("已把控制权交还本机"),
                 Err(e) => warn!("交还本机控制失败：{e}"),
             }
@@ -875,7 +892,10 @@ where
         match transition {
             Transition::Enter { seq, at } => {
                 // 先抓取再通知对方：抓取失败就不过去。
-                if let Err(e) = self.capture.grab() {
+                let started = Instant::now();
+                let result = self.capture.grab();
+                self.metrics.record_cursor_switch(started.elapsed());
+                if let Err(e) = result {
                     warn!("抓取本机键鼠失败，留在本机：{e}");
                     self.neighbors.abort();
                     return;
@@ -902,7 +922,10 @@ where
             }
             Transition::Leave { seq, local_at } => {
                 // 先归还本机控制再通知对方：发送失败也不会把本机键鼠锁住。
-                if let Err(e) = self.capture.release(local_at) {
+                let started = Instant::now();
+                let result = self.capture.release(local_at);
+                self.metrics.record_cursor_switch(started.elapsed());
+                if let Err(e) = result {
                     warn!("交还本机控制失败：{e}");
                 }
                 self.config.edge.pointer(|p| p.here = true);
@@ -993,11 +1016,7 @@ where
     }
 
     /// 本机的显示器变了（改分辨率、插拔显示器）：重新划分各段，告诉每台设备。
-    fn refresh_local(&mut self) {
-        // 查询偶尔失败（例如显示器正在切换）时等下一次。
-        let Ok(now) = self.displays.displays() else {
-            return;
-        };
+    fn refresh_local(&mut self, now: Vec<Display>) {
         if now == self.local {
             return;
         }
@@ -1349,7 +1368,7 @@ async fn run_session(
                         }
                     }
                     Some(Message::Ping { nonce }) => {
-                        send(&mut framed, &Message::Pong { nonce }).await?;
+                        send_heartbeat(&mut framed, &Message::Pong { nonce }, &mut metrics).await?;
                     }
                     Some(Message::Bye(_)) | None => return Ok(()),
                     Some(
@@ -1382,7 +1401,7 @@ async fn run_session(
                     }
                     let remote = !*active.borrow();
                     if let Some(nonce) = heartbeat.poll_ping(remote) {
-                        send(&mut framed, &Message::Ping { nonce }).await?;
+                        send_heartbeat(&mut framed, &Message::Ping { nonce }, &mut metrics).await?;
                     }
                     if let Some(report) = heartbeat.poll_report() {
                         info!("{report}");

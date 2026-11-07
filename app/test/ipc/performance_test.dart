@@ -33,8 +33,25 @@ void main() {
     expect(peer.metrics.capture.maxWaitUs, 345);
     expect(peer.metrics.capture.coalesced, 50);
     expect(peer.metrics.latencies['inject']!.count, 0);
+    for (final stage in ['display_query', 'cursor_switch', 'heartbeat_send']) {
+      expect(peer.metrics.latencies[stage]!.count, 0, reason: '旧后台缺少阶段时显示无样本');
+    }
     expect(() => peer.metrics.latencies.clear(), throwsUnsupportedError);
     expect(() => info.peers.clear(), throwsUnsupportedError);
+  });
+
+  test('新增阶段保留实测值且往返采样时间可缺省', () {
+    final metrics = PerformanceMetrics.fromJson({
+      'display_query': {'count': 5, 'max_us': 120000, 'over_100ms': 1},
+      'cursor_switch': {'count': 2, 'max_us': 840},
+      'heartbeat_send': {'count': 8, 'max_us': 260},
+    });
+    expect(metrics.latencies['display_query']!.maxUs, 120000);
+    expect(metrics.latencies['display_query']!.over100ms, 1);
+    expect(metrics.latencies['cursor_switch']!.count, 2);
+    expect(metrics.latencies['heartbeat_send']!.maxUs, 260);
+    expect(Link.fromJson({}).rttMeasuredAt, isNull);
+    expect(Link.fromJson({'rtt_measured_at': 1700000000123}).rttMeasuredAt!.millisecondsSinceEpoch, 1700000000123);
   });
 
   test('新增设置缺省安全且补丁保留零值和关闭状态', () {

@@ -358,7 +358,7 @@ class _LatencyCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = AppScope.of(context, aspects: const {AppAspect.rtt, AppAspect.connection});
+    final state = AppScope.of(context, aspects: const {AppAspect.rtt, AppAspect.connection, AppAspect.clock});
     final c = SfColors.of(context);
     String ms(double? v) => v == null ? '—' : v.toStringAsFixed(2);
     final rtt = state.rtt;
@@ -366,11 +366,7 @@ class _LatencyCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          CardHeader(
-            icon: Icons.speed_rounded,
-            title: context.l10n.overviewRtt,
-            trailing: rtt.isEmpty ? null : SideNote(context.l10n.overviewPeak(ms(state.peakRtt))),
-          ),
+          CardHeader(icon: Icons.speed_rounded, title: context.l10n.overviewRtt),
           const SizedBox(height: 10),
           Text.rich(
             TextSpan(
@@ -384,6 +380,24 @@ class _LatencyCard extends StatelessWidget {
             ),
             style: const TextStyle(fontSize: 40, fontWeight: FontWeight.w800, height: 1.05, fontFeatures: tabular),
           ),
+          if (rtt.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              context.l10n.overviewRttLatest(
+                state.rttMeasuredAt == null
+                    ? context.l10n.performanceTimeUnknown
+                    : timeAgo(context.l10n, state.rttMeasuredAt!),
+              ),
+              style: TextStyle(fontSize: 12, color: c.muted),
+            ),
+          ],
+          if (rtt.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(
+              context.l10n.overviewPeak(ms(state.peakRtt)),
+              style: TextStyle(fontSize: 12, color: c.muted, fontFeatures: tabular),
+            ),
+          ],
           const SizedBox(height: 14),
           LatencyBars(values: rtt, active: state.connected),
           const SizedBox(height: 10),
@@ -391,6 +405,8 @@ class _LatencyCard extends StatelessWidget {
             rtt.isEmpty ? context.l10n.overviewRttEmpty : context.l10n.overviewRttAverage(rtt.length, ms(state.avgRtt)),
             style: TextStyle(fontSize: 14, color: c.muted, fontFeatures: tabular),
           ),
+          const SizedBox(height: 6),
+          Text(context.l10n.overviewRttHint, style: TextStyle(fontSize: 12, color: c.muted, height: 1.5)),
         ],
       ),
     );

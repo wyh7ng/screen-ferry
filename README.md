@@ -42,7 +42,7 @@ flowchart LR
 ```
 
 Each computer runs a background service that captures or injects input and handles networking and sync. The settings window is a separate process that talks to it over loopback.
-Each pair of devices keeps two TLS 1.3 connections, so a large file transfer never slows down the keyboard and mouse.
+Input, clipboard and file content use separate channels so file content does not queue ahead of input in the same stream. They still share network and system resources; large transfers can affect latency.
 
 Trust is set up on the first connection:
 
@@ -92,7 +92,8 @@ Quit other keyboard and mouse sharing tools first so they don't compete for inpu
 
 Settings can limit the combined rate of all outgoing files (decimal MB/s; 0 means unlimited), leaving bandwidth for input and other applications. Rate limiting does not eliminate wireless link jitter.
 “Coalesce pointer motion” is off by default. When enabled it combines queued ordinary motion while preserving key, drag and screen transition order.
-The overview shows local stage timings and queues for the latest sample window. Percentiles are approximate; RTT is not input-to-display latency.
+The overview shows local stage timings and queues for the latest sample window. Percentiles are approximate. Application RTT includes processing and queues on both computers plus network transit; it is neither system ping nor input-to-display latency. The UI distinguishes the latest sampled mean, historical peak and sample age.
+Display queries run on a separate background thread. Performance statistics include display queries, cursor transitions and heartbeat writes; full diagnostics retain bounded windows around spikes to help investigate intermittent stalls.
 
 ### Command line
 

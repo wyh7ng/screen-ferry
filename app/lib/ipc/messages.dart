@@ -151,7 +151,17 @@ class PerformanceMetrics {
     this.capture = const QueueSummary(),
     this.outbound = const QueueSummary(),
   });
-  static const stages = ['capture_queue', 'send_queue', 'send', 'inject', 'rtt', 'scheduler'];
+  static const stages = [
+    'capture_queue',
+    'send_queue',
+    'send',
+    'inject',
+    'rtt',
+    'scheduler',
+    'display_query',
+    'cursor_switch',
+    'heartbeat_send',
+  ];
   factory PerformanceMetrics.fromJson(Json j) => PerformanceMetrics(
     windowMs: j['window_ms'] is num ? _int(j['window_ms']) : 5000,
     latencies: Map.unmodifiable({
@@ -446,6 +456,7 @@ class Link {
     required this.since,
     required this.cursorOnPeer,
     required this.rttMs,
+    this.rttMeasuredAt,
     this.inputTransport,
     this.fallbackReason,
   });
@@ -457,6 +468,7 @@ class Link {
     peer: j['peer'] is Json ? PeerRef.fromJson(j['peer'] as Json) : null,
     since: _time(j['since']),
     cursorOnPeer: _bool(j['cursor_on_peer']),
+    rttMeasuredAt: _time(j['rtt_measured_at']),
     rttMs: [
       for (final v in (j['rtt_ms'] is List ? j['rtt_ms'] as List : const []))
         if (v is num) v.toDouble(),
@@ -470,8 +482,11 @@ class Link {
   final DateTime? since;
   final bool cursorOnPeer;
 
-  /// 每秒一个的平均往返延迟（毫秒），先旧后新。
+  /// 有样本窗口的平均应用往返延迟（毫秒），先旧后新。
   final List<double> rttMs;
+
+  /// 后台收到最近已结算窗口最后一个样本的时间；旧后台未知。
+  final DateTime? rttMeasuredAt;
 }
 
 /// 连接中的对方。

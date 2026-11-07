@@ -4,9 +4,11 @@
 
 mod client;
 mod clipboard;
+mod display_query;
 mod edge_drop;
 mod events;
 mod files;
+mod heartbeat;
 mod input_queue;
 mod invite;
 mod metrics;

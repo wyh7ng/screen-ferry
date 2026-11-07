@@ -265,7 +265,7 @@ class AppState extends ChangeNotifier {
         s.autoUpdate,
         [for (final d in s.devices) d.toJson()],
       ],
-      AppAspect.rtt: [...rtt],
+      AppAspect.rtt: [...rtt, rttMeasuredAt],
       AppAspect.performance: performance.value,
       AppAspect.clipboard: [
         c?.toPeer,
@@ -473,6 +473,7 @@ class AppState extends ChangeNotifier {
 
   List<double> get rtt => connected ? (_daemon?.link.rttMs ?? const []) : const [];
   double? get latestRtt => rtt.isEmpty ? null : rtt.last;
+  DateTime? get rttMeasuredAt => connected ? _daemon?.link.rttMeasuredAt : null;
   double? get peakRtt => rtt.isEmpty ? null : rtt.reduce((a, b) => a > b ? a : b);
   double? get avgRtt => rtt.isEmpty ? null : rtt.reduce((a, b) => a + b) / rtt.length;
 

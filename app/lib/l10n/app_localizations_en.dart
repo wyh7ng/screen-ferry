@@ -56,7 +56,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String statusSharingRtt(String ms) {
-    return 'Sharing · $ms ms';
+    return 'App RTT · $ms ms';
   }
 
   @override
@@ -1132,11 +1132,11 @@ class AppLocalizationsEn extends AppLocalizations {
   String get overviewResume => 'Resume Sharing';
 
   @override
-  String get overviewRtt => 'Round-Trip Time';
+  String get overviewRtt => 'Application RTT';
 
   @override
   String overviewPeak(String ms) {
-    return 'Peak $ms';
+    return 'History peak $ms ms';
   }
 
   @override
@@ -1144,7 +1144,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String overviewRttAverage(int n, String ms) {
-    return 'Average over the last $n s: $ms ms';
+    return 'Mean of the last $n sampled windows: $ms ms';
   }
 
   @override
@@ -2072,7 +2072,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get performanceHint =>
-      'Local processing stages over the last 5 seconds. Percentiles are approximate; maximums are measured. RTT is network round-trip time, not end-to-end input latency. — means no samples.';
+      'All stages are measured locally in the latest sampling window; device groups identify the connection. Percentiles are approximate; maximums are measured. Application RTT includes processing and queues on both computers plus network transport, not end-to-end input latency. — means no samples.';
 
   @override
   String get performanceEmpty => 'Connect a device and use the keyboard or mouse to see measurements.';
@@ -2099,7 +2099,7 @@ class AppLocalizationsEn extends AppLocalizations {
   String get performanceInject => 'Injection duration';
 
   @override
-  String get performanceRtt => 'Network RTT';
+  String get performanceRtt => 'Heartbeat RTT';
 
   @override
   String get performanceScheduler => 'Scheduler delay';
@@ -2129,7 +2129,7 @@ class AppLocalizationsEn extends AppLocalizations {
   String get performanceOverflows => 'Overflows';
 
   @override
-  String get performanceLocal => 'This computer';
+  String get performanceLocal => 'Local engine';
 
   @override
   String get performanceUnits => 'Durations in ms; >100 ms shows a count.';
@@ -2205,4 +2205,26 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get inputTransportDataTcp => 'Clipboard and files use TCP · TLS 1.3';
+
+  @override
+  String overviewRttLatest(String age) {
+    return 'Latest window mean · $age';
+  }
+
+  @override
+  String get overviewRttHint =>
+      'Application heartbeat round trip, including processing and queues on both computers. The history peak is not the current delay.';
+
+  @override
+  String get performanceDisplayQuery => 'Display query';
+
+  @override
+  String get performanceCursorSwitch => 'Cursor switch';
+
+  @override
+  String get performanceHeartbeatSend => 'Heartbeat write wait';
+
+  @override
+  String get performanceBackgroundHint =>
+      'Display queries run in the background; a slow query does not mean the input thread was blocked. A completed heartbeat write does not confirm delivery.';
 }

@@ -116,6 +116,7 @@ pub(crate) struct Runtime<H: Host> {
     store: Store,
     session: String,
     performance: BTreeMap<String, ferry_ipc::PeerPerformance>,
+    performance_history: crate::MetricsHistory,
     command_error: Option<String>,
     next_operation: u64,
     dial_requests: HashMap<u64, (u64, u64, Instant)>,
@@ -256,6 +257,7 @@ impl<H: Host> Runtime<H> {
             platform_info_pending: false,
             session,
             performance: BTreeMap::new(),
+            performance_history: Default::default(),
             command_error: None,
             next_operation: 1,
             dial_requests: HashMap::new(),
@@ -577,6 +579,7 @@ impl<H: Host> Runtime<H> {
     /// 连接全没了（引擎停下）：记下各台设备最后在线的时刻，清空与连接有关的状态。
     fn drop_link(&mut self) {
         self.performance.clear();
+        self.performance_history.clear();
         if self.engine.is_none() {
             self.port = None;
         }
@@ -666,6 +669,7 @@ impl<H: Host> Runtime<H> {
                 }) {
                     return;
                 }
+                self.performance_history.record(peer, (*metrics).clone());
                 self.performance.insert(
                     peer.map(|p| p.to_hex()).unwrap_or_default(),
                     super::performance::project(peer, *metrics),
@@ -719,6 +723,7 @@ impl<H: Host> Runtime<H> {
                 self.status = LinkStatus::Connected;
                 self.clear_problem();
                 self.performance.remove(&fingerprint.to_hex());
+                self.performance_history.remove_peer(Some(fingerprint));
                 self.links.retain(|l| l.fingerprint != fingerprint);
                 self.links.push(LinkInfo {
                     input_transport: None,
@@ -785,6 +790,7 @@ impl<H: Host> Runtime<H> {
             }
             Event::Disconnected { peer, reason } => {
                 self.performance.remove(&peer.to_hex());
+                self.performance_history.remove_peer(Some(peer));
                 let name = self.peer_name(&peer);
                 self.links.retain(|l| l.fingerprint != peer);
                 self.last_seen.insert(peer, now_ms());

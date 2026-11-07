@@ -20,6 +20,39 @@ use serde_json::{Value, json};
 const FP_PC: &str = "3f9a12c477e0b1d2aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55";
 const FP_MAC: &str = "7ab05cb238fbd60311223344556677889900aabbccddeeff0011223344556677";
 
+#[test]
+fn additional_latency_fields_and_sample_age_are_optional_for_older_daemons() {
+    let old: ferry_ipc::InputMetrics = serde_json::from_value(json!({"window_ms": 5000})).unwrap();
+    assert_eq!(old.display_query.count, 0);
+    assert_eq!(old.cursor_switch.count, 0);
+    assert_eq!(old.heartbeat_send.count, 0);
+    let sample = ferry_ipc::LatencySummary {
+        count: 1,
+        max_us: 120_000,
+        over_100ms: 1,
+        ..Default::default()
+    };
+    let current = ferry_ipc::InputMetrics {
+        display_query: sample.clone(),
+        cursor_switch: sample.clone(),
+        heartbeat_send: sample,
+        ..Default::default()
+    };
+    let encoded = serde_json::to_value(&current).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ferry_ipc::InputMetrics>(encoded).unwrap(),
+        current
+    );
+    let mut link = serde_json::to_value(state().link).unwrap();
+    link.as_object_mut().unwrap().remove("rtt_measured_at");
+    assert_eq!(
+        serde_json::from_value::<Link>(link)
+            .unwrap()
+            .rtt_measured_at,
+        None
+    );
+}
+
 fn samples_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/test/fixtures/ipc_samples.json")
 }
@@ -199,6 +232,7 @@ fn state() -> State {
             since: Some(1_793_480_000_000),
             cursor_on_peer: true,
             rtt_ms: vec![0.31, 0.28, 0.5],
+            rtt_measured_at: Some(1_793_480_005_000),
         },
         clipboard: Some(ClipboardSync {
             to_peer: true,
@@ -318,6 +352,7 @@ fn notices() -> Vec<Notice> {
             since: None,
             cursor_on_peer: false,
             rtt_ms: vec![],
+            rtt_measured_at: None,
         },
         clipboard: None,
         ..state()

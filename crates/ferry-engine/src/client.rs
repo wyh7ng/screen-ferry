@@ -33,6 +33,7 @@ use tokio::time::{MissedTickBehavior, interval, interval_at, sleep, timeout};
 use tracing::{debug, info, warn};
 
 use crate::clipboard::{self, ClipLimit, Reporter, SharedClipboard, Start};
+use crate::display_query::DisplayQuery;
 use crate::edge_drop::{Edge, EdgeFeed, gone};
 use crate::error::{Error, Result};
 use crate::events::{DialError, Event, Events, FoundServer};
@@ -40,7 +41,7 @@ use crate::files::{Files, Opener};
 use crate::invite::{self, Invitation};
 use crate::link::{
     CONNECT_TIMEOUT, DEFAULT_PORT, DISPLAY_CHECK, HANDSHAKE_TIMEOUT, capabilities, frame_of,
-    platform_of, primary_scale, send,
+    platform_of, primary_scale, send, send_heartbeat,
 };
 use crate::metrics::{self, MetricsWindow, QueueSummary};
 use crate::pairing::{self, ConfirmPairing, Outcome};
@@ -116,7 +117,7 @@ pub async fn connect<I, D, K, P>(
 ) -> Result<Infallible>
 where
     I: InputInject,
-    D: Displays,
+    D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
 {
@@ -142,12 +143,22 @@ pub async fn connect_with_transport<I, D, K, P>(
 ) -> Result<Infallible>
 where
     I: InputInject,
-    D: Displays,
+    D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
 {
     transport.ensure_available()?;
-    displays.displays()?;
+    let mut displays = DisplayQuery::new(displays).await?;
+    let mut startup_metrics = MetricsWindow::default();
+    let queried = displays.fresh().await?;
+    startup_metrics.record_display_query(queried.elapsed);
+    config.events.emit(Event::Metrics {
+        peer: None,
+        metrics: startup_metrics
+            .take(QueueSummary::default(), QueueSummary::default())
+            .into(),
+    });
+    queried.displays?;
     let finder = match config.server {
         ServerAddr::Fixed(addr) => Finder::Fixed(addr),
         ServerAddr::Discover => Finder::Discover(Browser::start()?),
@@ -247,7 +258,14 @@ where
             }
         };
         let via = target.via;
-        let result = client.session(&config, &displays, &target).await;
+        let result = client.session(&config, &mut displays, &target).await;
+        *lock(&client.current) = None;
+        let ok = result.is_ok();
+        client.peer_side = None;
+        client.edge.reset();
+        client.release_all();
+        client.hide_cursor(false);
+        client.active.send_replace(false);
         if client.in_session {
             client.events.emit(Event::Metrics {
                 peer: client.server,
@@ -257,13 +275,6 @@ where
                     .into(),
             });
         }
-        *lock(&client.current) = None;
-        let ok = result.is_ok();
-        client.peer_side = None;
-        client.edge.reset();
-        client.release_all();
-        client.hide_cursor(false);
-        client.active.send_replace(false);
         if std::mem::take(&mut client.in_session)
             && let Some(peer) = client.server
         {
@@ -558,10 +569,10 @@ impl<I: InputInject, K, P> Drop for Client<I, K, P> {
 }
 
 impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
-    async fn session<D: Displays>(
+    async fn session(
         &mut self,
         config: &ClientConfig,
-        displays: &D,
+        displays: &mut DisplayQuery,
         target: &Target,
     ) -> Result<Ended> {
         let requested = target.via == Via::Requested;
@@ -581,6 +592,12 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         {
             self.events.emit(Event::Connecting { addr });
         }
+        // 先完成本机布局准备再打开输入连接，避免旧查询的等待占用对端握手期限。
+        // fresh 会丢弃上个会话的在飞结果，只使用当前会话重新查询的布局。
+        self.metrics = MetricsWindow::default();
+        let queried = displays.fresh().await?;
+        self.metrics.record_display_query(queried.elapsed);
+        let mut screens = queried.displays?;
         let (mut framed, server, addr) =
             match connect_any(&self.tls, &target.addrs, Channel::Input, self.transport).await {
                 Ok(connected) => connected,
@@ -600,6 +617,8 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             self.repair = false;
             return Ok(Ended::Paired);
         }
+        // 配对不依赖有效显示范围；已信任的输入会话才要求本机显示器可用。
+        bounds(&screens).ok_or(Error::NoDisplays("本机"))?;
 
         let device = config
             .devices
@@ -642,7 +661,6 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         if let Err(e) = crate::server::remember_addr(&config.store, server, addr) {
             warn!("记下服务端的地址失败：{e}");
         }
-        let mut screens = displays.displays()?;
         send(&mut framed, &Message::Displays(screens.clone())).await?;
         if negotiated.contains(Capabilities::APP_INFO) {
             send(&mut framed, &crate::link::app_info()).await?;
@@ -750,7 +768,6 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             .map(|_| crate::MotionReceiver::new(welcome.session));
         // 自己定时 Ping 服务端测往返延迟；同时据最后一次收到消息的时刻判断断线。
         let epoch = Instant::now();
-        self.metrics = MetricsWindow::default();
         let mut metrics_tick = interval_at(
             tokio::time::Instant::now() + metrics::REPORT_EVERY,
             metrics::REPORT_EVERY,
@@ -763,7 +780,8 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut silence = interval(SILENCE_TIMEOUT / 4);
         silence.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut screen_check = interval(DISPLAY_CHECK);
+        let mut screen_check =
+            interval_at(tokio::time::Instant::now() + DISPLAY_CHECK, DISPLAY_CHECK);
         screen_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut hints = self.edge.hints();
         hints.mark_unchanged();
@@ -827,9 +845,16 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     continue;
                 }
                 _ = screen_check.tick() => {
+                    displays.request()?;
+                    continue;
+                }
+                queried = displays.completed() => {
                     // 改了分辨率、缩放或插拔显示器：告诉服务端，它按新的范围移动光标。
                     // 查询偶尔失败（例如显示器正在切换）时等下一次。
-                    if let Ok(now) = displays.displays()
+                    let queried = queried?;
+                    self.metrics.record_display_query(queried.elapsed);
+                    if let Ok(now) = queried.displays
+                        && bounds(&now).is_some()
                         && now != screens
                     {
                         info!("本机的显示器布局已更新，已告知服务端");
@@ -843,7 +868,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                 }
                 _ = ping.tick() => {
                     let nonce = epoch.elapsed().as_micros() as u64;
-                    send(&mut framed, &Message::Ping { nonce }).await?;
+                    send_heartbeat(&mut framed, &Message::Ping { nonce }, &mut self.metrics).await?;
                     continue;
                 }
                 expected = scheduler_tick.tick() => {
@@ -915,7 +940,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     return Err(Error::Protocol("控制端发来了QUIC移动确认"));
                 }
                 Some(Message::Ping { nonce }) => {
-                    send(&mut framed, &Message::Pong { nonce }).await?
+                    send_heartbeat(&mut framed, &Message::Pong { nonce }, &mut self.metrics).await?
                 }
                 Some(Message::Pong { nonce }) => {
                     let sent = epoch.checked_add(Duration::from_micros(nonce));
@@ -1100,7 +1125,10 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             return;
         }
         self.cursor_hidden = hidden;
-        if let Err(e) = self.inject.set_cursor_hidden(hidden) {
+        let started = Instant::now();
+        let result = self.inject.set_cursor_hidden(hidden);
+        self.metrics.record_cursor_switch(started.elapsed());
+        if let Err(e) = result {
             debug!("{}本机光标失败：{e}", if hidden { "隐藏" } else { "显示" });
         }
     }

@@ -67,7 +67,7 @@ local     name · fingerprint · short · role(server|client) · data_dir · ver
 sharing   用户没有暂停共享
 problem   null | { kind(permission|port_in_use|other), message, port（端口被占用时是哪个端口，否则 null） }
 link      status(paused|starting|waiting|searching|connecting|connected|stopped)
-          peer(null | { name, fingerprint, short, addr }) · since · cursor_on_peer · rtt_ms[]
+          peer(null | { name, fingerprint, short, addr }) · since · cursor_on_peer · rtt_ms[] · rtt_measured_at（Unix毫秒，可空）
           连着几台时是摘要：指光标所在（否则最近连上）的那台；每台是否连着见 peers
 clipboard null | { to_peer, peer, chars, bytes, preview, rich（带格式）, at,
                  image（null | { width, height, path（预览用的 PNG 文件，存不下来时为 null）}） }
@@ -204,7 +204,13 @@ update    { status(idle|checking|up_to_date|available|downloading|ready|installi
 
 未发布的IPC3追加可选字段，旧消息缺少时取默认值。`settings`/`update_settings.settings`支持`file_rate_limit_mbps`和`coalesce_motion`，设置持久化失败时保留原值并返回命令失败。
 
-`state.performance.peers[]`为`{ fingerprint: string|null, measured_at: Unix毫秒, metrics }`，null指本机捕获阶段。`metrics.window_ms`给出采样窗口；`capture_queue/send_queue/send/inject/rtt/scheduler`均为`{count,p50_us,p95_us,p99_us,max_us,over_100ms}`，单位微秒，分位数是固定直方图近似，count=0不解释为0ms。`capture/outbound`为`{depth,high_water,oldest_us,max_wait_us,coalesced,overflows}`；oldest_us为null表示不能测量当前最老事件，max_wait_us是该窗已消费事件最大等待。仅本机时钟差值，不是跨机单程时间。
+`state.performance.peers[]`为`{ fingerprint: string|null, measured_at: Unix毫秒, metrics }`，null指本机引擎公共阶段（控制端捕获/光标切换/显示器查询，以及被控端启动查询），有fingerprint也仍是本机对该连接的统计，不是对端测量。`metrics.window_ms`给出采样窗口；`capture_queue/send_queue/send/inject/rtt/scheduler/display_query/cursor_switch/heartbeat_send`均为`{count,p50_us,p95_us,p99_us,max_us,over_100ms}`，新增阶段缺省全零，单位微秒，分位数是固定直方图近似，count=0不解释为0ms。`capture/outbound`为`{depth,high_water,oldest_us,max_wait_us,coalesced,overflows}`；oldest_us为null表示不能测量当前最老事件，max_wait_us是该窗已消费事件最大等待。仅本机时钟差值，不是跨机单程时间。
+
+`display_query`测后台线程内显示器API执行，慢查询不代表核心线程被阻塞；`cursor_switch`测控制端grab/release和被控端显示/隐藏；`heartbeat_send`测Ping/Pong编码、写入及flush的等待（包括失败），不代表对端确认。`rtt`是应用心跳往返，包含两端排队/处理和传输，不是纯网络RTT或输入到显示时间。
+
+`link.rtt_ms`最多保留32个有样本的结算窗口均值，空窗口不插值；未消费RTT事件可合并，总览不是无损全样本统计。`rtt_measured_at`是最新已结算平均中最后一个样本被resident观测的时间，不是报文到达内核的时间；旧消息缺省null，重连/断线清空。历史峰值是这组窗口均值的最大值，不代表当前延迟。
+
+完整诊断文件新增有界窗口上下文：常规60秒、每来源12窗、全局128窗；另存最近4次>100ms事件，每次最多前2/触发1/后2个同源窗口，重叠触发不延长容量。来源断线/重连及引擎重启清空对应记录。仅保存在后台内存，完整导出时包含JSON；复制摘要只含事件数量，不向每次State附加历史，不记录键值/文字/位置。各阶段都可触发上下文，后台查询慢本身不表示输入卡顿。
 
 `read_run_log`新增`cursor:string|null`、`request_id:u64|null`，保留`since`兼容。新界面优先原样回传opaque cursor，不自行解析；后端回相同request_id。`run_log.cursor`用于下一页，`more=true`表示当前还有可读取的分页；`fresh=true`替换旧行。`error`非空时保留旧行与游标，释放在途状态稍后重试；界面拒绝不匹配当前request_id的迟到响应。换页/断线时取消观察不会让旧响应覆盖新一轮。
 
