@@ -134,17 +134,8 @@ impl DragQuery {
 
 fn summarize(files: &[PathBuf]) -> Option<(String, u32, u64)> {
     let name = files.first()?.file_name()?.to_string_lossy().into_owned();
-    let mut bytes = 0u64;
-    for file in files {
-        match std::fs::metadata(file) {
-            Ok(meta) if meta.is_file() => bytes = bytes.saturating_add(meta.len()),
-            _ => {
-                bytes = 0;
-                break;
-            }
-        }
-    }
-    Some((name, u32::try_from(files.len()).unwrap_or(u32::MAX), bytes))
+    // 接收目标的出现不能等待网络盘/云文件的metadata。真实大小由发送扫描提供。
+    Some((name, u32::try_from(files.len()).unwrap_or(u32::MAX), 0))
 }
 
 fn is_directory(path: &Path) -> bool {

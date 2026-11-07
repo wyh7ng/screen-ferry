@@ -187,18 +187,22 @@ define_class!(
         }
 
         #[unsafe(method(prepareForDragOperation:))]
-        fn prepare_for_drag(&self, _sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-            true
+        fn prepare_for_drag(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+            sender.draggingSource().is_none()
         }
 
         #[unsafe(method(performDragOperation:))]
         fn perform_drag(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-            let paths = file_urls(&sender.draggingPasteboard());
-            let any = !paths.is_empty();
-            if any {
-                emit(OverlayEvent::Dropped { paths });
+            if sender.draggingSource().is_some() {
+                false
+            } else {
+                let paths = file_urls(&sender.draggingPasteboard());
+                let any = !paths.is_empty();
+                if any {
+                    emit(OverlayEvent::Dropped { paths });
+                }
+                any
             }
-            any
         }
     }
 );
@@ -321,7 +325,12 @@ fn create_panel(mtm: MainThreadMarker) -> Panel {
     unsafe { panel.setReleasedWhenClosed(false) };
     panel.setLevel(NSStatusWindowLevel);
     panel.setOpaque(false);
-    panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    // 非零背景覆盖透明边缘，保证尚未绘制胶囊时的接收条也参与拖放命中。
+    // 不把整个窗口alpha设为0：那会让系统忽略这个拖放目标。
+    panel.setBackgroundColor(Some(&NSColor::colorWithCalibratedWhite_alpha(
+        0.0,
+        1.0 / 255.0,
+    )));
     panel.setHasShadow(false);
     // 明确设为不忽略：整个窗口（包括透明的边）都接收拖放，文件推到屏幕边缘就能放下。
     panel.setIgnoresMouseEvents(false);
@@ -357,29 +366,49 @@ fn on_panel(work: impl FnOnce(&Panel, MainThreadMarker) + Send + 'static) {
 /// 主线程只保留最新一帧；鼠标事件比绘制快时不累积过时的场景。
 struct PendingFrame {
     frame: Option<(Frame, f32, Scene)>,
+    /// 预览尚未识别时的原生接收条，与胶囊共用同一窗口，转换时不撤销拖放目标。
+    strip: Option<Frame>,
     queued: bool,
 }
 
 static FRAME_UPDATE: Mutex<PendingFrame> = Mutex::new(PendingFrame {
     frame: None,
+    strip: None,
     queued: false,
 });
 
 fn update_frame(frame: Option<(Frame, f32, Scene)>) {
+    update_window(|pending| pending.frame = frame);
+}
+
+fn update_strip(strip: Option<Frame>) {
+    update_window(|pending| pending.strip = strip);
+}
+
+fn clear_window() {
+    update_window(|pending| {
+        pending.frame = None;
+        pending.strip = None;
+    });
+}
+
+fn update_window(change: impl FnOnce(&mut PendingFrame)) {
     let mut pending = FRAME_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
-    pending.frame = frame;
+    change(&mut pending);
     if pending.queued {
         return;
     }
     pending.queued = true;
     drop(pending);
     on_panel(|panel, mtm| {
-        let frame = {
+        let (frame, strip) = {
             let mut pending = FRAME_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
             pending.queued = false;
-            pending.frame.take()
+            // 必须保留最新场景：只有接收条变化时，不能把已经显示的胶囊误收起。
+            (pending.frame.clone(), pending.strip)
         };
-        if let Some((frame, scale, scene)) = frame {
+        let shown = frame.or_else(|| strip.map(|frame| (frame, 1.0, Scene::default())));
+        if let Some((frame, scale, scene)) = shown {
             *panel.view.ivars().scene.borrow_mut() = scene;
             panel.view.ivars().scale.set(f64::from(scale));
             panel.panel.setFrame_display(cocoa_rect(frame, mtm), false);
@@ -421,7 +450,7 @@ impl Default for MacOverlay {
 impl Drop for MacOverlay {
     fn drop(&mut self) {
         *SINK.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        update_frame(None);
+        clear_window();
     }
 }
 
@@ -452,6 +481,11 @@ impl Overlay for MacOverlay {
 
     fn offer(&mut self, files: Vec<PathBuf>) {
         on_panel(move |panel, _| *panel.view.ivars().offered.borrow_mut() = files);
+    }
+
+    fn watch_edge(&mut self, strip: Option<Frame>) {
+        // 原生拖入回调不依赖异步拖放剪贴板基线，因此首次快速拖动也有接收目标。
+        update_strip(strip);
     }
 
     fn open(&self, path: &Path) {

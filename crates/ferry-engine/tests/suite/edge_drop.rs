@@ -282,14 +282,14 @@ async fn without_a_drag_clipboard_the_edge_is_watched_until_files_come_in() {
     );
     assert!(overlay.shown().is_none(), "还不知道是文件时不出现胶囊");
 
-    // 拖着文件进了接收条：直接展开成“松手发送”，不再留意。
+    // 拖着文件进了接收条：展开成“松手发送”，接收条保留到原生Drop完成。
     overlay.start_drag(vec![file]);
     overlay.emit(OverlayEvent::DragEntered { files: true });
     eventually("展开成松手发送", || {
         texts(&overlay).contains(&"松手发送到".to_owned())
     })
     .await;
-    eventually("不再留意", || overlay.watching().is_none()).await;
+    assert!(overlay.watching().is_some(), "动画切换不撤销原生接收区域");
     left_button(&rig, false);
 }
 
@@ -399,10 +399,7 @@ async fn dragging_toward_the_edge_slides_out_the_receiving_capsule_on_the_other_
     .await;
     let shown = texts(&pc);
     assert!(shown.contains(&"来自 mac".to_owned()), "{shown:?}");
-    assert!(
-        shown.contains(&"设计稿.fig · 2.0 KB".to_owned()),
-        "{shown:?}"
-    );
+    assert!(shown.contains(&"设计稿.fig".to_owned()), "{shown:?}");
 
     // 放下：对方在同一高度显示收到的卡片。
     mac.emit(OverlayEvent::Dropped {
@@ -543,6 +540,38 @@ async fn receive_card(rig: &Rig, overlay: &MockOverlay, name: &str) -> std::path
 }
 
 #[tokio::test]
+async fn an_old_received_card_yields_the_window_to_a_new_unknown_drag_strip() {
+    let (rig, overlay, _edge) = rig_with_edge_drop().await;
+    let _old = receive_card(&rig, &overlay, "old-card.txt").await;
+    assert!(overlay.shown().is_some());
+    pointer(&rig, 900, 100);
+    press_and_drag(&rig, &overlay, None).await;
+    eventually("旧卡片让出新拖动的原生接收区域", || {
+        overlay.watching().is_some() && overlay.shown().is_none()
+    })
+    .await;
+    let source = TempDir::new();
+    let path = source_file(&source, "new-drop.txt", b"new target");
+    overlay.start_drag(vec![path.clone()]);
+    overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("原生进入后显示新拖动", || {
+        texts(&overlay).contains(&"new-drop.txt".into())
+    })
+    .await;
+    let (frame, _) = overlay.shown().unwrap();
+    assert!(
+        frame.y <= 100.0 && frame.bottom() >= 100.0,
+        "新接收窗口应立即覆盖新拖动高度，不能从旧卡片位置慢慢滑来：{frame:?}"
+    );
+    overlay.emit(OverlayEvent::Dropped { paths: vec![path] });
+    left_button(&rig, false);
+    eventually("新拖动发送成功", || {
+        rig.pc.store.downloads_dir().join("new-drop.txt").is_file()
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_received_files_can_be_dragged_out_of_the_card() {
     let (rig, overlay, _edge) = rig_with_edge_drop().await;
     let saved = receive_card(&rig, &overlay, "会议纪要.docx").await;
@@ -652,6 +681,90 @@ async fn with_two_clients_on_one_edge_files_go_to_the_one_whose_part_they_are_dr
     })
     .await;
     left_button(&rig, false);
+}
+
+#[tokio::test]
+async fn a_new_unknown_drag_does_not_reuse_the_previous_gestures_peer() {
+    let (rig, overlay, _edge) = rig_with_edge_drop().await;
+    let laptop = rig.add_client("laptop", EdgeFeed::none()).await;
+    let source = TempDir::new();
+    let path = source_file(&source, "new-gesture-target.txt", b"only laptop");
+    pointer(&rig, 900, 100);
+    press_and_drag(&rig, &overlay, Some(vec![path.clone()])).await;
+    overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("第一次手势选择上半段pc", || {
+        texts(&overlay).contains(&"pc".into())
+    })
+    .await;
+    left_button(&rig, false);
+    sleep(Duration::from_millis(70)).await;
+
+    // 宽限期内开始新手势；拖放计数尚未变化，只有下半段原生接收条。
+    pointer(&rig, 900, 700);
+    left_button(&rig, true);
+    eventually("新未知手势使用下半段接收条", || {
+        overlay.watching().is_some_and(|strip| strip.y >= 400.0) && overlay.shown().is_none()
+    })
+    .await;
+    overlay.emit(OverlayEvent::Dropped { paths: vec![path] });
+    left_button(&rig, false);
+    eventually("权威Drop发送到新手势的laptop", || {
+        laptop
+            .device
+            .store
+            .downloads_dir()
+            .join("new-gesture-target.txt")
+            .is_file()
+    })
+    .await;
+    assert!(
+        !rig.pc
+            .store
+            .downloads_dir()
+            .join("new-gesture-target.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn disconnect_reset_removes_a_released_drag_target_before_a_late_drop() {
+    let (rig, overlay, _edge) = client_with_edge_drop().await;
+    rig.enter().await;
+    let source = TempDir::new();
+    let file = source_file(&source, "late-after-reset.txt", b"must not send");
+    left_button(&rig, true);
+    eventually("客户端在边缘留意", || {
+        rig.push(-1, 0);
+        overlay.watching().is_some()
+    })
+    .await;
+    overlay.start_drag(vec![file.clone()]);
+    overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("显示当前发送目标", || {
+        texts(&overlay).contains(&"松手发送到".into())
+    })
+    .await;
+    left_button(&rig, false);
+    rig.server.abort();
+    eventually("断线重置清除接收目标", || {
+        rig.pc_files.connected().is_empty()
+            && overlay.watching().is_none()
+            && overlay.shown().is_none()
+    })
+    .await;
+    overlay.emit(OverlayEvent::Dropped { paths: vec![file] });
+    sleep(Duration::from_millis(80)).await;
+    assert!(
+        !rig.mac
+            .store
+            .downloads_dir()
+            .join("late-after-reset.txt")
+            .exists()
+    );
+    assert!(
+        overlay.shown().is_none(),
+        "迟到回调不能重新显示已重置的目标"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -24,7 +24,7 @@ use ferry_proto::{DropHint, HintState};
 use ferry_types::{Frame, Lang, Rgba};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
-use tracing::warn;
+use tracing::{info, warn};
 
 use ferry_trust::Fingerprint;
 
@@ -55,6 +55,8 @@ const DROP_GRACE: Duration = Duration::from_millis(2000);
 const HINT_GAP: Duration = Duration::from_millis(50);
 /// 剪贴板只在实际拖动且靠近边缘时轮询，至多每秒20次；没有活动拖动时不轮询。
 const QUERY_GAP: Duration = Duration::from_millis(50);
+/// 鼠标钩子的Up可能先于原生Drop回调到达；接收区域短暂保留，但绝不凭Up发送缓存内容。
+const LOCAL_DROP_GRACE: Duration = Duration::from_millis(250);
 /// 提示里沿边位置的满量程。
 const ALONG_FULL: f32 = 10_000.0;
 
@@ -221,6 +223,8 @@ impl EdgeDrop {
             card_generation: 0,
             card_query: None,
             query_due: None,
+            pointer_held: false,
+            pending_drop: None,
         };
         Self {
             feed: EdgeFeed {
@@ -270,6 +274,12 @@ struct Drag {
     over: bool,
     /// 拖的是什么：第一项的名字、几项、总大小（有文件夹时不算，记为 0）。
     summary: Option<(String, u32, u64)>,
+}
+
+struct PendingDrop {
+    until: Instant,
+    peer: Option<Fingerprint>,
+    along: f32,
 }
 
 /// 对方正在拖过来的东西。
@@ -353,6 +363,8 @@ struct Worker<O> {
     card_generation: u64,
     card_query: Option<PathBuf>,
     query_due: Option<Instant>,
+    pointer_held: bool,
+    pending_drop: Option<PendingDrop>,
 }
 
 impl<O: Overlay> Worker<O> {
@@ -386,6 +398,7 @@ impl<O: Overlay> Worker<O> {
                     }
                     if self.edges.borrow().is_empty() {
                         self.drag = None;
+                        self.pending_drop = None;
                     }
                 }
                 changed = self.incoming.changed() => {
@@ -441,10 +454,19 @@ impl<O: Overlay> Worker<O> {
             .chain(card)
             .chain(remote)
             .chain(self.hint_due)
+            .chain(self.pending_drop.as_ref().map(|drop| drop.until))
             .min()
     }
 
     fn expire(&mut self, now: Instant) {
+        if self
+            .pending_drop
+            .as_ref()
+            .is_some_and(|drop| drop.until <= now)
+        {
+            self.pending_drop = None;
+            self.drag = None;
+        }
         if self.brief.as_ref().is_some_and(|b| b.until <= now) {
             self.brief = None;
         }
@@ -497,8 +519,33 @@ impl<O: Overlay> Worker<O> {
 
     fn on_pointer(&mut self) {
         let pointer = *self.pointer.borrow_and_update();
+        let released = self.pointer_held && !pointer.held;
+        self.pointer_held = pointer.held;
+        if pointer.held && self.pending_drop.take().is_some() {
+            self.drag = None;
+            self.drag_target = None;
+        }
+        if released && self.drag.is_some() {
+            let near = pointer.here
+                && edge_at(&self.edges.borrow(), &pointer)
+                    .is_some_and(|edge| distance(edge, &pointer) <= NEAR);
+            if near && (self.watching.is_some() || self.drag.as_ref().is_some_and(|drag| drag.over))
+            {
+                self.pending_drop = Some(PendingDrop {
+                    until: Instant::now() + LOCAL_DROP_GRACE,
+                    peer: self
+                        .drag_target
+                        .or_else(|| edge_at(&self.edges.borrow(), &pointer).map(|edge| edge.id)),
+                    along: self.along(),
+                });
+                self.query_due = None;
+                return;
+            }
+            self.drag = None;
+        }
         match (&mut self.drag, pointer.held) {
             (None, true) if !self.dragging_out => {
+                self.drag_target = None;
                 self.drag_generation = self.drag_generation.wrapping_add(1);
                 self.drag = Some(Drag {
                     count: None,
@@ -509,13 +556,17 @@ impl<O: Overlay> Worker<O> {
                     summary: None,
                 });
             }
-            (Some(_), false) => self.drag = None,
+            (Some(drag), false) if !drag.over && self.pending_drop.is_none() => self.drag = None,
             (Some(_), true) => {}
-            (None, _) => {}
+            _ => {}
         }
     }
 
     fn schedule_query(&mut self, queries: &mut Option<DragQuery>, now: Instant) {
+        if self.pending_drop.is_some() {
+            self.query_due = None;
+            return;
+        }
         let Some(query) = queries.as_mut() else {
             self.query_due = None;
             return;
@@ -530,7 +581,9 @@ impl<O: Overlay> Worker<O> {
             && edge_at(&self.edges.borrow(), &pointer)
                 .is_some_and(|edge| distance(edge, &pointer) <= NEAR);
         let request = match self.drag.as_ref() {
-            Some(drag) if pointer.held && !self.dragging_out && drag.files.is_none() => {
+            Some(drag)
+                if (pointer.held || drag.over) && !self.dragging_out && drag.files.is_none() =>
+            {
                 match drag.count {
                     None => Some(QueryRequest::Baseline {
                         generation: drag.generation,
@@ -585,14 +638,28 @@ impl<O: Overlay> Worker<O> {
                 let Some(drag) = &mut self.drag else {
                     return;
                 };
-                if drag.generation != generation || !self.pointer.borrow().held || self.dragging_out
+                if drag.generation != generation
+                    || (!self.pointer.borrow().held && !drag.over)
+                    || self.pending_drop.is_some()
+                    || self.dragging_out
                 {
                     return;
                 }
                 if let Some(content) = content {
+                    let had_files = !content.files.is_empty();
                     let files = not_ours(content.files, &self.offered);
                     if files.is_empty() {
-                        drag.over = false;
+                        if had_files {
+                            // 已确认是当前卡片自己提供的文件，不把它当成新的跨机发送。
+                            drag.files = Some(Vec::new());
+                            drag.over = false;
+                            drag.force_read = false;
+                            self.query_due = None;
+                            return;
+                        }
+                        // 原生拖动数据可能尚未准备好；空读取不是整个手势的永久结论。
+                        self.query_due = Some(Instant::now() + QUERY_GAP);
+                        return;
                     }
                     drag.summary = (!files.is_empty()).then_some(content.summary).flatten();
                     drag.files = Some(files);
@@ -622,31 +689,70 @@ impl<O: Overlay> Worker<O> {
             OverlayEvent::DragEntered { .. } | OverlayEvent::Dropped { .. }
                 if self.dragging_out => {}
             OverlayEvent::DragEntered { files } => {
+                if self.pending_drop.is_some() {
+                    return;
+                }
+                if files && self.drag.is_none() && !self.edges.borrow().is_empty() {
+                    self.drag_target = None;
+                    self.drag_generation = self.drag_generation.wrapping_add(1);
+                    self.drag = Some(Drag {
+                        count: None,
+                        generation: self.drag_generation,
+                        force_read: true,
+                        files: None,
+                        over: true,
+                        summary: None,
+                    });
+                }
                 if let Some(drag) = &mut self.drag {
                     drag.over = files;
                     // 有的系统（Windows）要到拖进接收条才知道拖的是什么。
-                    if drag.files.is_none() {
-                        if files {
-                            drag.force_read = true;
-                            self.query_due = Some(Instant::now());
-                        } else {
-                            drag.files = Some(Vec::new());
-                        }
+                    if drag.files.is_none() && files {
+                        drag.force_read = true;
+                        self.query_due = Some(Instant::now());
                     }
                 }
             }
             OverlayEvent::DragExited => {
+                if self.pending_drop.is_some() {
+                    return;
+                }
                 if let Some(drag) = &mut self.drag {
                     drag.over = false;
                 }
+                if !self.pointer.borrow().held {
+                    self.drag = None;
+                }
             }
             OverlayEvent::Dropped { paths } => {
-                let along = self.along();
+                let pending = self.pending_drop.take();
+                let along = pending
+                    .as_ref()
+                    .map_or_else(|| self.along(), |drop| drop.along);
                 self.drag = None;
-                let target = self.drag_target.take().or_else(|| {
-                    let pointer = *self.pointer.borrow();
-                    edge_at(&self.edges.borrow(), &pointer).map(|e| e.id)
+                self.query_due = None;
+                let target = pending
+                    .and_then(|drop| drop.peer)
+                    .or(self.drag_target.take())
+                    .or_else(|| {
+                        let pointer = *self.pointer.borrow();
+                        edge_at(&self.edges.borrow(), &pointer).map(|e| e.id)
+                    })
+                    .filter(|peer| self.edges.borrow().iter().any(|edge| edge.id == *peer));
+                info!(items = paths.len(), "边缘收到文件放下，正在准备传输");
+                let lang = *self.lang.borrow();
+                self.brief = Some(Brief {
+                    look: wide(
+                        Avatar::Device(peer_glyph()),
+                        [lang.pick("正在准备发送", "Preparing transfer"), "", ""],
+                        Action::None,
+                    ),
+                    along,
+                    until: Instant::now() + NOTICE,
+                    peer: target,
                 });
+                self.decide();
+                self.draw(1.0);
                 let sent = match target {
                     Some(peer) => self.files.send(peer, paths).await,
                     None => Err(crate::error::Error::NotConnected),
@@ -659,6 +765,7 @@ impl<O: Overlay> Worker<O> {
                         self.pending_along = Some(along);
                     }
                     Err(e) => {
+                        warn!("边缘文件发送准备失败，已在本机显示原因");
                         let lang = *self.lang.borrow();
                         let look = wide(
                             Avatar::Warn,
@@ -678,6 +785,7 @@ impl<O: Overlay> Worker<O> {
             OverlayEvent::DragOutStarted => {
                 self.dragging_out = true;
                 self.drag = None;
+                self.pending_drop = None;
             }
             OverlayEvent::DragOutEnded { dropped } => {
                 self.dragging_out = false;
@@ -830,13 +938,18 @@ impl<O: Overlay> Worker<O> {
         }
     }
 
-    /// 拖着还不知道是什么的东西靠近边缘时，请平台在贴边留意；知道了或离开了就不再留意。
+    /// 活动拖动靠近边缘时保留原生接收条，直到放下/取消；可见胶囊由平台优先显示。
     fn watch(&mut self) {
+        if self.pending_drop.is_some() {
+            return;
+        }
         let pointer = *self.pointer.borrow();
         let edge = edge_at(&self.edges.borrow(), &pointer).cloned();
         let wanted = match (&self.drag, &edge) {
             (Some(drag), Some(edge))
-                if pointer.here && drag.files.is_none() && distance(edge, &pointer) <= NEAR =>
+                if pointer.here
+                    && (pointer.held || drag.over)
+                    && distance(edge, &pointer) <= NEAR =>
             {
                 Some(strip_of(edge))
             }
@@ -854,6 +967,22 @@ impl<O: Overlay> Worker<O> {
         if edges.is_empty() {
             self.drag_target = None;
             self.retarget(None);
+            return;
+        }
+        if self.pending_drop.is_some() {
+            return;
+        }
+        if self.fallback_only() {
+            // 旧传输卡片不能遮住新拖动所在高度的原生接收条。保留卡片状态，临时让出窗口。
+            self.drag_target = edge_at(&edges, &self.pointer.borrow()).map(|edge| edge.id);
+            self.target = None;
+            self.capsule = Capsule::new();
+            self.moving = false;
+            self.dirty = false;
+            if self.shown {
+                self.overlay.hide();
+                self.shown = false;
+            }
             return;
         }
         let pointer = *self.pointer.borrow();
@@ -1055,6 +1184,13 @@ impl<O: Overlay> Worker<O> {
         }
         self.moving = self.capsule.step(dt);
         self.dirty = false;
+        if self.fallback_only() {
+            if self.shown {
+                self.overlay.hide();
+                self.shown = false;
+            }
+            return;
+        }
         let scale = self.scale;
         let accent = *self.accent.borrow();
         match self.capsule.render(scale, accent) {
@@ -1068,6 +1204,18 @@ impl<O: Overlay> Worker<O> {
             }
             None => {}
         }
+    }
+
+    fn fallback_only(&self) -> bool {
+        let pointer = *self.pointer.borrow();
+        self.pending_drop.is_none()
+            && self
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.files.is_none() && (pointer.held || drag.over))
+            && pointer.here
+            && edge_at(&self.edges.borrow(), &pointer)
+                .is_some_and(|edge| distance(edge, &pointer) <= NEAR)
     }
 
     /// 光标沿着它靠近的那一段边的位置。

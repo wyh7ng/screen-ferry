@@ -18,6 +18,7 @@ struct Gate {
     timed_out: AtomicBool,
     counts: AtomicUsize,
     reads: AtomicUsize,
+    empty_reads: AtomicUsize,
     released: Mutex<bool>,
     ready: Condvar,
 }
@@ -54,6 +55,16 @@ impl DragReader for ControlledReader {
 
     fn files(&mut self) -> Vec<PathBuf> {
         self.gate.reads.fetch_add(1, Ordering::SeqCst);
+        if self
+            .gate
+            .empty_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Vec::new();
+        }
         let result = self.inner.files();
         if self.gate.block.swap(false, Ordering::SeqCst) {
             self.gate.entered.store(true, Ordering::SeqCst);
@@ -271,4 +282,176 @@ async fn unchanged_drag_clipboard_is_polled_at_a_bounded_rate_and_stops_when_rel
     let idle = test.gate.counts.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(140)).await;
     assert_eq!(test.gate.counts.load(Ordering::SeqCst), idle, "空闲不轮询");
+}
+
+#[tokio::test]
+async fn native_enter_recovers_a_pasteboard_already_changed_before_async_baseline() {
+    let test = DragRig::start().await;
+    let temp = TempDir::new();
+    let path = source_file(&temp, "early-drag.txt", b"first gesture");
+    pointer(&test.rig, 900, 400);
+    // 与旧测试相反：系统先准备拖放数据，后台才消费按下和异步基线。
+    test.overlay.start_drag(vec![path.clone()]);
+    left_button(&test.rig, true);
+    eventually("异步基线与当前拖放计数一致", || {
+        test.gate.counts.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    assert_eq!(
+        test.gate.reads.load(Ordering::SeqCst),
+        0,
+        "不凭旧计数猜测正在拖的内容"
+    );
+    assert!(
+        test.overlay.watching().is_some(),
+        "预览未知时仍存在原生接收条"
+    );
+    test.overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("原生进入强制取得当前文件", || {
+        texts(&test.overlay).contains(&"early-drag.txt".into())
+    })
+    .await;
+    assert!(
+        test.overlay.watching().is_some(),
+        "已知文件后接收条也不在动画前消失"
+    );
+    test.overlay
+        .emit(OverlayEvent::Dropped { paths: vec![path] });
+    left_button(&test.rig, false);
+    eventually("第一轮拖放就发送", || {
+        test.rig
+            .pc
+            .store
+            .downloads_dir()
+            .join("early-drag.txt")
+            .is_file()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_empty_drag_read_retries_without_waiting_for_another_gesture() {
+    let test = DragRig::start().await;
+    let temp = TempDir::new();
+    let path = source_file(&temp, "late-ready.txt", b"ready after empty");
+    test.gate.empty_reads.store(1, Ordering::SeqCst);
+    test.begin(vec![path], false).await;
+    eventually("瞬时空读取后仍继续识别", || {
+        texts(&test.overlay).contains(&"late-ready.txt".into())
+            || test.gate.reads.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    test.overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("同一次拖动显示文件", || {
+        texts(&test.overlay).contains(&"late-ready.txt".into())
+    })
+    .await;
+    assert!(test.gate.reads.load(Ordering::SeqCst) >= 2);
+    left_button(&test.rig, false);
+}
+
+#[tokio::test]
+async fn native_enter_before_pointer_watch_creates_current_drag() {
+    let test = DragRig::start().await;
+    let temp = TempDir::new();
+    let path = source_file(&temp, "native-first.txt", b"native enter is authoritative");
+    pointer(&test.rig, 900, 400);
+    test.overlay.start_drag(vec![path.clone()]);
+    // 原生拖放事件不应要求watch通道已经观察到ButtonDown。
+    test.overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("未消费按下也识别原生拖入", || {
+        texts(&test.overlay).contains(&"native-first.txt".into())
+    })
+    .await;
+    test.overlay
+        .emit(OverlayEvent::Dropped { paths: vec![path] });
+    eventually("原生路径仍发送成功", || {
+        test.rig
+            .pc
+            .store
+            .downloads_dir()
+            .join("native-first.txt")
+            .is_file()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn button_up_keeps_native_drop_target_until_callback_but_never_sends_cached_files() {
+    let test = DragRig::start().await;
+    let temp = TempDir::new();
+    let cached = source_file(&temp, "cached.txt", b"preview only");
+    let dropped = source_file(&temp, "actual.txt", b"native drop data");
+    test.begin(vec![cached], false).await;
+    test.overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("接收胶囊已显示", || {
+        texts(&test.overlay).contains(&"松手发送到".into())
+    })
+    .await;
+    left_button(&test.rig, false);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        test.overlay.watching().is_some(),
+        "Up不能在原生Drop前撤掉接收条"
+    );
+    assert!(test.overlay.shown().is_some(), "Up不能在原生Drop前收起胶囊");
+    assert!(
+        !test
+            .rig
+            .pc
+            .store
+            .downloads_dir()
+            .join("cached.txt")
+            .exists(),
+        "Up本身绝不发送预览缓存"
+    );
+    test.overlay.emit(OverlayEvent::DragExited);
+    test.overlay.emit(OverlayEvent::Dropped {
+        paths: vec![dropped],
+    });
+    eventually("迟于Up的Drop仍发送权威路径", || {
+        test.rig
+            .pc
+            .store
+            .downloads_dir()
+            .join("actual.txt")
+            .is_file()
+    })
+    .await;
+    assert!(
+        !test
+            .rig
+            .pc
+            .store
+            .downloads_dir()
+            .join("cached.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn release_without_native_drop_expires_without_sending_preview() {
+    let test = DragRig::start().await;
+    let temp = TempDir::new();
+    let path = source_file(&temp, "cancelled-drag.txt", b"must not send");
+    test.begin(vec![path], false).await;
+    test.overlay.emit(OverlayEvent::DragEntered { files: true });
+    eventually("当前文件已识别", || {
+        texts(&test.overlay).contains(&"cancelled-drag.txt".into())
+    })
+    .await;
+    left_button(&test.rig, false);
+    eventually("没有Drop时宽限后收起", || {
+        test.overlay.watching().is_none() && test.overlay.shown().is_none()
+    })
+    .await;
+    assert!(
+        !test
+            .rig
+            .pc
+            .store
+            .downloads_dir()
+            .join("cancelled-drag.txt")
+            .exists()
+    );
 }
