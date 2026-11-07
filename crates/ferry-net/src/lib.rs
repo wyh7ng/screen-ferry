@@ -23,7 +23,7 @@ mod transport;
 
 pub use addresses::local_addresses;
 pub use error::{Error, Result};
-pub use framed::Framed;
+pub use framed::{Framed, FramedReader, FramedWriter};
 pub use handshake::{accept, initiate};
 pub use https::{Downloaded, Https};
 pub use tls::{ClientStream, ServerStream, Tls};

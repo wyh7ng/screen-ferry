@@ -2072,7 +2072,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get performanceHint =>
-      'All stages are measured locally in the latest sampling window; device groups identify the connection. Percentiles are approximate; maximums are measured. Application RTT includes processing and queues on both computers plus network transport, not end-to-end input latency. — means no samples.';
+      'All stages are measured locally in the latest sampling window; device groups identify the connection. Percentiles are approximate; maximums are measured. Independent network tasks answer heartbeats. Application RTT includes heartbeat processing, transport queues and network transit, without waiting for input injection; low RTT can coexist with slow input handling. It is not end-to-end input latency. — means no samples.';
 
   @override
   String get performanceEmpty => 'Connect a device and use the keyboard or mouse to see measurements.';
@@ -2093,10 +2093,10 @@ class AppLocalizationsEn extends AppLocalizations {
   String get performanceSendQueue => 'Send queue wait';
 
   @override
-  String get performanceSend => 'Send duration';
+  String get performanceSend => 'Send queue + write';
 
   @override
-  String get performanceInject => 'Injection duration';
+  String get performanceInject => 'Receive to injection';
 
   @override
   String get performanceRtt => 'Heartbeat RTT';
@@ -2213,7 +2213,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get overviewRttHint =>
-      'Application heartbeat round trip, including processing and queues on both computers. The history peak is not the current delay.';
+      'Independent network tasks answer heartbeats; low RTT does not guarantee fast input handling or screen response. The history peak is not the current delay.';
 
   @override
   String get performanceDisplayQuery => 'Display query';
@@ -2222,9 +2222,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get performanceCursorSwitch => 'Cursor switch';
 
   @override
-  String get performanceHeartbeatSend => 'Heartbeat write wait';
+  String get performanceHeartbeatSend => 'Heartbeat queue + write';
 
   @override
   String get performanceBackgroundHint =>
-      'Display queries run in the background; a slow query does not mean the input thread was blocked. A completed heartbeat write does not confirm delivery.';
+      'Display queries run in the background; a slow query does not mean the input thread was blocked. Send and heartbeat durations include writer queueing through flush completion, not peer acknowledgment. Injection timing starts after input decoding and includes receive queues, the platform worker and native calls, not screen presentation.';
 }

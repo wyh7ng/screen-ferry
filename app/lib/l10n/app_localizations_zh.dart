@@ -1996,7 +1996,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get performanceHint =>
-      '以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 包含两端处理、排队和网络传输，不是端到端输入延迟。无样本显示 —。';
+      '以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 由独立网络任务响应，包含心跳处理、收发排队和网络传输，不等待键鼠注入；RTT 低也可能输入处理慢，它不是端到端输入延迟。无样本显示 —。';
 
   @override
   String get performanceEmpty => '连接设备并操作键鼠后显示统计。';
@@ -2017,10 +2017,10 @@ class AppLocalizationsZh extends AppLocalizations {
   String get performanceSendQueue => '发送队列等待';
 
   @override
-  String get performanceSend => '发送耗时';
+  String get performanceSend => '发送排队与写入';
 
   @override
-  String get performanceInject => '注入耗时';
+  String get performanceInject => '接收到注入完成';
 
   @override
   String get performanceRtt => '应用心跳 RTT';
@@ -2134,7 +2134,7 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
-  String get overviewRttHint => '应用心跳往返，包含两端处理和排队。历史峰值不代表当前延迟。';
+  String get overviewRttHint => '心跳由独立网络任务响应；RTT 低不代表键鼠处理或画面响应一定快。历史峰值不代表当前延迟。';
 
   @override
   String get performanceDisplayQuery => '显示器查询';
@@ -2143,8 +2143,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get performanceCursorSwitch => '光标切换';
 
   @override
-  String get performanceHeartbeatSend => '心跳写入等待';
+  String get performanceHeartbeatSend => '心跳排队与写入';
 
   @override
-  String get performanceBackgroundHint => '显示器查询在后台执行，耗时较长不代表输入线程被阻塞。心跳写入完成也不代表对方已收到。';
+  String get performanceBackgroundHint =>
+      '显示器查询在后台执行，耗时较长不代表输入线程被阻塞。发送及心跳写入包含写队列等待，截止 flush 完成，不代表对方已确认。注入从输入解码后计时，包含接收排队、平台工作线程及系统调用等待，不包含屏幕呈现。';
 }

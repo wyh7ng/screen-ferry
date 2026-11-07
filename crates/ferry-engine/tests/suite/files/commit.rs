@@ -1,8 +1,9 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use ferry_engine::{Events, Files, TransferState};
 use ferry_platform::FileCommit;
@@ -294,4 +295,235 @@ async fn receipt_cleanup_never_removes_an_active_transfer_record() {
     .unwrap();
     assert_eq!(rig.mac_files.prune_receipts().await.unwrap(), 0);
     assert!(receipt.exists());
+}
+
+#[derive(Clone, Copy)]
+enum CleanupOutcome {
+    Delete,
+    Fail,
+    Panic,
+    Replaced,
+}
+
+struct CleanupGate {
+    target: Option<PathBuf>,
+    calls: usize,
+    blocked: bool,
+    released: bool,
+    timed_out: bool,
+}
+
+struct SlowCleanup {
+    state: Mutex<CleanupGate>,
+    changed: Condvar,
+    outcome: CleanupOutcome,
+}
+
+impl SlowCleanup {
+    fn new(outcome: CleanupOutcome) -> Self {
+        Self {
+            state: Mutex::new(CleanupGate {
+                target: None,
+                calls: 0,
+                blocked: false,
+                released: false,
+                timed_out: false,
+            }),
+            changed: Condvar::new(),
+            outcome,
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+
+    fn blocked(&self) -> bool {
+        self.state.lock().unwrap().blocked
+    }
+}
+
+impl FileCommit for SlowCleanup {
+    fn identity(&self, path: &Path) -> io::Result<String> {
+        let mut state = self.state.lock().unwrap();
+        if state.target.as_deref() == Some(path) {
+            state.calls += 1;
+            if state.calls == 2 {
+                // 第一次扫描候选；第二次已保留该任务，在磁盘重查期间阻塞。
+                state.blocked = true;
+                let (mut state, wait) = self
+                    .changed
+                    .wait_timeout_while(state, Duration::from_secs(8), |s| !s.released)
+                    .unwrap();
+                state.timed_out = wait.timed_out();
+                state.blocked = false;
+                drop(state);
+                match self.outcome {
+                    CleanupOutcome::Delete | CleanupOutcome::Replaced => {}
+                    CleanupOutcome::Fail => return Err(io::ErrorKind::PermissionDenied.into()),
+                    CleanupOutcome::Panic => panic!("injected cleanup worker panic"),
+                }
+                return MockFileCommit.identity(path);
+            }
+        }
+        drop(state);
+        MockFileCommit.identity(path)
+    }
+
+    fn identity_open_file(&self, file: &fs::File) -> io::Result<String> {
+        MockFileCommit.identity_open_file(file)
+    }
+    fn rename_no_replace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        MockFileCommit.rename_no_replace(from, to)
+    }
+    fn replace_record(&self, from: &Path, to: &Path) -> io::Result<()> {
+        MockFileCommit.replace_record(from, to)
+    }
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        MockFileCommit.sync_directory(path)
+    }
+}
+
+struct ReleaseCleanup(Arc<SlowCleanup>);
+impl Drop for ReleaseCleanup {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn cleanup_overlap(outcome: CleanupOutcome, abort_caller: bool) {
+    let mac = Device::new();
+    let (events, mut incoming) = Events::channel();
+    let platform = Arc::new(SlowCleanup::new(outcome));
+    // 不调度隐式启动清理：本测试控制何时进入磁盘阶段。
+    let files = Files::new(&mac.store, events.clone(), platform.clone());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let _release = ReleaseCleanup(platform.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                while let Some(event) = incoming.recv().await {
+                    seen.lock().unwrap().push(event);
+                }
+            }
+        });
+        let rig = Rig::with(Setup {
+            mac,
+            start_client: false,
+            mac_files: Some(files.clone()),
+            mac_events: events,
+            ..Setup::default()
+        }).await;
+        let mut peer = WirePeer::connect(&rig).await;
+        let id = TransferId([94; 16]);
+        let work = rig.mac.store.partial_dir().join(peer.fingerprint.to_hex()).join(id.to_string());
+        fs::create_dir_all(&work).unwrap();
+        let receipt = work.join("committed.json");
+        fs::write(&receipt, br#"{"version":1,"manifest":"expired","saved":[],"completed":0}"#).unwrap();
+        platform.state.lock().unwrap().target = Some(work.clone());
+        let cleanup = tokio::spawn({
+            let files = files.clone();
+            async move { files.prune_receipts().await }
+        });
+        eventually("清理进入锁外慢磁盘操作", || platform.blocked()).await;
+        assert!(files.connected().contains(&peer.fingerprint), "共享状态锁不等待磁盘");
+        peer.data.send(&Message::FileOffer(ferry_proto::FileOffer {
+            id,
+            name: "wire.txt".into(),
+            items: 1,
+            files: 1,
+            bytes: 4,
+        })).await.unwrap();
+        eventually("同一任务只登记等待清理", || seen.lock().unwrap().iter().any(|event| {
+            matches!(event, ferry_engine::Event::Transfer(update) if update.id == id && update.state == TransferState::Waiting)
+        })).await;
+        // 即使对端在Accept前抢先打开内容连接，也不能越过目录保留开始恢复。
+        let (mut premature, _) = peer.tls.connect(peer.addr, ferry_proto::Channel::File).await.unwrap();
+        ferry_net::initiate(&mut premature, ferry_proto::Hello::new(
+            ferry_proto::Channel::File,
+            ferry_proto::Capabilities::FILES,
+            peer.session,
+            "wire-peer",
+        )).await.unwrap();
+        premature.send(&Message::FileOpen { id }).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(1), premature.recv()).await.unwrap() {
+            Ok(None) | Err(ferry_net::Error::Closed) => {}
+            Err(ferry_net::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset) => {}
+            other => panic!("清理期间提前打开的文件连接必须关闭：{other:?}"),
+        }
+        // 不相关任务仍可获取同一State锁并立即接受。
+        let other = TransferId([95; 16]);
+        assert!(matches!(peer.offer(other, 1).await, Message::FileAccept { id: got } if got == other));
+        assert!(receipt.exists(), "等待中的任务不能读取或覆盖待清理回执");
+
+        let before = seen.lock().unwrap().iter().filter(|event| matches!(event, ferry_engine::Event::Rtt { .. })).count();
+        eventually("慢清理期间心跳持续响应", || seen.lock().unwrap().iter().filter(|event| matches!(event, ferry_engine::Event::Rtt { .. })).count() > before).await;
+        assert!(platform.blocked(), "回归测试必须在磁盘仍阻塞时验证进展");
+        assert!(!platform.state.lock().unwrap().timed_out);
+        assert!(tokio::time::timeout(Duration::from_millis(100), peer.data.recv()).await.is_err(), "清理中不得提前接受同一任务");
+
+        if matches!(outcome, CleanupOutcome::Replaced) {
+            // 扫描后原子替换回执；即使完成时刻仍为同一秒，也不能清理新对象。
+            let temporary = work.join("replacement.tmp");
+            fs::write(&temporary, br#"{"version":1,"manifest":"refreshed","saved":[],"completed":0}"#).unwrap();
+            MockFileCommit.replace_record(&temporary, &receipt).unwrap();
+        }
+
+        if abort_caller {
+            cleanup.abort();
+            assert!(cleanup.await.unwrap_err().is_cancelled());
+            assert_eq!(files.prune_receipts().await.unwrap(), 0, "调用方取消不提前释放真实工作线程名额");
+            assert!(platform.blocked());
+            platform.release();
+        } else {
+            platform.release();
+            let result = cleanup.await.unwrap();
+            match outcome {
+                CleanupOutcome::Delete => assert_eq!(result.unwrap(), 1),
+                CleanupOutcome::Fail | CleanupOutcome::Replaced => assert_eq!(result.unwrap(), 0),
+                CleanupOutcome::Panic => assert!(result.is_err()),
+            }
+        }
+        let response = tokio::time::timeout(Duration::from_secs(3), peer.data.recv()).await.unwrap().unwrap();
+        assert!(matches!(response, Some(Message::FileAccept { id: got }) if got == id), "清理结束或失败后原等待任务自动继续");
+
+        if matches!(outcome, CleanupOutcome::Delete) {
+            assert!(!receipt.exists());
+            let (mut file, resume) = peer.file(id, 4).await;
+            assert_eq!((resume.index, resume.offset), (0, 0));
+            file.send(&Message::FileData { data: b"done".to_vec() }).await.unwrap();
+            let sha256 = ring::digest::digest(&ring::digest::SHA256, b"done").as_ref().try_into().unwrap();
+            file.send(&Message::FileEnd(ferry_proto::FileEnd { index: 0, sha256 })).await.unwrap();
+            assert!(matches!(file.recv().await.unwrap(), Some(Message::FileDone)));
+            assert_eq!(fs::read(received(&rig.mac).join("wire.txt")).unwrap(), b"done");
+        } else {
+            assert!(receipt.exists(), "清理失败保留原回执");
+        }
+    });
+}
+
+#[test]
+fn slow_receipt_cleanup_does_not_hold_runtime_state_and_cancel_keeps_reservation() {
+    cleanup_overlap(CleanupOutcome::Delete, true);
+}
+
+#[test]
+fn failed_receipt_cleanup_releases_waiting_offer_without_deleting_receipt() {
+    cleanup_overlap(CleanupOutcome::Fail, false);
+}
+
+#[test]
+fn panicked_receipt_cleanup_releases_waiting_offer_without_poisoning_state() {
+    cleanup_overlap(CleanupOutcome::Panic, false);
+}
+
+#[test]
+fn receipt_replaced_after_scan_is_preserved_even_with_the_same_completion_second() {
+    cleanup_overlap(CleanupOutcome::Replaced, false);
 }

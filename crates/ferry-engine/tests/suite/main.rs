@@ -13,8 +13,10 @@ mod input_queue;
 mod invite;
 mod metrics;
 mod pairing;
+mod platform_input;
 mod resident;
 mod server;
+mod session_io;
 mod support;
 
 #[cfg(feature = "quic-experiment")]

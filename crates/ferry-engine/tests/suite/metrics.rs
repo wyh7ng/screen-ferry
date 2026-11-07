@@ -164,3 +164,34 @@ fn invalid_duplicate_and_reversed_windows_do_not_contaminate_context() {
     assert_eq!(history.recent(now).count(), 1);
     assert_eq!(history.incidents().count(), 0);
 }
+
+#[test]
+fn connection_spike_keeps_other_local_sources_and_totals_survive_incident_eviction() {
+    let now = Instant::now();
+    let peer = Some(Fingerprint::from_bytes([22; 32]));
+    let mut history = MetricsHistory::default();
+    history.record(None, window(now - Duration::from_secs(20), 1));
+    history.record(peer, window(now - Duration::from_secs(19), 150_000));
+    history.record(None, window(now - Duration::from_secs(18), 2));
+    let incident = history.incidents().next().unwrap();
+    assert_eq!(incident.related().len(), 2);
+    assert!(incident.related().iter().all(|entry| entry.peer.is_none()));
+    for i in 0..6 {
+        history.record(Some(Fingerprint::from_bytes([i; 32])), window(now, 120_000));
+    }
+    assert_eq!(history.incidents().count(), 4);
+    assert!(history.incidents().all(|incident| incident.peer != peer));
+    let total = history.totals().find(|entry| entry.peer == peer).unwrap();
+    assert_eq!(total.stages["rtt"].over_100ms, 1);
+    assert_eq!(total.stages["rtt"].max_us, 150_000);
+    history.remove_peer(None);
+    assert!(
+        history
+            .incidents()
+            .all(|incident| incident.related().iter().all(|entry| entry.peer.is_some()))
+    );
+    history.remove_peer(peer);
+    assert!(history.totals().all(|entry| entry.peer != peer));
+    history.clear();
+    assert_eq!(history.totals().count(), 0);
+}

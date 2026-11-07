@@ -426,6 +426,9 @@ impl Drop for MacOverlay {
 }
 
 impl Overlay for MacOverlay {
+    fn drag_reader(&self) -> Box<dyn ferry_platform::DragReader> {
+        Box::new(MacDragReader)
+    }
     fn start(&mut self, sink: OverlaySink) -> Result<()> {
         *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
         Ok(())
@@ -440,15 +443,11 @@ impl Overlay for MacOverlay {
     }
 
     fn drag_count(&self) -> i64 {
-        // SAFETY: 读取 AppKit 导出的常量。
-        let name = unsafe { NSPasteboardNameDrag };
-        NSPasteboard::pasteboardWithName(name).changeCount() as i64
+        ferry_platform::DragReader::change_count(&mut MacDragReader)
     }
 
     fn dragged_files(&self) -> Vec<PathBuf> {
-        // SAFETY: 读取 AppKit 导出的常量。
-        let name = unsafe { NSPasteboardNameDrag };
-        file_urls(&NSPasteboard::pasteboardWithName(name))
+        ferry_platform::DragReader::files(&mut MacDragReader)
     }
 
     fn offer(&mut self, files: Vec<PathBuf>) {
@@ -468,6 +467,27 @@ impl Overlay for MacOverlay {
             let urls = NSArray::from_retained_slice(&[url.0]);
             NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(&urls);
         });
+    }
+}
+
+/// NSPasteboard 可在任意线程读取；每次调用自带释放池，不移交任何窗口对象。
+struct MacDragReader;
+
+impl ferry_platform::DragReader for MacDragReader {
+    fn change_count(&mut self) -> i64 {
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: 读取 AppKit 导出的常量。
+            let name = unsafe { NSPasteboardNameDrag };
+            NSPasteboard::pasteboardWithName(name).changeCount() as i64
+        })
+    }
+
+    fn files(&mut self) -> Vec<PathBuf> {
+        objc2::rc::autoreleasepool(|_| {
+            // SAFETY: 读取 AppKit 导出的常量。
+            let name = unsafe { NSPasteboardNameDrag };
+            file_urls(&NSPasteboard::pasteboardWithName(name))
+        })
     }
 }
 

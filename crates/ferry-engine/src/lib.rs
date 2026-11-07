@@ -21,9 +21,11 @@ mod invite;
 mod link;
 mod metrics;
 mod pairing;
+mod platform_input;
 mod quic_motion;
 pub mod resident;
 mod server;
+mod session_io;
 
 pub use client::{ClientCommand, ClientConfig, ServerAddr, connect, connect_with_transport};
 pub use clipboard::{ClipLimit, DEFAULT_CLIP_LIMIT};
@@ -40,8 +42,8 @@ pub use input_queue::{
 pub use invite::{INVITE_PORT, invite};
 pub use link::DEFAULT_PORT;
 pub use metrics::{
-    InputMetrics, LatencyHistogram, LatencySummary, MetricIncident, MetricsHistory, QueueSummary,
-    RecordedMetrics,
+    InputMetrics, LatencyHistogram, LatencySummary, MetricIncident, MetricTotals, MetricsHistory,
+    QueueSummary, RecordedMetrics, StageTotals,
 };
 pub use pairing::{ConfirmPairing, PairingRequest};
 pub use server::{Live, ServerConfig, serve, serve_with_transport};

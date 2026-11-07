@@ -41,7 +41,7 @@ use crate::files::{Files, Opener};
 use crate::invite::{self, Invitation};
 use crate::link::{
     CONNECT_TIMEOUT, DEFAULT_PORT, DISPLAY_CHECK, HANDSHAKE_TIMEOUT, capabilities, frame_of,
-    platform_of, primary_scale, send, send_heartbeat,
+    platform_of, primary_scale, send,
 };
 use crate::metrics::{self, MetricsWindow, QueueSummary};
 use crate::pairing::{self, ConfirmPairing, Outcome};
@@ -116,7 +116,7 @@ pub async fn connect<I, D, K, P>(
     confirm: P,
 ) -> Result<Infallible>
 where
-    I: InputInject,
+    I: InputInject + 'static,
     D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
@@ -142,7 +142,7 @@ pub async fn connect_with_transport<I, D, K, P>(
     transport: ferry_net::Transport,
 ) -> Result<Infallible>
 where
-    I: InputInject,
+    I: InputInject + 'static,
     D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
@@ -200,7 +200,8 @@ where
         fingerprint: identity.fingerprint(),
         confirm,
         repair: false,
-        inject,
+        inject: crate::platform_input::InjectWorker::new(config.store.root().to_owned(), inject)
+            .await?,
         clipboard: SharedClipboard::new(clipboard)?,
         active: watch::Sender::new(false),
         pressed: Pressed::new(),
@@ -263,8 +264,11 @@ where
         let ok = result.is_ok();
         client.peer_side = None;
         client.edge.reset();
-        client.release_all();
-        client.hide_cursor(false);
+        client.release_all().await;
+        client.hide_cursor(false).await;
+        if let Err(error) = client.inject.reset().await {
+            warn!("会话结束时恢复平台输入失败：{error}");
+        }
         client.active.send_replace(false);
         if client.in_session {
             client.events.emit(Event::Metrics {
@@ -280,6 +284,9 @@ where
         {
             let reason = result.as_ref().err().map(ToString::to_string);
             config.events.emit(Event::Disconnected { peer, reason });
+        }
+        if client.inject.is_failed() {
+            return Err(std::io::Error::other("平台注入操作超时或工作线程停止").into());
         }
         match result {
             // 刚配对完，立即用新的信任关系重连。
@@ -522,7 +529,7 @@ enum Ended {
     },
 }
 
-struct Client<I: InputInject, K, P> {
+struct Client<K, P> {
     tls: Tls,
     transport: ferry_net::Transport,
     /// 此刻连着的服务端，等邀请的任务据此判断忙不忙。
@@ -531,7 +538,7 @@ struct Client<I: InputInject, K, P> {
     confirm: P,
     /// 服务端说不认识本机：即使本机信任它，下次也要重新配对。
     repair: bool,
-    inject: I,
+    inject: crate::platform_input::InjectWorker,
     clipboard: SharedClipboard<K>,
     /// 光标是否在本机，供剪贴板同步判断谁是活动端。
     active: watch::Sender<bool>,
@@ -556,19 +563,7 @@ struct Client<I: InputInject, K, P> {
     metrics: MetricsWindow,
 }
 
-/// 无论因为什么停下（包括整个引擎被关掉），都松开对方按着的键、让本机光标重新出现。
-impl<I: InputInject, K, P> Drop for Client<I, K, P> {
-    fn drop(&mut self) {
-        for event in self.pressed.release_all(self.cursor) {
-            let _ = self.inject.inject(&event);
-        }
-        if self.cursor_hidden {
-            let _ = self.inject.set_cursor_hidden(false);
-        }
-    }
-}
-
-impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
+impl<K: Clipboard, P: ConfirmPairing> Client<K, P> {
     async fn session(
         &mut self,
         config: &ClientConfig,
@@ -669,8 +664,6 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         self.in_session = true;
         self.server = Some(server);
         *lock(&self.current) = Some(server);
-        // 刚连上时光标在服务端屏幕上。
-        self.hide_cursor(true);
         // 本机是 Mac 时看得出对方是不是 Mac：交集里有 COMMAND_KEY 说明两边都是。
         let platform = config
             .command_key
@@ -767,7 +760,14 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             .as_ref()
             .map(|_| crate::MotionReceiver::new(welcome.session));
         // 自己定时 Ping 服务端测往返延迟；同时据最后一次收到消息的时刻判断断线。
-        let epoch = Instant::now();
+        let mut io = crate::session_io::SessionIo::new(framed, server, self.events.clone());
+        // 独立reader已可回应心跳，初始化原生光标等待不会暂停收发。
+        // 刚连上时光标在服务端屏幕上。
+        self.hide_cursor(true).await;
+        if self.inject.is_failed() {
+            return Err(std::io::Error::other("平台光标操作超时或工作线程停止").into());
+        }
+        let output = io.sender();
         let mut metrics_tick = interval_at(
             tokio::time::Instant::now() + metrics::REPORT_EVERY,
             metrics::REPORT_EVERY,
@@ -775,7 +775,6 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut scheduler_tick = interval(crate::heartbeat::TICK);
         scheduler_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut last_heard = Instant::now();
         let mut ping = interval(RTT_INTERVAL);
         ping.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut silence = interval(SILENCE_TIMEOUT / 4);
@@ -785,9 +784,9 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         screen_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut hints = self.edge.hints();
         hints.mark_unchanged();
-        loop {
+        let result = async { loop {
             let message = tokio::select! {
-                message = framed.recv() => message?,
+                message = io.recv() => message?,
                 packet = async {
                     match &datagrams { Some(datagrams) => datagrams.recv().await, None => std::future::pending().await }
                 } => {
@@ -795,8 +794,11 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     let received = Instant::now();
                     if let Some(packet) = ferry_proto::MotionPacket::decode_datagram(&bytes)
                         && let Some(position) = motion.as_mut().and_then(|state| state.position(packet)) {
-                        self.move_to(position);
+                        self.move_to(position).await;
                         self.metrics.inject.record(received.elapsed());
+                        if self.inject.is_failed() {
+                            return Err(std::io::Error::other("平台输入操作超时或工作线程停止").into());
+                        }
                     }
                     continue;
                 }
@@ -805,7 +807,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                         ClientCommand::OpenPeerSettings => {
                             let sent = negotiated.contains(Capabilities::REMOTE_SETTINGS);
                             if sent {
-                                send(&mut framed, &Message::OpenSettings).await?;
+                                output.send(Message::OpenSettings)?;
                             }
                             self.events.emit(Event::PeerSettings { peer: server, sent });
                         }
@@ -840,7 +842,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     if changed.is_ok() {
                         let hint = hints.borrow_and_update().clone();
                         let hint = hint.map_or_else(gone, |(_, hint)| hint);
-                        send(&mut framed, &Message::DropHint(hint)).await?;
+                        output.send(Message::DropHint(hint))?;
                     }
                     continue;
                 }
@@ -858,7 +860,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                         && now != screens
                     {
                         info!("本机的显示器布局已更新，已告知服务端");
-                        send(&mut framed, &Message::Displays(now.clone())).await?;
+                        output.send(Message::Displays(now.clone()))?;
                         screens = now;
                         if let Some(side) = self.peer_side {
                             self.publish_edge(side, &screens, &shown);
@@ -867,8 +869,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     continue;
                 }
                 _ = ping.tick() => {
-                    let nonce = epoch.elapsed().as_micros() as u64;
-                    send_heartbeat(&mut framed, &Message::Ping { nonce }, &mut self.metrics).await?;
+                    io.ping()?;
                     continue;
                 }
                 expected = scheduler_tick.tick() => {
@@ -876,19 +877,19 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     continue;
                 }
                 _ = metrics_tick.tick() => {
+                    io.collect(&mut self.metrics);
                     self.events.emit(Event::Metrics { peer: Some(server),
                         metrics: self.metrics.take(QueueSummary::default(), QueueSummary::default()).into() });
                     continue;
                 }
                 _ = silence.tick() => {
-                    if last_heard.elapsed() > SILENCE_TIMEOUT {
+                    if io.silence() > SILENCE_TIMEOUT {
                         return Err(Error::HeartbeatTimeout);
                     }
                     continue;
                 }
             };
-            last_heard = Instant::now();
-            let received = Instant::now();
+            let received = io.received_at();
             let enters = matches!(&message, Some(Message::Enter(_)));
             let leaves = matches!(&message, Some(Message::Leave { .. }));
             let control = !matches!(
@@ -925,7 +926,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                         .fence(generation, sequence, position)
                         .map_err(Error::Protocol)?
                     {
-                        self.move_to(position);
+                        self.move_to(position).await;
                     }
                 }
                 Some(Message::MotionSync(packet)) => {
@@ -933,32 +934,18 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                         return Err(Error::Protocol("未协商QUIC移动"));
                     };
                     if let Some(position) = state.position(packet) {
-                        self.move_to(position);
+                        self.move_to(position).await;
                     }
                 }
                 Some(Message::MotionAck { .. }) => {
                     return Err(Error::Protocol("控制端发来了QUIC移动确认"));
                 }
-                Some(Message::Ping { nonce }) => {
-                    send_heartbeat(&mut framed, &Message::Pong { nonce }, &mut self.metrics).await?
-                }
-                Some(Message::Pong { nonce }) => {
-                    let sent = epoch.checked_add(Duration::from_micros(nonce));
-                    let now = Instant::now();
-                    if let Some(sent) = sent.filter(|&sent| sent <= now) {
-                        self.metrics.rtt.record(now - sent);
-                        self.events.emit(Event::Rtt {
-                            peer: server,
-                            rtt: now - sent,
-                        });
-                    }
-                }
                 Some(Message::Enter(enter)) => {
                     // 先把光标移到入口再显示，免得它先在藏身处闪一下。
-                    self.move_to(enter.position);
-                    self.hide_cursor(false);
+                    self.move_to(enter.position).await;
+                    self.hide_cursor(false).await;
                     // 只同步 Caps Lock：对方可能没有 Num Lock（例如 Mac），同步它会误关本机的小键盘。
-                    if let Err(e) = self.inject.sync_locks(enter.locks, LockKeys::CAPS) {
+                    if let Err(e) = self.inject.sync_locks(enter.locks, LockKeys::CAPS).await {
                         warn!("同步锁定键失败：{e}");
                     }
                     self.active.send_replace(true);
@@ -971,8 +958,8 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                     });
                 }
                 Some(Message::Leave { .. }) => {
-                    self.release_all();
-                    self.hide_cursor(true);
+                    self.release_all().await;
+                    self.hide_cursor(true).await;
                     self.active.send_replace(false);
                     self.edge.pointer(|p| p.here = false);
                     info!("光标离开本机");
@@ -982,7 +969,7 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
                         peer: server,
                     });
                 }
-                Some(Message::Input(event)) => self.apply(event),
+                Some(Message::Input(event)) => self.apply(event).await,
                 Some(Message::PeerSide { side }) => {
                     info!(?side, "服务端在本机的这一侧");
                     self.publish_edge(side, &screens, &shown);
@@ -1001,14 +988,19 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
             if measured {
                 self.metrics.inject.record(received.elapsed());
             }
+            if self.inject.is_failed() {
+                return Err(std::io::Error::other("平台输入操作超时或工作线程停止").into());
+            }
             if control
                 && let Some(ack) = motion
                     .as_mut()
                     .and_then(|state| state.after_control(enters, leaves))
             {
-                send(&mut framed, &ack).await?;
+                output.send(ack)?;
             }
-        }
+        } }.await;
+        io.collect(&mut self.metrics);
+        result
     }
 
     /// 在单独的配对连接上与服务端核对配对码。任何一方拒绝都返回 [`Error::PairingRejected`]。
@@ -1074,26 +1066,26 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
         }
     }
 
-    fn apply(&mut self, event: InputEvent) {
+    async fn apply(&mut self, event: InputEvent) {
         match event {
-            InputEvent::PointerMotion { position } => return self.move_to(position),
+            InputEvent::PointerMotion { position } => return self.move_to(position).await,
             // 先把光标放到事件发生的位置，再执行按键或滚动。
             InputEvent::Button { position, .. } | InputEvent::Wheel { position, .. }
                 if position != self.cursor =>
             {
-                self.move_to(position);
+                self.move_to(position).await;
             }
             _ => {}
         }
         self.pressed.track(&event);
         let held = self.pressed.any_button();
         self.edge.pointer(|p| p.held = held);
-        self.inject(&event);
+        self.inject(&event).await;
     }
 
-    fn move_to(&mut self, position: Point) {
+    async fn move_to(&mut self, position: Point) {
         self.cursor = position;
-        self.inject(&InputEvent::PointerMotion { position });
+        self.inject(&InputEvent::PointerMotion { position }).await;
         self.edge.pointer(|p| {
             p.x = position.x as f32;
             p.y = position.y as f32;
@@ -1120,28 +1112,28 @@ impl<I: InputInject, K: Clipboard, P: ConfirmPairing> Client<I, K, P> {
     }
 
     /// 光标在服务端屏幕上时隐藏本机光标，回到本机时重新显示。失败只影响显示，不影响控制。
-    fn hide_cursor(&mut self, hidden: bool) {
+    async fn hide_cursor(&mut self, hidden: bool) {
         if self.cursor_hidden == hidden {
             return;
         }
         self.cursor_hidden = hidden;
         let started = Instant::now();
-        let result = self.inject.set_cursor_hidden(hidden);
+        let result = self.inject.set_cursor_hidden(hidden).await;
         self.metrics.record_cursor_switch(started.elapsed());
         if let Err(e) = result {
             debug!("{}本机光标失败：{e}", if hidden { "隐藏" } else { "显示" });
         }
     }
 
-    fn release_all(&mut self) {
+    async fn release_all(&mut self) {
         for event in self.pressed.release_all(self.cursor) {
-            self.inject(&event);
+            self.inject(&event).await;
         }
         self.edge.pointer(|p| p.held = false);
     }
 
-    fn inject(&mut self, event: &InputEvent) {
-        match self.inject.inject(event) {
+    async fn inject(&mut self, event: &InputEvent) {
+        match self.inject.inject(event).await {
             Ok(()) => {}
             Err(e @ PlatformError::Unsupported(_)) => debug!("跳过：{e}"),
             Err(e) => warn!(?event, "注入失败：{e}"),

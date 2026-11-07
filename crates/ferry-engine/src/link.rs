@@ -1,6 +1,6 @@
 //! 服务端与客户端共用的连接参数和收发帮助函数。
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ferry_net::Framed;
 use ferry_proto::{Capabilities, Message};
@@ -9,7 +9,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
 use crate::error::{Error, Result};
-use crate::metrics::MetricsWindow;
 
 /// 默认端口。
 pub const DEFAULT_PORT: u16 = 24810;
@@ -70,21 +69,6 @@ where
         .await
         .map_err(|_| Error::Timeout("发送"))??;
     Ok(())
-}
-
-/// 心跳编码、写入及 flush 的本机等待；包括失败，不表示对端已经确认或处理。
-pub(crate) async fn send_heartbeat<S>(
-    framed: &mut Framed<S>,
-    message: &Message,
-    metrics: &mut MetricsWindow,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let started = Instant::now();
-    let result = send(framed, message).await;
-    metrics.record_heartbeat_send(started.elapsed());
-    result
 }
 
 /// 主显示器的缩放比例；没有主显示器时取第一块。

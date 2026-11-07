@@ -12,6 +12,8 @@
 //! 两端联动：本机拖着文件靠近边缘时，经引擎把提示（`DropHint`）发给对方；对方在相邻边上
 //! 同一位置提前滑出接收胶囊，放下后接收进度也出现在那里。
 
+mod drag_query;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ use ferry_trust::Fingerprint;
 
 use crate::events::{TransferState, TransferUpdate};
 use crate::files::Files;
+use drag_query::{DragQuery, Reply as QueryReply, Request as QueryRequest};
 
 /// 离边缘多近（点）开始出现胶囊。
 const NEAR: f32 = 210.0;
@@ -50,6 +53,8 @@ const GRACE: Duration = Duration::from_millis(300);
 const DROP_GRACE: Duration = Duration::from_millis(2000);
 /// 两条拖动提示之间至少隔多久；状态变化（靠近、到胶囊上、离开）不受限制。
 const HINT_GAP: Duration = Duration::from_millis(50);
+/// 剪贴板只在实际拖动且靠近边缘时轮询，至多每秒20次；没有活动拖动时不轮询。
+const QUERY_GAP: Duration = Duration::from_millis(50);
 /// 提示里沿边位置的满量程。
 const ALONG_FULL: f32 = 10_000.0;
 
@@ -212,6 +217,10 @@ impl EdgeDrop {
             shown: false,
             moving: false,
             dirty: false,
+            drag_generation: 0,
+            card_generation: 0,
+            card_query: None,
+            query_due: None,
         };
         Self {
             feed: EdgeFeed {
@@ -251,7 +260,10 @@ impl EdgeDrop {
 /// 一次正在进行的拖动。
 struct Drag {
     /// 按下鼠标那一刻拖放剪贴板的变化计数；之后变了，说明开始拖新的东西。
-    count: i64,
+    count: Option<i64>,
+    generation: u64,
+    /// 原生 DragEntered 证明是当前拖动，不必等待异步取得的基线发生变化。
+    force_read: bool,
     /// 拖的文件：还没判断时为 `None`，判断出不是文件时为空。
     files: Option<Vec<PathBuf>>,
     /// 拖着的东西在胶囊上。
@@ -337,15 +349,30 @@ struct Worker<O> {
     moving: bool,
     /// 内容变了：下一帧要重画，即使动画已经停下。
     dirty: bool,
+    drag_generation: u64,
+    card_generation: u64,
+    card_query: Option<PathBuf>,
+    query_due: Option<Instant>,
 }
 
 impl<O: Overlay> Worker<O> {
     async fn run(mut self) {
+        let mut queries = match DragQuery::new(self.overlay.drag_reader()).await {
+            Ok(queries) => Some(queries),
+            Err(error) => {
+                warn!(%error, "拖放预览读取不可用，放下文件仍可发送");
+                None
+            }
+        };
         let mut last = Instant::now();
         let mut next_frame: Option<Instant> = None;
         loop {
             // 输入只改变目标；动画按固定的下一帧截止时间推进，不随每个输入重新计时。
-            let wake = next_frame.into_iter().chain(self.deadline()).min();
+            let wake = next_frame
+                .into_iter()
+                .chain(self.deadline())
+                .chain(self.query_due)
+                .min();
             tokio::select! {
                 changed = self.pointer.changed() => {
                     if changed.is_err() {
@@ -356,6 +383,9 @@ impl<O: Overlay> Worker<O> {
                 changed = self.edges.changed() => {
                     if changed.is_err() {
                         return;
+                    }
+                    if self.edges.borrow().is_empty() {
+                        self.drag = None;
                     }
                 }
                 changed = self.incoming.changed() => {
@@ -368,10 +398,20 @@ impl<O: Overlay> Worker<O> {
                 _ = self.lang.changed() => self.dirty = true,
                 Some(update) = self.transfers.recv() => self.on_transfer(update),
                 Some(event) = self.events.recv() => self.on_event(event).await,
+                result = next_query(&mut queries) => {
+                    match result {
+                        Ok(reply) => self.on_query(reply),
+                        Err(error) => {
+                            warn!(%error, "拖放预览读取停止，放下文件仍可发送");
+                            queries = None;
+                        }
+                    }
+                }
                 _ = sleep_or_never(wake) => {}
             }
             let now = Instant::now();
             self.expire(now);
+            self.schedule_query(&mut queries, now);
             self.watch();
             self.decide();
             self.sync_offer();
@@ -459,25 +499,120 @@ impl<O: Overlay> Worker<O> {
         let pointer = *self.pointer.borrow_and_update();
         match (&mut self.drag, pointer.held) {
             (None, true) if !self.dragging_out => {
+                self.drag_generation = self.drag_generation.wrapping_add(1);
                 self.drag = Some(Drag {
-                    count: self.overlay.drag_count(),
+                    count: None,
+                    generation: self.drag_generation,
+                    force_read: false,
                     files: None,
                     over: false,
                     summary: None,
                 });
             }
             (Some(_), false) => self.drag = None,
-            (Some(drag), true) => {
-                // 靠近边缘时才去看拖的是什么，平时不打扰。
-                let near = edge_at(&self.edges.borrow(), &pointer)
-                    .is_some_and(|edge| distance(edge, &pointer) <= NEAR);
-                if near && drag.files.is_none() && self.overlay.drag_count() != drag.count {
-                    let files = not_ours(self.overlay.dragged_files(), &self.offered);
-                    drag.summary = summarize(&files);
-                    drag.files = Some(files);
+            (Some(_), true) => {}
+            (None, _) => {}
+        }
+    }
+
+    fn schedule_query(&mut self, queries: &mut Option<DragQuery>, now: Instant) {
+        let Some(query) = queries.as_mut() else {
+            self.query_due = None;
+            return;
+        };
+        if query.busy() {
+            // 一项查询没有完成就不再设置周期唤醒或排入更多工作。
+            self.query_due = None;
+            return;
+        }
+        let pointer = *self.pointer.borrow();
+        let near = pointer.here
+            && edge_at(&self.edges.borrow(), &pointer)
+                .is_some_and(|edge| distance(edge, &pointer) <= NEAR);
+        let request = match self.drag.as_ref() {
+            Some(drag) if pointer.held && !self.dragging_out && drag.files.is_none() => {
+                match drag.count {
+                    None => Some(QueryRequest::Baseline {
+                        generation: drag.generation,
+                    }),
+                    Some(baseline) if near || drag.force_read => {
+                        if self.query_due.is_some_and(|due| due > now) {
+                            return;
+                        }
+                        Some(QueryRequest::Files {
+                            generation: drag.generation,
+                            baseline,
+                            force: drag.force_read,
+                        })
+                    }
+                    _ => None,
                 }
             }
-            (None, _) => {}
+            _ => None,
+        };
+        let request = request.or_else(|| {
+            if self.card.is_none() {
+                self.card_query = None;
+            }
+            self.card_query.take().map(|path| QueryRequest::Directory {
+                generation: self.card_generation,
+                path,
+            })
+        });
+        self.query_due = None;
+        if let Some(request) = request
+            && let Err(error) = query.request(request)
+        {
+            warn!(%error, "拖放预览读取停止，放下文件仍可发送");
+            *queries = None;
+        }
+    }
+
+    fn on_query(&mut self, reply: QueryReply) {
+        match reply {
+            QueryReply::Baseline { generation, count } => {
+                if let Some(drag) = &mut self.drag
+                    && drag.generation == generation
+                {
+                    drag.count = Some(count);
+                    self.query_due = Some(Instant::now());
+                }
+            }
+            QueryReply::Files {
+                generation,
+                content,
+            } => {
+                let Some(drag) = &mut self.drag else {
+                    return;
+                };
+                if drag.generation != generation || !self.pointer.borrow().held || self.dragging_out
+                {
+                    return;
+                }
+                if let Some(content) = content {
+                    let files = not_ours(content.files, &self.offered);
+                    if files.is_empty() {
+                        drag.over = false;
+                    }
+                    drag.summary = (!files.is_empty()).then_some(content.summary).flatten();
+                    drag.files = Some(files);
+                    drag.force_read = false;
+                } else {
+                    self.query_due = Some(Instant::now() + QUERY_GAP);
+                }
+            }
+            QueryReply::Directory {
+                generation,
+                directory,
+            } => {
+                if generation == self.card_generation
+                    && directory
+                    && let Some(card) = &mut self.card
+                    && let Look::Card { tile, .. } = &mut card.look
+                {
+                    *tile = Tile::Folder;
+                }
+            }
         }
     }
 
@@ -491,14 +626,12 @@ impl<O: Overlay> Worker<O> {
                     drag.over = files;
                     // 有的系统（Windows）要到拖进接收条才知道拖的是什么。
                     if drag.files.is_none() {
-                        let files = if files {
-                            not_ours(self.overlay.dragged_files(), &self.offered)
+                        if files {
+                            drag.force_read = true;
+                            self.query_due = Some(Instant::now());
                         } else {
-                            Vec::new()
-                        };
-                        drag.over = !files.is_empty();
-                        drag.summary = summarize(&files);
-                        drag.files = Some(files);
+                            drag.files = Some(Vec::new());
+                        }
                     }
                 }
             }
@@ -622,6 +755,10 @@ impl<O: Overlay> Worker<O> {
                 return;
             }
             TransferState::Done { saved } if !update.outgoing => {
+                self.card_generation = self.card_generation.wrapping_add(1);
+                self.card_query = (update.items == 1)
+                    .then(|| saved.first().cloned())
+                    .flatten();
                 let size = size_text(update.bytes);
                 let look = Look::Card {
                     from: lang.pick(format!("来自 {peer}"), format!("From {peer}")),
@@ -630,7 +767,7 @@ impl<O: Overlay> Worker<O> {
                         format!("已保存到「下载」· {size}"),
                         format!("Saved to Downloads · {size}"),
                     ),
-                    tile: tile_of(&update, saved),
+                    tile: tile_of(&update),
                     chip: true,
                 };
                 self.card = Some(Card {
@@ -1058,23 +1195,6 @@ fn not_ours(files: Vec<PathBuf>, offered: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
-/// 拖着的东西的摘要：第一项的名字、几项、总大小（含文件夹时不知道总大小，记为 0）。
-fn summarize(files: &[PathBuf]) -> Option<(String, u32, u64)> {
-    let first = files.first()?;
-    let name = first.file_name()?.to_string_lossy().into_owned();
-    let mut bytes = 0u64;
-    for file in files {
-        match std::fs::metadata(file) {
-            Ok(meta) if meta.is_file() => bytes += meta.len(),
-            _ => {
-                bytes = 0;
-                break;
-            }
-        }
-    }
-    Some((name, u32::try_from(files.len()).unwrap_or(u32::MAX), bytes))
-}
-
 fn along_of(edge: &Edge, p: &Pointer) -> f32 {
     match edge.side {
         Side::Left | Side::Right => p.y,
@@ -1145,12 +1265,9 @@ fn with_more(first: &str, items: u32, lang: Lang) -> String {
 }
 
 /// 卡片上的小图标：多项、文件夹，或者带扩展名的文件。
-fn tile_of(update: &TransferUpdate, saved: &[PathBuf]) -> Tile {
+fn tile_of(update: &TransferUpdate) -> Tile {
     if update.items > 1 {
         return Tile::Stack(update.items);
-    }
-    if saved.first().is_some_and(|p| p.is_dir()) {
-        return Tile::Folder;
     }
     let ext = std::path::Path::new(&update.name)
         .extension()
@@ -1200,6 +1317,13 @@ pub(crate) fn size_text(bytes: u64) -> String {
 async fn sleep_or_never(at: Option<Instant>) {
     match at {
         Some(at) => sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_query(queries: &mut Option<DragQuery>) -> std::io::Result<QueryReply> {
+    match queries {
+        Some(queries) => queries.completed().await,
         None => std::future::pending().await,
     }
 }

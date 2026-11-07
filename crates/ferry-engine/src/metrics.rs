@@ -39,12 +39,12 @@ pub struct InputMetrics {
     /// 原生捕获回调开始到引擎消费，包括捕获转换和入队后的等待。
     pub capture_queue: LatencySummary,
     pub send_queue: LatencySummary,
-    /// 编码、TLS写入与flush等待，不代表对端处理完毕。
+    /// 独立写队列入队至编码、传输写入与flush完成，不代表对端处理完毕。
     pub send: LatencySummary,
-    /// 本机解码得到输入到平台注入调用返回，不含系统合成/屏幕呈现。
+    /// 本机解码得到输入到平台注入调用返回，含接收队列与平台线程等待，不含屏幕呈现。
     pub inject: LatencySummary,
     pub rtt: LatencySummary,
-    /// 定时任务相对于预定唤醒时刻的迟到量。
+    /// 本任务定时检查的迟到量，可能包含异步等待，不等于整个运行时被阻塞。
     pub scheduler: LatencySummary,
     /// 后台显示器查询执行耗时，不代表核心运行时被阻塞。
     pub display_query: LatencySummary,
@@ -76,6 +76,15 @@ impl Default for LatencyHistogram {
 }
 
 impl LatencyHistogram {
+    pub(crate) fn merge(&mut self, other: &mut Self) {
+        for (ours, theirs) in self.buckets.iter_mut().zip(other.buckets) {
+            *ours = ours.saturating_add(theirs);
+        }
+        self.count = self.count.saturating_add(other.count);
+        self.max_us = self.max_us.max(other.max_us);
+        self.over_100ms = self.over_100ms.saturating_add(other.over_100ms);
+        *other = Self::default();
+    }
     pub fn record(&mut self, elapsed: Duration) {
         let us = micros(elapsed);
         let index = bucket(us);
@@ -228,9 +237,14 @@ pub struct MetricIncident {
     stages: Vec<&'static str>,
     windows: Vec<InputMetrics>,
     following: usize,
+    related: Vec<RecordedMetrics>,
 }
 
 impl MetricIncident {
+    /// 触发时间前后15秒内的其他本机来源，最多16窗；不表示各阶段属于同一操作。
+    pub fn related(&self) -> &[RecordedMetrics] {
+        &self.related
+    }
     pub fn windows(&self) -> &[InputMetrics] {
         &self.windows
     }
@@ -241,6 +255,22 @@ impl MetricIncident {
     }
 }
 
+/// 当前来源生命周期内已接收窗口的累计值，不从近似分位数推算平均或全局分位数。
+#[derive(Clone, Debug)]
+pub struct MetricTotals {
+    pub peer: Option<Fingerprint>,
+    pub windows: u64,
+    pub last_collected: Instant,
+    pub stages: std::collections::BTreeMap<&'static str, StageTotals>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct StageTotals {
+    pub count: u64,
+    pub max_us: u64,
+    pub over_100ms: u64,
+}
+
 /// 有界的诊断上下文。常规窗口保留60秒，每来源最多12个，全局最多128个；
 /// 另外保留最近4次尖峰，每次最多5个窗口，直到来源移除、清空或被新尖峰挤出。
 /// 同源尖峰的后续2个窗口内再次触发只并入当前上下文，不延长容量。
@@ -249,6 +279,7 @@ impl MetricIncident {
 pub struct MetricsHistory {
     recent: VecDeque<RecordedMetrics>,
     incidents: VecDeque<MetricIncident>,
+    totals: VecDeque<MetricTotals>,
 }
 
 impl MetricsHistory {
@@ -265,14 +296,45 @@ impl MetricsHistory {
             return;
         };
         if now.duration_since(at) > Self::AGE
-            || self.recent.iter().rev().any(|entry| {
-                entry.peer == peer && entry.metrics.collected_at.is_some_and(|old| old >= at)
-            })
+            || self
+                .totals
+                .iter()
+                .any(|entry| entry.peer == peer && entry.last_collected >= at)
         {
             return;
         }
+        if !self.totals.iter().any(|entry| entry.peer == peer) {
+            if self.totals.len() >= Self::TOTAL {
+                self.totals.pop_front();
+            }
+            self.totals.push_back(MetricTotals {
+                peer,
+                windows: 0,
+                last_collected: at,
+                stages: Default::default(),
+            });
+        }
+        if let Some(total) = self.totals.iter_mut().find(|entry| entry.peer == peer) {
+            total.windows = total.windows.saturating_add(1);
+            total.last_collected = at;
+            for (name, stage) in stages(&metrics) {
+                let sum = total.stages.entry(name).or_default();
+                sum.count = sum.count.saturating_add(stage.count);
+                sum.over_100ms = sum.over_100ms.saturating_add(stage.over_100ms);
+                sum.max_us = sum.max_us.max(stage.max_us);
+            }
+        }
         let mut continuing = false;
         for incident in &mut self.incidents {
+            if related_source(incident.peer, peer)
+                && related_time(at, incident.triggered_at)
+                && incident.related.len() < 16
+            {
+                incident.related.push(RecordedMetrics {
+                    peer,
+                    metrics: metrics.clone(),
+                });
+            }
             if incident.peer == peer && incident.following > 0 {
                 incident.windows.push(metrics.clone());
                 incident.following -= 1;
@@ -291,12 +353,27 @@ impl MetricsHistory {
                 .collect();
             before.reverse();
             before.push(metrics.clone());
+            let related = self
+                .recent
+                .iter()
+                .rev()
+                .filter(|entry| {
+                    related_source(peer, entry.peer)
+                        && entry
+                            .metrics
+                            .collected_at
+                            .is_some_and(|when| related_time(when, at))
+                })
+                .take(8)
+                .cloned()
+                .collect();
             self.incidents.push_back(MetricIncident {
                 peer,
                 triggered_at: at,
                 stages,
                 windows: before,
                 following: 2,
+                related,
             });
             while self.incidents.len() > Self::INCIDENTS {
                 self.incidents.pop_front();
@@ -330,14 +407,23 @@ impl MetricsHistory {
         self.incidents.iter()
     }
 
+    pub fn totals(&self) -> impl Iterator<Item = &MetricTotals> {
+        self.totals.iter()
+    }
+
     pub fn remove_peer(&mut self, peer: Option<Fingerprint>) {
         self.recent.retain(|entry| entry.peer != peer);
         self.incidents.retain(|entry| entry.peer != peer);
+        for incident in &mut self.incidents {
+            incident.related.retain(|entry| entry.peer != peer);
+        }
+        self.totals.retain(|entry| entry.peer != peer);
     }
 
     pub fn clear(&mut self) {
         self.recent.clear();
         self.incidents.clear();
+        self.totals.clear();
     }
 }
 
@@ -349,6 +435,22 @@ fn fresh(metrics: &InputMetrics, now: Instant) -> bool {
 }
 
 fn spike_stages(metrics: &InputMetrics) -> Vec<&'static str> {
+    stages(metrics)
+        .into_iter()
+        .filter_map(|(name, stage)| (stage.over_100ms > 0).then_some(name))
+        .collect()
+}
+
+fn related_time(at: Instant, trigger: Instant) -> bool {
+    at.max(trigger).duration_since(at.min(trigger)) <= Duration::from_secs(15)
+}
+
+fn related_source(trigger: Option<Fingerprint>, other: Option<Fingerprint>) -> bool {
+    // 连接尖峰优先关联公共引擎；引擎尖峰关联连接，避免无关其他peer挤走本机阶段。
+    trigger.is_none() != other.is_none()
+}
+
+fn stages(metrics: &InputMetrics) -> [(&'static str, &LatencySummary); 9] {
     [
         ("capture_queue", &metrics.capture_queue),
         ("send_queue", &metrics.send_queue),
@@ -360,7 +462,4 @@ fn spike_stages(metrics: &InputMetrics) -> Vec<&'static str> {
         ("cursor_switch", &metrics.cursor_switch),
         ("heartbeat_send", &metrics.heartbeat_send),
     ]
-    .into_iter()
-    .filter_map(|(name, stage)| (stage.over_100ms > 0).then_some(name))
-    .collect()
 }

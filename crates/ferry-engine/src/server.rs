@@ -44,11 +44,10 @@ use crate::edge_drop::{Edge, EdgeFeed, gone};
 use crate::error::{Error, Result};
 use crate::events::{Event, Events};
 use crate::files::Files;
-use crate::heartbeat::{self, Heartbeat};
+use crate::heartbeat;
 use crate::input_queue::{InputReceiver, InputSender, InputSettings, input_queue};
 use crate::link::{
     DISPLAY_CHECK, HANDSHAKE_TIMEOUT, capabilities, frame_of, platform_of, primary_scale, send,
-    send_heartbeat,
 };
 use crate::metrics::{self, MetricsWindow, QueueSummary};
 use crate::pairing::{self, ConfirmPairing, Outcome};
@@ -148,7 +147,7 @@ pub async fn serve<C, D, K, P>(
     confirm: P,
 ) -> Result<Infallible>
 where
-    C: InputCapture,
+    C: InputCapture + 'static,
     D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
@@ -176,7 +175,7 @@ pub async fn serve_with_transport<C, D, K, P>(
     transport: ferry_net::Transport,
 ) -> Result<Infallible>
 where
-    C: InputCapture,
+    C: InputCapture + 'static,
     D: Displays + 'static,
     K: Clipboard,
     P: ConfirmPairing,
@@ -207,7 +206,9 @@ where
         port: addr.port(),
         announced: advertiser.is_some(),
     });
-    server.run(listener, transport).await
+    let result = server.run(listener, transport).await;
+    server.report_capture();
+    result
 }
 
 /// 会话任务和连接握手交回主循环的事。
@@ -308,11 +309,11 @@ struct Session {
     sync: Option<ClipboardTask>,
 }
 
-struct Server<C, K, P> {
+struct Server<K, P> {
     config: ServerConfig,
     shared: Arc<Shared<P>>,
     arrivals: mpsc::Receiver<Arrival>,
-    capture: C,
+    capture: crate::platform_input::CaptureWorker,
     displays: crate::display_query::DisplayQuery,
     clipboard: SharedClipboard<K>,
     events: mpsc::Receiver<Captured>,
@@ -332,15 +333,14 @@ struct Server<C, K, P> {
     hint_target: Option<Fingerprint>,
 }
 
-impl<C, K, P> Server<C, K, P>
+impl<K, P> Server<K, P>
 where
-    C: InputCapture,
     K: Clipboard,
     P: ConfirmPairing,
 {
     async fn start(
         config: ServerConfig,
-        mut capture: C,
+        capture: impl InputCapture + 'static,
         displays: impl Displays + 'static,
         clipboard: K,
         confirm: P,
@@ -357,24 +357,30 @@ where
         let (tx, events) = mpsc::channel(CAPTURE_CAPACITY);
         let capture_stats = Arc::new(CaptureStats::default());
         let stats = capture_stats.clone();
-        capture.start(Box::new(move |event| {
-            // 原生回调绝不等待：溢出后主循环停止引擎，不能丢掉Up却继续控制远端。
-            if stats.overflows.load(Ordering::Relaxed) != 0 {
-                return;
-            }
-            match tx.try_send(event) {
-                Ok(()) => {
-                    stats
-                        .high_water
-                        .fetch_max(CAPTURE_CAPACITY - tx.capacity(), Ordering::Relaxed);
+        let capture = crate::platform_input::CaptureWorker::start(
+            config.store.root().to_owned(),
+            capture,
+            Box::new(move |event| {
+                // 原生回调绝不等待：溢出后主循环停止引擎，不能丢掉Up却继续控制远端。
+                if stats.overflows.load(Ordering::Relaxed) != 0 {
+                    return;
                 }
-                Err(error) => {
-                    if matches!(error, mpsc::error::TrySendError::Full(_)) {
-                        stats.overflows.fetch_add(1, Ordering::Relaxed);
+                match tx.try_send(event) {
+                    Ok(()) => {
+                        stats
+                            .high_water
+                            .fetch_max(CAPTURE_CAPACITY - tx.capacity(), Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                            stats.overflows.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
-            }
-        }))?;
+            }),
+            Point::new(rect.x, rect.y),
+        )
+        .await?;
         let (arrivals_tx, arrivals) = mpsc::channel(64);
         let shared = Arc::new(Shared {
             capabilities: capabilities(config.clipboard, true, config.command_key),
@@ -505,14 +511,14 @@ where
                     Err(e) => warn!("接受连接失败：{e}"),
                 },
                 _ = handshakes.join_next(), if !handshakes.is_empty() => {},
-                Some(arrival) = self.arrivals.recv() => self.on_arrival(arrival),
+                Some(arrival) = self.arrivals.recv() => self.on_arrival(arrival).await,
                 Some(captured) = self.events.recv() => {
                     if self.capture_stats.overflows.load(Ordering::Relaxed) != 0 {
-                        self.stop_overloaded_capture();
+                        self.stop_overloaded_capture().await;
                         return Err(std::io::Error::other("输入捕获队列已满，已停止共享并归还控制").into());
                     }
                     self.metrics.capture.record(captured.captured_at.elapsed());
-                    self.on_capture(captured);
+                    self.on_capture(captured).await;
                 },
                 expected = metrics_tick.tick() => {
                     self.metrics.scheduler.record(expected.elapsed());
@@ -523,7 +529,7 @@ where
                         live_open = false;
                         continue;
                     }
-                    self.relayout();
+                    self.relayout().await;
                 }
                 changed = hints.changed() => {
                     if changed.is_ok() {
@@ -540,8 +546,11 @@ where
                     }
                 }
             }
+            if self.capture.is_failed() {
+                return Err(std::io::Error::other("平台捕获操作超时或工作线程停止").into());
+            }
             for id in std::mem::take(&mut self.broken) {
-                self.end(id, Some("对方长时间收不动，已断开".into()));
+                self.end(id, Some("对方长时间收不动，已断开".into())).await;
             }
         }
     }
@@ -559,10 +568,10 @@ where
         });
     }
 
-    fn stop_overloaded_capture(&mut self) {
+    async fn stop_overloaded_capture(&mut self) {
         if let Some((_, at)) = self.neighbors.abort() {
             let started = Instant::now();
-            let _ = self.capture.release(at);
+            let _ = self.capture.release(at).await;
             self.metrics.record_cursor_switch(started.elapsed());
         }
         self.sessions.clear();
@@ -572,16 +581,16 @@ where
 
     // ── 会话的开始与结束 ─────────────────────────
 
-    fn on_arrival(&mut self, arrival: Arrival) {
+    async fn on_arrival(&mut self, arrival: Arrival) {
         match arrival {
-            Arrival::Session(new) => self.begin(*new),
+            Arrival::Session(new) => self.begin(*new).await,
             Arrival::Data { id, framed } => self.attach_data(id, *framed),
             Arrival::Message { id, message } => self.on_message(id, message),
-            Arrival::Closed { id, reason } => self.end(id, reason),
+            Arrival::Closed { id, reason } => self.end(id, reason).await,
         }
     }
 
-    fn begin(&mut self, new: NewSession) {
+    async fn begin(&mut self, new: NewSession) {
         let NewSession {
             id,
             peer,
@@ -600,7 +609,7 @@ where
             .collect();
         for old in stale {
             info!(peer = %mark::device(&hello.name), "这台设备重新连上了，结束它之前的会话");
-            self.end(old, None);
+            self.end(old, None).await;
         }
         let Some(remote_rect) = bounds(&remote) else {
             warn!(peer = %mark::device(&hello.name), "对方没有报告显示器，已断开");
@@ -754,7 +763,7 @@ where
     }
 
     /// 结束一个会话。光标在它上面时立即交还本机。
-    fn end(&mut self, id: u64, reason: Option<String>) {
+    async fn end(&mut self, id: u64, reason: Option<String>) {
         let Some(session) = self.sessions.remove(&id) else {
             return;
         };
@@ -773,7 +782,7 @@ where
         if let Some(at) = self.neighbors.remove(id) {
             self.pressed.clear_keys();
             let started = Instant::now();
-            let result = self.capture.release(at);
+            let result = self.capture.release(at).await;
             self.metrics.record_cursor_switch(started.elapsed());
             match result {
                 Ok(()) => info!("已把控制权交还本机"),
@@ -799,7 +808,7 @@ where
 
     // ── 本机输入 ──────────────────────────────
 
-    fn on_capture(&mut self, captured: Captured) {
+    async fn on_capture(&mut self, captured: Captured) {
         // 切换那一刻还在路上的事件，发生时光标在另一边：本机已经处理过它，或者它已被吞掉。
         // 按现在的状态解释它，会拿过时的位置判断边缘、把光标立刻推回去，所以不再使用；
         // 鼠标键照样记录，免得以为某个键一直按着。
@@ -823,10 +832,10 @@ where
                             self.neighbors
                                 .local_motion(position, dx, dy, Instant::now())
                     {
-                        self.perform(id, t, false);
+                        self.perform(id, t, false).await;
                     }
                 } else if let Some((id, t)) = self.neighbors.remote_motion(dx, dy, free) {
-                    self.perform(id, t, false);
+                    self.perform(id, t, false).await;
                 }
             }
             CaptureEvent::Button { button, pressed } => {
@@ -873,7 +882,7 @@ where
                 {
                     info!("快捷键 Ctrl + Option（Alt）+ Esc：回到本机");
                     if let Some((id, t)) = self.neighbors.leave() {
-                        self.perform(id, t, true);
+                        self.perform(id, t, true).await;
                     }
                 } else if let Some(session) = self.sessions.get_mut(&id) {
                     for (code, action) in session.mapper.key(code, action) {
@@ -885,7 +894,7 @@ where
     }
 
     /// 执行一次切换或移动。
-    fn perform(&mut self, id: u64, transition: Transition, hotkey: bool) {
+    async fn perform(&mut self, id: u64, transition: Transition, hotkey: bool) {
         let Some(peer) = self.sessions.get(&id).map(|s| s.peer) else {
             return;
         };
@@ -893,18 +902,21 @@ where
             Transition::Enter { seq, at } => {
                 // 先抓取再通知对方：抓取失败就不过去。
                 let started = Instant::now();
-                let result = self.capture.grab();
+                let result = self.capture.grab().await;
                 self.metrics.record_cursor_switch(started.elapsed());
-                if let Err(e) = result {
-                    warn!("抓取本机键鼠失败，留在本机：{e}");
-                    self.neighbors.abort();
-                    return;
-                }
+                let locks = match result {
+                    Ok(locks) => locks,
+                    Err(e) => {
+                        warn!("抓取本机键鼠失败，留在本机：{e}");
+                        self.neighbors.abort();
+                        return;
+                    }
+                };
                 self.config.edge.pointer(|p| p.here = false);
                 let enter = Enter {
                     seq,
                     position: at,
-                    locks: self.capture.lock_keys(),
+                    locks,
                 };
                 self.send_to(id, Message::Enter(enter));
                 if let Some(session) = self.sessions.get(&id) {
@@ -923,7 +935,7 @@ where
             Transition::Leave { seq, local_at } => {
                 // 先归还本机控制再通知对方：发送失败也不会把本机键鼠锁住。
                 let started = Instant::now();
-                let result = self.capture.release(local_at);
+                let result = self.capture.release(local_at).await;
                 self.metrics.record_cursor_switch(started.elapsed());
                 if let Err(e) = result {
                     warn!("交还本机控制失败：{e}");
@@ -967,7 +979,7 @@ where
 
     /// 用户改了布局或某台设备的设置：每台设备按新的位置摆、按新的设置换算。
     /// 光标所在的那台换到另一侧时先回到本机。
-    fn relayout(&mut self) {
+    async fn relayout(&mut self) {
         let live = self.config.live.borrow_and_update().clone();
         let ids: Vec<u64> = self.sessions.keys().copied().collect();
         for id in ids {
@@ -980,7 +992,8 @@ where
                 || settings.files != session.settings.files
             {
                 // 已协商的能力不能半途悄悄改变；断开数据和输入会话，让双方重新协商。
-                self.end(id, Some("共享权限已改变，正在重新连接".into()));
+                self.end(id, Some("共享权限已改变，正在重新连接".into()))
+                    .await;
                 continue;
             }
             if settings != session.settings {
@@ -998,7 +1011,7 @@ where
             };
             let place = live.place_of(&session.peer);
             if let Some(t) = self.neighbors.set_place(id, place) {
-                self.perform(id, t, false);
+                self.perform(id, t, false).await;
             }
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
@@ -1309,7 +1322,7 @@ async fn pair<P: ConfirmPairing>(
 /// 一个会话的收发：发出主循环交来的消息，回应心跳、测往返延迟，把要处理的消息交回主循环。
 /// 结束时（对方断开、心跳超时、出错、主循环不要它了）告诉主循环。
 async fn run_session(
-    mut framed: Framed<ServerStream>,
+    framed: Framed<ServerStream>,
     identity: (u64, Fingerprint, bool),
     mut outbox: InputReceiver,
     active: watch::Receiver<bool>,
@@ -1319,7 +1332,8 @@ async fn run_session(
     let (id, peer, motion_enabled) = identity;
     let datagrams = framed.get_ref().datagrams().filter(|_| motion_enabled);
     let mut motion = datagrams.as_ref().map(|_| crate::MotionSender::new(id));
-    let mut heartbeat = Heartbeat::new();
+    let mut io = crate::session_io::SessionIo::new(framed, peer, events.clone());
+    let output = io.sender();
     let mut metrics = MetricsWindow::default();
     let mut metrics_tick = interval_at(
         tokio::time::Instant::now() + metrics::REPORT_EVERY,
@@ -1331,44 +1345,35 @@ async fn run_session(
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                message = outbox.recv() => match message {
+                message = outbox.recv(), if output.available() => match message {
                     Some(queued) => {
                         metrics.queued.record(queued.queued_at.elapsed());
                         let start = Instant::now();
                         if let Some(state) = motion.as_mut() {
                             let plan = state.prepare(queued.message, queued.ordinary_motion, start);
-                            for reliable in plan.reliable { send(&mut framed, &reliable).await?; }
+                            for reliable in plan.reliable { output.send(reliable)?; }
                             if let Some(packet) = plan.datagram
                                 && let Some(datagrams) = &datagrams
                                 && datagrams.send(&packet.encode_datagram()).is_err() {
                                 state.disable();
                                 if let Some(final_position) = state.compensate() {
-                                    send(&mut framed, &final_position).await?;
+                                    output.send(final_position)?;
                                 }
                             }
                         } else {
-                            send(&mut framed, &queued.message).await?;
+                            output.send(queued.message)?;
                         }
-                        metrics.send.record(start.elapsed());
                     },
                     None => return Ok(()),
                 },
-                message = framed.recv() => match message? {
+                ready = output.writable(), if !output.available() => { ready?; },
+                message = io.recv() => match message? {
                     Some(Message::MotionFence { .. } | Message::MotionSync(_)) => {
                         return Err(Error::Protocol("被控端不能发送QUIC移动控制"));
                     }
                     Some(Message::MotionAck { generation, sequence }) => {
                         let Some(state) = &mut motion else { return Err(Error::Protocol("未协商QUIC移动")); };
                         state.acknowledge(generation, sequence);
-                    }
-                    Some(Message::Pong { nonce }) => {
-                        if let Some(rtt) = heartbeat.pong(nonce) {
-                            metrics.rtt.record(rtt);
-                            events.emit(Event::Rtt { peer, rtt });
-                        }
-                    }
-                    Some(Message::Ping { nonce }) => {
-                        send_heartbeat(&mut framed, &Message::Pong { nonce }, &mut metrics).await?;
                     }
                     Some(Message::Bye(_)) | None => return Ok(()),
                     Some(
@@ -1388,26 +1393,23 @@ async fn run_session(
                     }
                 } => {
                     if let Some(final_position) = motion.as_mut().and_then(crate::MotionSender::compensate) {
-                        send(&mut framed, &final_position).await?;
+                        output.send(final_position)?;
                     }
                 }
                 expected = tick.tick() => {
                     if let Some(state) = &mut motion { state.check_timeout(Instant::now()); }
                     metrics.scheduler.record(expected.elapsed());
-                    if heartbeat.timed_out() {
+                    if io.timed_out() {
                         let bye = Bye { reason: ByeReason::TIMEOUT };
-                        let _ = send(&mut framed, &Message::Bye(bye)).await;
+                        let _ = output.send(Message::Bye(bye));
                         return Err(Error::HeartbeatTimeout);
                     }
                     let remote = !*active.borrow();
-                    if let Some(nonce) = heartbeat.poll_ping(remote) {
-                        send_heartbeat(&mut framed, &Message::Ping { nonce }, &mut metrics).await?;
-                    }
-                    if let Some(report) = heartbeat.poll_report() {
-                        info!("{report}");
-                    }
+                    io.poll_ping(remote)?;
+                    io.report();
                 }
                 _ = metrics_tick.tick() => {
+                    io.collect(&mut metrics);
                     events.emit(Event::Metrics { peer: Some(peer),
                         metrics: metrics.take(QueueSummary::default(), outbox.summary()).into() });
                 }
@@ -1415,6 +1417,7 @@ async fn run_session(
         }
     }
     .await;
+    io.collect(&mut metrics);
     events.emit(Event::Metrics {
         peer: Some(peer),
         metrics: metrics

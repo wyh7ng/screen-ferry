@@ -76,7 +76,7 @@ void main() {
       expect(find.textContaining('不是端到端输入延迟'), findsOneWidget);
       expect(find.text('显示器查询'), findsOneWidget);
       expect(find.text('光标切换'), findsOneWidget);
-      expect(find.text('心跳写入等待'), findsOneWidget);
+      expect(find.text('心跳排队与写入'), findsOneWidget);
       expect(find.text('120.12'), findsOneWidget);
       expect(find.text('0.86'), findsOneWidget);
       expect(find.text('0.29'), findsOneWidget);

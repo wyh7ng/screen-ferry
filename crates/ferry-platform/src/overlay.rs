@@ -31,8 +31,17 @@ pub enum OverlayEvent {
 /// 接收浮层事件的回调。在系统的界面线程上调用，必须立即返回。
 pub type OverlaySink = Box<dyn FnMut(OverlayEvent) + Send>;
 
+/// 可交给专用线程的拖放剪贴板读取能力；不持有或操作原生窗口。
+pub trait DragReader: Send {
+    fn change_count(&mut self) -> i64;
+    fn files(&mut self) -> Vec<PathBuf>;
+}
+
 /// 屏幕边缘的浮层。可以在任意线程调用，实现自己把工作交给界面线程。
 pub trait Overlay: Send {
+    /// 创建独立读取句柄。这里只创建能力，不读取剪贴板或等待系统服务。
+    fn drag_reader(&self) -> Box<dyn DragReader>;
+
     /// 开始工作，之后发生的事交给 `sink`。
     fn start(&mut self, sink: OverlaySink) -> Result<()>;
 

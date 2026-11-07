@@ -11,6 +11,8 @@ use tokio::time::sleep;
 
 use crate::support::{Device, Rig, Setup, TempDir, eventually};
 
+mod drag_query;
+
 const ACCENT: Rgba = Rgba::hex(0x0A6CFF, 255);
 
 /// 给一台设备配上边缘投递。常驻后台会把文件传输的进展转给边缘投递，这里由一个小任务代劳。
@@ -726,6 +728,9 @@ struct CountedOverlay {
 }
 
 impl ferry_platform::Overlay for CountedOverlay {
+    fn drag_reader(&self) -> Box<dyn ferry_platform::DragReader> {
+        ferry_platform::Overlay::drag_reader(&self.inner)
+    }
     fn start(&mut self, sink: ferry_platform::OverlaySink) -> ferry_platform::Result<()> {
         ferry_platform::Overlay::start(&mut self.inner, sink)
     }

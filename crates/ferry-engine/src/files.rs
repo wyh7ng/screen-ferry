@@ -13,7 +13,7 @@ mod receive;
 mod send;
 pub use budget::FileRateLimit;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -85,12 +85,53 @@ struct State {
     generation: u64,
     jobs: HashMap<TransferId, Job>,
     cancelled: VecDeque<(TransferId, Fingerprint)>,
+    /// 已保留给回执清理的目录；磁盘操作不持有state锁，新任务只能登记等待。
+    cleaning: HashSet<(Fingerprint, TransferId)>,
 }
 
 impl State {
     /// 发给 `peer` 的控制消息的去处；没连着时为 `None`。
     fn tx(&self, peer: &Fingerprint) -> Option<UnboundedSender<Message>> {
         self.links.get(peer).map(|link| link.tx.clone())
+    }
+}
+
+/// 原生磁盘操作即使在调用方取消后仍可能继续，保留标记必须由实际工作线程释放。
+/// Drop也覆盖平台错误和panic；运行时只会短暂等待内存状态，绝不等清理磁盘。
+struct ReceiptReservation {
+    files: Files,
+    peer: Fingerprint,
+    id: TransferId,
+}
+
+impl ReceiptReservation {
+    fn acquire(files: &Files, peer: Fingerprint, id: TransferId) -> Option<Self> {
+        let mut state = files.lock();
+        if state.jobs.get(&id).is_some_and(|job| job.peer == peer)
+            || !state.cleaning.insert((peer, id))
+        {
+            return None;
+        }
+        Some(Self {
+            files: files.clone(),
+            peer,
+            id,
+        })
+    }
+}
+
+impl Drop for ReceiptReservation {
+    fn drop(&mut self) {
+        let mut state = self.files.lock();
+        state.cleaning.remove(&(self.peer, self.id));
+        if let Some(job) = state.jobs.get_mut(&self.id)
+            && job.peer == self.peer
+            && matches!(job.kind, JobKind::Receive(_))
+            && job.task.is_none()
+        {
+            // 已有有界watch任务负责接受和打开连接；清理等待不消耗网络重试预算。
+            job.retry_at = Instant::now();
+        }
     }
 }
 
@@ -315,28 +356,49 @@ impl Files {
                         continue;
                     }
                     let path = entry.path();
-                    if path.join("data").exists() || path.join(commit::INTENT).exists() {
+                    let Ok(id) = entry.file_name().to_string_lossy().parse::<TransferId>() else {
+                        continue;
+                    };
+                    if path.join("data").try_exists().unwrap_or(true)
+                        || path.join(commit::INTENT).try_exists().unwrap_or(true)
+                    {
                         continue;
                     }
-                    if let Some(at) = commit::completed_at(&path) {
-                        candidates.push((at, fingerprint, entry.file_name(), path));
+                    if let Some(at) = commit::completed_at(&path)
+                        && let Ok(identity) = files.inner.commit.identity(&path)
+                        && let Ok(receipt_identity) =
+                            files.inner.commit.identity(&path.join(commit::RECEIPT))
+                    {
+                        candidates.push((at, fingerprint, id, path, identity, receipt_identity));
                     }
                 }
             }
             candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.3.cmp(&b.3)));
             let now = commit::now();
             let mut removed = 0;
-            for (index, (at, peer, name, path)) in candidates.into_iter().enumerate() {
+            for (index, (at, peer, id, path, identity, receipt_identity)) in
+                candidates.into_iter().enumerate()
+            {
                 if index < MAX_RECEIPTS && now.saturating_sub(at) < RECEIPT_TTL {
                     continue;
                 }
-                // 和新任务登记互斥：清理检查后不会突然出现读取这份回执的新任务。
-                let state = files.lock();
-                let active = state
-                    .jobs
-                    .iter()
-                    .any(|(id, job)| job.peer == peer && id.to_string() == name.to_string_lossy());
-                if active || path.join("data").exists() || path.join(commit::INTENT).exists() {
+                let Some(_reservation) = ReceiptReservation::acquire(&files, peer, id) else {
+                    continue;
+                };
+                // 保留目录后再检查磁盘。目录被替换、出现未完成内容或意图时保守保留。
+                // 新任务可以登记，但在_reservation释放前不能接受或启动恢复。
+                if files.inner.commit.identity(&path).ok().as_ref() != Some(&identity)
+                    || files
+                        .inner
+                        .commit
+                        .identity(&path.join(commit::RECEIPT))
+                        .ok()
+                        .as_ref()
+                        != Some(&receipt_identity)
+                    || commit::completed_at(&path) != Some(at)
+                    || path.join("data").try_exists().unwrap_or(true)
+                    || path.join(commit::INTENT).try_exists().unwrap_or(true)
+                {
                     continue;
                 }
                 if std::fs::remove_file(path.join(commit::RECEIPT)).is_ok() {
@@ -540,11 +602,14 @@ impl Files {
                     return;
                 }
             };
-            let idle = files
-                .lock()
-                .jobs
-                .get(&id)
-                .is_some_and(|j| j.task.is_none() && j.peer == peer);
+            let idle = {
+                let state = files.lock();
+                !state.cleaning.contains(&(peer, id))
+                    && state
+                        .jobs
+                        .get(&id)
+                        .is_some_and(|j| j.task.is_none() && j.peer == peer)
+            };
             if !idle {
                 warn!(%id, "文件连接对应的传输不存在或已在进行，已关闭");
                 return;
@@ -558,12 +623,13 @@ impl Files {
 
     fn on_offer(&self, peer: Fingerprint, offer: FileOffer) {
         let id = offer.id;
-        let (tx, opener, new) = {
+        let (tx, opener, new, cleaning) = {
             let mut state = self.lock();
             let Some(link) = state.links.get(&peer) else {
                 return;
             };
             let found = (link.tx.clone(), link.opener.clone());
+            let cleaning = state.cleaning.contains(&(peer, id));
             if state.cancelled.contains(&(id, peer)) {
                 let _ = found.0.send(Message::FileCancel(FileCancel {
                     id,
@@ -581,7 +647,7 @@ impl Files {
                     return;
                 }
                 // 相同通告可以重发：重新确认，正在运行的任务不会启动第二份。
-                (found.0, found.1, false)
+                (found.0, found.1, false, cleaning)
             } else {
                 if !within_budget(&state, peer) {
                     let _ = found.0.send(Message::FileCancel(FileCancel {
@@ -603,13 +669,16 @@ impl Files {
                         cancelled_by_peer: false,
                     },
                 );
-                (found.0, found.1, true)
+                (found.0, found.1, true, cleaning)
             }
         };
         if new {
             info!(name = %mark::file(&offer.name), files = offer.files, bytes = offer.bytes, "对方发来文件，开始接收");
             self.emit(JobKind::Receive(offer).update(peer, 0, TransferState::Waiting));
             self.watch(id);
+        }
+        if cleaning {
+            return;
         }
         let _ = tx.send(Message::FileAccept { id });
         if let Some(opener) = opener {
@@ -691,6 +760,13 @@ impl Files {
         let cancel = Cancellation::default();
         let attempt = {
             let mut state = self.lock();
+            if state
+                .jobs
+                .get(&id)
+                .is_some_and(|job| state.cleaning.contains(&(job.peer, id)))
+            {
+                return;
+            }
             let Some(job) = state.jobs.get_mut(&id).filter(|job| job.task.is_none()) else {
                 return;
             };
@@ -938,6 +1014,9 @@ impl Files {
             let Some(job) = state.jobs.get(&id) else {
                 return false;
             };
+            if state.cleaning.contains(&(job.peer, id)) {
+                return true;
+            }
             if job.task.is_some() || Instant::now() < job.retry_at {
                 return true;
             }

@@ -28,6 +28,6 @@ pub use error::{Error, Result};
 pub use event_loop::{Dispatcher, EventLoop, MainTask};
 pub use file_commit::FileCommit;
 pub use inject::InputInject;
-pub use overlay::{Overlay, OverlayEvent, OverlaySink};
+pub use overlay::{DragReader, Overlay, OverlayEvent, OverlaySink};
 pub use permission::Permissions;
 pub use update::{Prepared, Updater};

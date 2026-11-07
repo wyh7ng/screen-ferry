@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ferry_platform::{Overlay, OverlayEvent, OverlaySink, Result};
+use ferry_platform::{DragReader, Overlay, OverlayEvent, OverlaySink, Result};
 use ferry_types::{Frame, Scene};
 
 /// 假的浮层：记下最后显示的内容，测试可以模拟拖入、放下和点击。
@@ -75,6 +75,9 @@ impl MockOverlay {
 }
 
 impl Overlay for MockOverlay {
+    fn drag_reader(&self) -> Box<dyn DragReader> {
+        Box::new(self.clone())
+    }
     fn start(&mut self, sink: OverlaySink) -> Result<()> {
         self.lock().sink = Some(sink);
         Ok(())
@@ -110,5 +113,15 @@ impl Overlay for MockOverlay {
 
     fn reveal(&self, path: &Path) {
         self.lock().revealed.push(path.to_owned());
+    }
+}
+
+impl DragReader for MockOverlay {
+    fn change_count(&mut self) -> i64 {
+        self.lock().drag_count
+    }
+
+    fn files(&mut self) -> Vec<PathBuf> {
+        self.lock().dragged.clone()
     }
 }

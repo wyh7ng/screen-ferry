@@ -84,3 +84,55 @@ async fn buffered_frames_and_a_cancelled_partial_frame_preserve_order() {
     );
     assert_eq!(framed.recv().await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn split_keeps_prefetched_messages_and_read_progress_during_write_backpressure() {
+    use std::time::Duration;
+    let (socket, mut peer) = duplex(64);
+    let codec = Codec::new(Channel::Input);
+    let mut bytes = Vec::new();
+    codec
+        .encode(&Message::Ping { nonce: 1 }, &mut bytes)
+        .unwrap();
+    codec
+        .encode(&Message::Pong { nonce: 2 }, &mut bytes)
+        .unwrap();
+    peer.write_all(&bytes).await.unwrap();
+    let mut framed = Framed::new(socket, Channel::Input);
+    assert_eq!(
+        framed.recv().await.unwrap(),
+        Some(Message::Ping { nonce: 1 })
+    );
+    let (mut reader, mut writer) = framed.split();
+    assert_eq!(
+        reader.recv().await.unwrap(),
+        Some(Message::Pong { nonce: 2 })
+    );
+    let stalled = tokio::spawn(async move {
+        for nonce in 0..100 {
+            writer.send(&Message::Ping { nonce }).await.unwrap();
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!stalled.is_finished(), "对端不读时写缓冲饱和");
+    let mut bytes = Vec::new();
+    codec
+        .encode(&Message::Pong { nonce: 3 }, &mut bytes)
+        .unwrap();
+    peer.write_all(&bytes[..3]).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), reader.recv())
+            .await
+            .is_err()
+    );
+    peer.write_all(&bytes[3..]).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), reader.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(Message::Pong { nonce: 3 })
+    );
+    assert!(!stalled.is_finished(), "读取成功不依赖写入完成");
+    stalled.abort();
+}

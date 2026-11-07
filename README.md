@@ -94,6 +94,7 @@ Settings can limit the combined rate of all outgoing files (decimal MB/s; 0 mean
 “Coalesce pointer motion” is off by default. When enabled it combines queued ordinary motion while preserving key, drag and screen transition order.
 The overview shows local stage timings and queues for the latest sample window. Percentiles are approximate. Application RTT includes processing and queues on both computers plus network transit; it is neither system ping nor input-to-display latency. The UI distinguishes the latest sampled mean, historical peak and sample age.
 Display queries run on a separate background thread. Performance statistics include display queries, cursor transitions and heartbeat writes; full diagnostics retain bounded windows around spikes to help investigate intermittent stalls.
+Cursor and input operations run in order on background workers. An independent network task responds to heartbeats, so low RTT does not guarantee fast input processing. Injection timings include receive queue waits; diagnostics retain adjacent local engine/connection windows and cumulative maxima and threshold counts for the current session.
 
 ### Command line
 

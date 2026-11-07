@@ -3467,7 +3467,7 @@ abstract class AppLocalizations {
   /// No description provided for @performanceHint.
   ///
   /// In zh, this message translates to:
-  /// **'以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 包含两端处理、排队和网络传输，不是端到端输入延迟。无样本显示 —。'**
+  /// **'以下均为本机最近采样窗口的阶段耗时，设备分组表示与该设备的连接。分位数为近似值，最大值为实测。应用 RTT 由独立网络任务响应，包含心跳处理、收发排队和网络传输，不等待键鼠注入；RTT 低也可能输入处理慢，它不是端到端输入延迟。无样本显示 —。'**
   String get performanceHint;
 
   /// No description provided for @performanceEmpty.
@@ -3509,13 +3509,13 @@ abstract class AppLocalizations {
   /// No description provided for @performanceSend.
   ///
   /// In zh, this message translates to:
-  /// **'发送耗时'**
+  /// **'发送排队与写入'**
   String get performanceSend;
 
   /// No description provided for @performanceInject.
   ///
   /// In zh, this message translates to:
-  /// **'注入耗时'**
+  /// **'接收到注入完成'**
   String get performanceInject;
 
   /// No description provided for @performanceRtt.
@@ -3725,7 +3725,7 @@ abstract class AppLocalizations {
   /// No description provided for @overviewRttHint.
   ///
   /// In zh, this message translates to:
-  /// **'应用心跳往返，包含两端处理和排队。历史峰值不代表当前延迟。'**
+  /// **'心跳由独立网络任务响应；RTT 低不代表键鼠处理或画面响应一定快。历史峰值不代表当前延迟。'**
   String get overviewRttHint;
 
   /// No description provided for @performanceDisplayQuery.
@@ -3743,13 +3743,13 @@ abstract class AppLocalizations {
   /// No description provided for @performanceHeartbeatSend.
   ///
   /// In zh, this message translates to:
-  /// **'心跳写入等待'**
+  /// **'心跳排队与写入'**
   String get performanceHeartbeatSend;
 
   /// No description provided for @performanceBackgroundHint.
   ///
   /// In zh, this message translates to:
-  /// **'显示器查询在后台执行，耗时较长不代表输入线程被阻塞。心跳写入完成也不代表对方已收到。'**
+  /// **'显示器查询在后台执行，耗时较长不代表输入线程被阻塞。发送及心跳写入包含写队列等待，截止 flush 完成，不代表对方已确认。注入从输入解码后计时，包含接收排队、平台工作线程及系统调用等待，不包含屏幕呈现。'**
   String get performanceBackgroundHint;
 }
 

@@ -8,7 +8,8 @@
 //! 调用方紧接着注入的移动必须排在后面，否则光标刚移到入口，又被挪回屏幕中央。
 
 use std::cell::Cell;
-use std::sync::{OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 
 use ferry_platform::{Error, Result};
@@ -45,12 +46,14 @@ thread_local! {
 pub(crate) struct CursorHider {
     /// 窗口句柄本身不是 Send，以整数保存；给窗口发消息可以在任何线程进行。
     hwnd: isize,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    stopped: AtomicBool,
 }
 
 impl CursorHider {
     pub(crate) fn start() -> Result<Self> {
         let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("ferry-cursor".into())
             .spawn(move || {
                 let hwnd = match create_window() {
@@ -78,11 +81,18 @@ impl CursorHider {
             call: "CreateWindowExW",
             detail: "隐藏光标的线程意外退出".into(),
         })??;
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd,
+            worker: Mutex::new(Some(worker)),
+            stopped: AtomicBool::new(false),
+        })
     }
 
     /// 藏起或收起，返回时已经做完。
     pub(crate) fn set_hidden(&self, hidden: bool) -> Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(Error::Failed("隐藏光标的窗口已停止".into()));
+        }
         let msg = if hidden {
             WM_HIDE_CURSOR
         } else {
@@ -101,6 +111,9 @@ impl CursorHider {
             )
         };
         if done.0 == 0 {
+            // 发送超时不保证窗口过程已经结束。先终止并等待窗口线程，防止迟到park
+            // 覆盖后续定位。调用发生在输入工作线程；核心运行时另有限时确认与取消。
+            self.stop();
             return Err(Error::Os {
                 call: "SendMessageTimeoutW",
                 detail: "隐藏光标的窗口没有及时响应".into(),
@@ -114,11 +127,20 @@ impl CursorHider {
         unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), msg, WPARAM(0), LPARAM(0)) }
             .map_err(|e| os("PostMessageW", e))
     }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let worker = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(worker) = worker {
+            let _ = self.post(WM_STOP);
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Drop for CursorHider {
     fn drop(&mut self) {
-        let _ = self.post(WM_STOP);
+        self.stop();
     }
 }
 

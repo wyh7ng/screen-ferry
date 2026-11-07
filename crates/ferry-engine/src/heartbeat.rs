@@ -1,5 +1,6 @@
 //! 心跳：定时 Ping，按 Pong 判断连接是否存活，并统计往返延迟。
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ pub(crate) struct Heartbeat {
     last_pong: Instant,
     window: Window,
     last_report: Instant,
+    pending: VecDeque<u64>,
 }
 
 impl Heartbeat {
@@ -31,6 +33,7 @@ impl Heartbeat {
             last_pong: now,
             window: Window::default(),
             last_report: now,
+            pending: VecDeque::new(),
         }
     }
 
@@ -45,12 +48,25 @@ impl Heartbeat {
         if self.last_ping.is_some_and(|t| now - t < interval) {
             return None;
         }
+        Some(self.ping())
+    }
+
+    /// 客户端主动测量；有界记录确实发起的探针，拒绝重复/伪造回复。
+    pub(crate) fn ping(&mut self) -> u64 {
+        let now = Instant::now();
         self.last_ping = Some(now);
-        Some((now - self.epoch).as_micros() as u64)
+        let nonce = (now - self.epoch).as_micros() as u64;
+        self.pending.push_back(nonce);
+        while self.pending.len() > 32 {
+            self.pending.pop_front();
+        }
+        nonce
     }
 
     /// 收到 Pong，返回这次的往返延迟；不是本连接发出的 nonce 时为 `None`。
     pub(crate) fn pong(&mut self, nonce: u64) -> Option<Duration> {
+        let index = self.pending.iter().position(|&sent| sent == nonce)?;
+        self.pending.remove(index);
         let sent = self.epoch.checked_add(Duration::from_micros(nonce))?;
         let now = Instant::now();
         if sent > now {

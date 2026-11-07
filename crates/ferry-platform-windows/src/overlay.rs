@@ -145,6 +145,9 @@ impl Drop for WinOverlay {
 }
 
 impl Overlay for WinOverlay {
+    fn drag_reader(&self) -> Box<dyn ferry_platform::DragReader> {
+        Box::new(WinDragReader(self.shared.clone()))
+    }
     fn start(&mut self, sink: OverlaySink) -> Result<()> {
         *lock(&self.shared.sink) = Some(sink);
         let shared = self.shared.clone();
@@ -201,6 +204,19 @@ impl Overlay for WinOverlay {
             .shell
             .push((path.to_owned(), true));
         self.shared.post(WM_SHELL);
+    }
+}
+
+/// 只读快照句柄，不拥有窗口；销毁不会发送 WM_STOP。
+struct WinDragReader(Arc<Shared>);
+
+impl ferry_platform::DragReader for WinDragReader {
+    fn change_count(&mut self) -> i64 {
+        lock(&self.0.drag).count
+    }
+
+    fn files(&mut self) -> Vec<PathBuf> {
+        lock(&self.0.drag).files.clone()
     }
 }
 

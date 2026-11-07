@@ -20,6 +20,8 @@ pub(super) fn history(history: &crate::MetricsHistory) -> serde_json::Value {
                     i64::try_from(incident.triggered_at.elapsed().as_millis()).unwrap_or(i64::MAX)),
                 "trigger_stages": incident.stages(),
                 "windows": windows,
+                "related_local_sources": incident.related().iter().map(|entry|
+                    project(entry.peer, entry.metrics.clone())).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -29,6 +31,13 @@ pub(super) fn history(history: &crate::MetricsHistory) -> serde_json::Value {
         "recent_total_limit": 128,
         "incident_limit": 4,
         "incident_window_limit": 5,
+        "related_window_limit": 16,
+        "totals_source_limit": 128,
+        "totals": history.totals().map(|total| serde_json::json!({
+            "fingerprint": total.peer.map(|peer| peer.to_hex()),
+            "windows_received": total.windows,
+            "stages": total.stages,
+        })).collect::<Vec<_>>(),
         "recent": recent,
         "incidents": incidents,
     })
